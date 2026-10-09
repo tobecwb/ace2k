@@ -1,0 +1,147 @@
+# ace2k
+
+Open firmware for the **Anycubic ACE 2 Pro**. It turns the unit into a native **Klipper** MCU.
+You declare the unit as `[mcu ace2k]` in `printer.cfg`, and add a small `[ace2k]` host module.
+
+The unit does these jobs on its own:
+
+- It dries filament.
+- It pulls in a filament you insert in a bay, and parks it (the load).
+- It finds and reads the RFID tag of each spool. The host then decodes what the tag says.
+
+The main target is the Snapmaker U1.
+
+ace2k should work with any Klipper printer. The unit becomes a Klipper MCU, and the `[ace2k]` host
+module does not depend on the printer. But it has only been tested on a Snapmaker U1. On the U1,
+the printer's own filament functions drive the unit through the adapter
+[ace2k-u1](https://github.com/tobecwb/ace2k-u1). On another printer, you drive the lanes from your
+own macros with the `ACE_*` commands ([`docs/commands.md`](docs/commands.md)).
+
+**Spool tags from almost any brand.** Spools carry two kinds of tag: NTAG and MIFARE Classic. The
+firmware reads both. The host decides what the tag means: each brand is a small Python decoder.
+
+- Decoded today: Anycubic, Bambu Lab and Snapmaker.
+- Written but off until read on a real tag: Elegoo and Creality.
+- Any other brand can be added on the host if its tag layout is known. For a MIFARE tag, its key
+  (or how to derive the key) must be known too. No firmware change and no reflash are needed
+  ([`docs/features.md`](docs/features.md#spool-tags), "Adding a brand").
+
+Nothing is ever written to a tag.
+
+**Status: Release Candidate `v0.12.0-rc.1`.** The long-run print test (burn-in) has not been done
+yet.
+
+**How this was built.** AI tools were used in developing this firmware. Every feature and every
+change was verified on real hardware, over many hours of bench testing, before it was accepted.
+Human review of the source code is still in progress.
+
+**A note on the language.** English is not the author's native language, so some terms in this
+documentation may read a little oddly. Corrections are welcome.
+
+## Read this first
+
+**Risks.** Flashing third-party firmware onto your ACE 2 Pro carries a small but real risk of
+damaging it. What limits that risk:
+- ace2k never writes to the bootloader or to the unit's factory calibration pages; it only reads them.
+- If a flash is interrupted, the unit's bootloader stays in recovery mode and accepts a new image
+  over the same cable (`docs/flashing.md`).
+- The heater only runs with both fans on, and it stops if a temperature sensor fails. The unit's
+  own 115 °C thermal cutout stays in place.
+
+What remains: the dryer switches mains power. Do not leave a drying cycle unattended. Tested only
+at 127 V / 60 Hz; 220–240 V / 50 Hz has never been tried.
+
+**Disclaimer.** This software is provided "as is", without warranty of any kind (see `LICENSE`).
+You use it at your own risk. The author is not responsible for any damage to your unit, your
+printer, your filament or anything else that results from installing or running it. Installing it
+may void your warranty. This project is not affiliated with or endorsed by Anycubic or Snapmaker.
+
+**Tested on.** One Anycubic ACE 2 Pro unit on a Snapmaker U1 running the paxx extended firmware
+`1.6.0-paxx12-22`, at 127 V / 60 Hz. Nothing else has been tested. This is a Release Candidate: the
+long-run print test (burn-in) has not been done yet.
+
+> [!WARNING]
+> **Connect only one unit to the printer.** ace2k has been tested with a single ACE 2 Pro
+> connected. Nobody knows what happens with more than one unit connected. That is true with both
+> units on ace2k, and with one on ace2k and one on the factory firmware. It is also true for two or
+> more units in a daisy chain, whatever firmware they run. To stay safe, connect one unit only.
+> Support for several units is not implemented yet; it is planned
+> ([`docs/limitations.md`](docs/limitations.md#planned)).
+
+> [!WARNING]
+> **Do not leave a drying cycle unattended.** The dryer switches mains power to a heater. Only the
+> author has tested it, for at most four hours of continuous drying, and only at 127 V / 60 Hz.
+> Nobody has run it on 220–240 V / 50 Hz mains yet. If that is your mains, expect to be the first.
+>
+> The firmware has its own protections:
+>
+> - The heater runs only with both fans on.
+> - The heater stops at 85 °C at the outlets.
+> - The heater stops when the chamber goes past its limit (the target + 10 °C, or 80 °C).
+> - A lost sensor, lost mains or stopped fans end the cycle.
+>
+> Automated tests cover these protections, but they were **not provoked on a real unit**. Doing so
+> could damage it, and the units are few and, where the author lives, very expensive. Below the
+> firmware, the unit's own 115 °C thermal cutout remains as a last, hardware protection.
+
+## Documentation
+
+To install:
+
+1. Build the USB cable ([`docs/cable.md`](docs/cable.md)).
+2. Flash the unit ([`docs/flashing.md`](docs/flashing.md)).
+
+To use it, read [`docs/features.md`](docs/features.md), then [`docs/commands.md`](docs/commands.md).
+
+All the documents:
+
+- [`docs/cable.md`](docs/cable.md) — the USB cable: Anycubic's own cable with a USB plug
+- [`docs/flashing.md`](docs/flashing.md) — flash the unit, and go back to the factory firmware
+- [`docs/commands.md`](docs/commands.md) — every `ACE_*` command and the flashing tool
+- [`docs/features.md`](docs/features.md) — configuration, the follow, the tail, the grip, the
+  feed-forward, encoder calibration, spool tags, drying, the lane LEDs
+- [`docs/differences-from-stock.md`](docs/differences-from-stock.md) — what behaves differently
+  from the factory firmware
+- [`docs/limitations.md`](docs/limitations.md) — known limitations and what is planned
+- [`docs/logging.md`](docs/logging.md) — recording a long run, and what to attach to a problem
+  report
+- [`docs/hardware.md`](docs/hardware.md) — the board: pins, sensors, links
+- [`docs/protocol.md`](docs/protocol.md) — the host–unit protocol
+- [`docs/architecture.md`](docs/architecture.md) — layers, the MCU/host split, the module map
+- [`docs/rules.md`](docs/rules.md) — the numbered design rules the code comments cite
+- [`docs/decisions/`](docs/decisions/) — why things are the way they are
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — the rules: C, Python, tooling, process, safety
+
+## The Snapmaker U1
+
+On the U1, a small adapter connects the printer's filament feed to the unit's lanes:
+[`ace2k-u1`](https://github.com/tobecwb/ace2k-u1). It is a separate project with its own install
+guide.
+
+## Build
+
+    git clone --recurse-submodules <url> ace2k && cd ace2k
+    git submodule update --init firmware/klipper   # in a clone made without --recurse-submodules
+    scripts/doctor.sh          # the toolchain: Arm GNU Toolchain (with newlib), llvm, cppcheck,
+                               # ruff, pytest
+    make -C firmware build     # → firmware/build/ace2k-<version>.bin  (+ .elf, .dict)
+    make -C firmware test      # host tests: the core with cc, the tools with pytest
+    make -C firmware lint      # format check, clang-tidy, cppcheck, ruff
+    make -C firmware lint-selftest   # proves the clang-tidy rules fire on tests/lint-fixtures/bad_style.c
+    make -C firmware coverage        # llvm-cov report on src/ace2k/
+
+Run every target from `firmware/`, or as `make -C firmware <target>` from the tree root.
+
+Klipper is a git submodule, pinned in `firmware/klipper.pin`. `make build` applies one small patch
+to it (`firmware/patches/`) and overlays `firmware/src/`. Nothing under `firmware/klipper/` is
+edited by hand.
+
+## Credits
+
+ace2k is built on the published work of **[hakimio](https://github.com/hakimio)** (the ACE 2 Pro
+protocol) and **[Simon-CR](https://github.com/Simon-CR)** (the reader protocol and the
+spool-rotation concepts), among others. See [`docs/credits.md`](docs/credits.md).
+
+## License
+
+GPL-3.0 (see `LICENSE`).

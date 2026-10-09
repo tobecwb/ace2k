@@ -1,0 +1,3 @@
+[submodule "firmware/klipper"]
+	path = firmware/klipper
+	url = https://github.com/Klipper3d/klipper.git

@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # The actions are pinned by commit; this keeps the pins current.
+  # Klipper is pinned on purpose (firmware/klipper.pin) and is bumped by hand.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

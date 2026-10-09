@@ -1,0 +1,12 @@
+# build products of firmware/Makefile
+firmware/build/
+# host test binaries and coverage
+firmware/tests/build/
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+# editors
+.DS_Store
+*.swp

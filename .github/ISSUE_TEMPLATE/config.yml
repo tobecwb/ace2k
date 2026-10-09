@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Safety problem (heater, fans, motors, flash)
+    url: https://github.com/tobecwb/ace2k/security/advisories/new
+    about: Report it privately. See SECURITY.md. If a unit is misbehaving now, unplug it first.

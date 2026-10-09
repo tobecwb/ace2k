@@ -1,0 +1,28 @@
+#!/bin/sh
+# ace2k pre-commit (public): the fast check (formatting) on what is being committed.  Installed by
+# `make hooks`, which fills in the placeholder on the `prefix=` line with the firmware directory's
+# path relative to the repository root, so the hook follows whatever checkout it runs in.
+# The slow lints run in `make lint` and in CI.
+set -e
+prefix=ACE2K_FIRMWARE_PREFIX
+if [ "$prefix" = "ACE2K_FIRMWARE_PREFIX" ]; then
+    echo "pre-commit: the placeholder was never filled in; install with make -C firmware hooks, not by hand" >&2
+    exit 1
+fi
+cd "$(git rev-parse --show-toplevel)"
+root=$(dirname "$prefix")/ # the ace2k tree: firmware/ and its siblings
+[ "$root" = "./" ] && root=
+if ! git cat-file -e ":$prefix/Makefile" 2>/dev/null; then
+    echo "pre-commit: $prefix has no Makefile in this commit; skipping the ace2k format check" >&2
+    exit 0
+fi
+# Only what format-check reads: the firmware tree, the Python directories and the ruff config.
+if git diff --cached --quiet -- "$prefix" "${root}klippy" "${root}scripts" "${root}ruff.toml"; then
+    exit 0
+fi
+# Judge the staged content, not the working tree: a partially staged file is checked as it will be
+# committed.  The index's copy of the tree is exported to a temporary directory and checked there.
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+git ls-files -z -- "${root:-.}" | git checkout-index -z --prefix="$tmp/" --stdin
+make -C "$tmp/$prefix" --no-print-directory format-check

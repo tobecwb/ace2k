@@ -1,0 +1,87 @@
+# ace2k build options.  Sourced from src/stm32/Kconfig by the ace2k patch.
+# One flag per subsystem: an image built without a flag contains no code that drives that
+# hardware (CONTRIBUTING.md, "The life of a feature").
+
+menu "ace2k (Anycubic ACE 2 Pro as a Klipper MCU)"
+    depends on MACH_GD32F303
+
+config ACE2K
+    bool "Build the ace2k modules"
+    default y
+
+config ACE2K_SENSORS
+    bool "Insert sensors, buffer switches, cutout input (read-only)"
+    depends on ACE2K
+    default n
+
+config ACE2K_ENV
+    bool "Outlet NTCs, chamber sensor, supply reference (read-only)"
+    depends on ACE2K_SENSORS
+    default n
+
+config ACE2K_LANE
+    bool "Filament encoders and motor tach counters (read-only)"
+    depends on ACE2K
+    default n
+
+config ACE2K_MAINS
+    bool "Mains zero-cross frequency (read-only)"
+    depends on ACE2K
+    default n
+
+config ACE2K_RFID
+    bool "RFID readers (the version register; the field with ACE2K_RFID_READ)"
+    depends on ACE2K
+    default n
+
+config ACE2K_RFID_READ
+    bool "RFID: the readers' field, the tag protocol, the watch of the lanes' tags"
+    # The watch reads the insert sensors, the lanes' motion and the link; only the RS-485
+    # console driver can say whether the host is there.
+    depends on ACE2K_RFID && ACE2K_SENSORS && ACE2K_LANE && STM32_SERIAL_UART4_PC11_PC10_RS485
+    default n
+
+config ACE2K_HEALTH
+    bool "Power-on self-test and the health mask"
+    depends on ACE2K_SENSORS && ACE2K_ENV && ACE2K_LANE && ACE2K_MAINS && ACE2K_RFID
+    default n
+
+config ACE2K_MOTOR
+    bool "Lane motors: the drive and the speed loop"
+    # Nothing moves without link_ok, and only the RS-485 console driver can say whether the host
+    # is there: an image on another console cannot carry the motors.
+    depends on ACE2K_LANE && STM32_SERIAL_UART4_PC11_PC10_RS485
+    default n
+
+config ACE2K_FEED
+    bool "Filament lanes: the feed state machine, the supervisors, the assist, the load"
+    depends on ACE2K_MOTOR && ACE2K_SENSORS
+    default n
+
+config ACE2K_HEAT
+    bool "Dryer outputs: the fans, the exhaust flaps and the heater's gate"
+    # The fan rule reads the outlet NTCs (env), the gate fires on the mains zero-cross (mains)
+    # and heat reads the cutout input (sensors).  The dryer (ACE2K_DRYER) is the gate's only
+    # user.  The heater stops when the host goes silent, and only the RS-485 console driver can
+    # say whether the host is there.
+    depends on ACE2K_ENV && ACE2K_MAINS && ACE2K_SENSORS && STM32_SERIAL_UART4_PC11_PC10_RS485
+    default n
+
+config ACE2K_DRYER
+    bool "Dryer: the autonomous drying cycle over the heater, the fans and the flaps"
+    # the reset cause comes from sysinfo, compiled with the health subsystem; the spool rule
+    # reads the insert sensors and the cutout from the sensors subsystem
+    depends on ACE2K_HEAT && ACE2K_SENSORS && ACE2K_HEALTH
+    default n
+
+config ACE2K_LED
+    bool "Lane LEDs"
+    depends on ACE2K
+    default n
+
+config ACE2K_CLOCK_120M
+    bool "Core clock 120 MHz (high-driver mode); off = 72 MHz through the same PLL path"
+    depends on ACE2K
+    default n
+
+endmenu

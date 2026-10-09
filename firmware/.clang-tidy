@@ -1,0 +1,37 @@
+# The rules of CONTRIBUTING.md "C rules" that a machine can check.  Runs on the host-compilable C
+# (core, util, tests); bindings are checked by the cross compiler and cppcheck.
+Checks: >
+  -*,
+  bugprone-*,
+  misc-*,
+  performance-*,
+  readability-*,
+  -bugprone-easily-swappable-parameters,
+  -misc-include-cleaner,
+  -readability-identifier-length,
+  -readability-avoid-unconditional-preprocessor-if
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*/(src/ace2k|src/ace2k_board|tests)/.*'
+CheckOptions:
+  readability-function-cognitive-complexity.Threshold: 15
+  readability-magic-numbers.IgnoredIntegerValues: '0;1;2;3;4;8;10;16;32;64;100;255;256;1000'
+  readability-magic-numbers.IgnorePowersOf2IntegerValues: true
+  readability-identifier-naming.FunctionCase: lower_case
+  readability-identifier-naming.GlobalFunctionCase: lower_case
+  readability-identifier-naming.GlobalFunctionPrefix: 'ace2k_'
+  readability-identifier-naming.VariableCase: lower_case
+  readability-identifier-naming.ParameterCase: lower_case
+  readability-identifier-naming.StructCase: lower_case
+  readability-identifier-naming.StructPrefix: 'ace2k_'
+  readability-identifier-naming.EnumCase: lower_case
+  readability-identifier-naming.EnumPrefix: 'ace2k_'
+  readability-identifier-naming.EnumConstantCase: UPPER_CASE
+  readability-identifier-naming.EnumConstantPrefix: 'ACE2K_'
+  readability-identifier-naming.MacroDefinitionCase: UPPER_CASE
+  readability-identifier-naming.GlobalConstantCase: lower_case
+  readability-identifier-naming.GlobalConstantPrefix: 'ace2k_'
+  readability-identifier-naming.GlobalVariableCase: lower_case
+  readability-identifier-naming.GlobalVariablePrefix: 'ace2k_'
+  readability-identifier-naming.StaticConstantCase: lower_case
+  readability-identifier-naming.StaticVariableCase: lower_case
+  readability-identifier-naming.TypedefCase: lower_case

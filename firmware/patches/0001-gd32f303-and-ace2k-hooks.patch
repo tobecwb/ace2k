@@ -1,0 +1,308 @@
+diff --git a/src/generic/armcm_timer.c b/src/generic/armcm_timer.c
+index e2d77924d..fa324d9ae 100644
+--- a/src/generic/armcm_timer.c
++++ b/src/generic/armcm_timer.c
+@@ -117,6 +117,16 @@ static uint32_t timer_repeat_until;
+ #define TIMER_MIN_TRY_TICKS 90
+ #define TIMER_DEFER_REPEAT_TICKS timer_from_us(5)
+ 
++// A caller that stalled the core (a flash erase or program: code runs from the
++// flash being written, so no timer can fire) declares it here before it
++// re-enables interrupts; the dispatcher then catches the overdue timers up
++// instead of treating the first as a runaway.
++void
++timer_note_stall(uint32_t grace_us)
++{
++    timer_repeat_until = timer_read_time() + timer_from_us(grace_us);
++}
++
+ // Invoke timers
+ static uint32_t
+ timer_dispatch_many(void)
+diff --git a/src/generic/misc.h b/src/generic/misc.h
+index fe0804e48..f62a4e188 100644
+--- a/src/generic/misc.h
++++ b/src/generic/misc.h
+@@ -6,6 +6,8 @@
+ 
+ struct command_encoder;
+ void console_sendf(const struct command_encoder *ce, va_list args);
++uint8_t console_try_sendf(const struct command_encoder *ce, uint_fast8_t reserve
++                          , va_list args);
+ void *console_receive_buffer(void);
+ 
+ uint32_t timer_from_us(uint32_t us);
+diff --git a/src/generic/serial_irq.c b/src/generic/serial_irq.c
+index 4c05ef3ef..992996018 100644
+--- a/src/generic/serial_irq.c
++++ b/src/generic/serial_irq.c
+@@ -89,9 +89,12 @@ console_task(void)
+ }
+ DECL_TASK(console_task);
+ 
+-// Encode and transmit a "response" message
+-void
+-console_sendf(const struct command_encoder *ce, va_list args)
++// Encode and queue a "response" message; 0 when it does not fit, or would
++// leave fewer than 'reserve' bytes free (ace2k's bindings hold such a frame
++// for their next tick and keep room for a command response behind it)
++uint8_t
++console_try_sendf(const struct command_encoder *ce, uint_fast8_t reserve
++                  , va_list args)
+ {
+     // Verify space for message
+     uint_fast8_t tpos = readb(&transmit_pos), tmax = readb(&transmit_max);
+@@ -101,15 +104,16 @@ console_sendf(const struct command_encoder *ce, va_list args)
+         writeb(&transmit_pos, 0);
+     }
+     if (tmax + READP(ce->max_size) > sizeof(transmit_buf)) {
+-        if (tmax - tpos + READP(ce->min_size) > sizeof(transmit_buf))
+-            // Not enough space for message
+-            return;
++        if (tmax - tpos + READP(ce->min_size) + reserve > sizeof(transmit_buf))
++            // Not enough space for message (and the reserve behind it)
++            return 0;
+         // Disable TX irq and move buffer
+         writeb(&transmit_max, 0);
+         tpos = readb(&transmit_pos);
+         tmax -= tpos;
+         memmove(&transmit_buf[0], &transmit_buf[tpos], tmax);
+         writeb(&transmit_pos, 0);
++        tpos = 0;
+         writeb(&transmit_max, tmax);
+         serial_enable_tx_irq();
+     }
+@@ -118,10 +122,18 @@ console_sendf(const struct command_encoder *ce, va_list args)
+     uint8_t *buf = &transmit_buf[tmax];
+     uint_fast8_t msglen = command_encode_and_frame(
+         buf, sizeof(transmit_buf) - tmax, ce, args);
+-    if (!msglen)
+-        return;
++    if (!msglen || sizeof(transmit_buf) - (tmax - tpos) - msglen < reserve)
++        return 0;
+ 
+     // Start message transmit
+     writeb(&transmit_max, tmax + msglen);
+     serial_enable_tx_irq();
++    return 1;
++}
++
++// Encode and transmit a "response" message
++void
++console_sendf(const struct command_encoder *ce, va_list args)
++{
++    console_try_sendf(ce, 0, args);
+ }
+diff --git a/src/i2c_software.c b/src/i2c_software.c
+index ffbf754f0..c4c264b47 100644
+--- a/src/i2c_software.c
++++ b/src/i2c_software.c
+@@ -21,17 +21,26 @@ struct i2c_software {
+     uint32_t ticks;
+ };
+ 
++struct i2c_software *
++i2c_software_setup(uint32_t scl_pin, uint32_t sda_pin, uint32_t pulse_ticks
++                   , uint8_t addr)
++{
++    struct i2c_software *is = alloc_chunk(sizeof(*is));
++    is->ticks = pulse_ticks;
++    is->addr = (addr & 0x7f) << 1; // address format shifted
++    is->scl_out = gpio_out_setup(scl_pin, 1);
++    is->scl_in = gpio_in_setup(scl_pin, 1);
++    is->sda_out = gpio_out_setup(sda_pin, 1);
++    is->sda_in = gpio_in_setup(sda_pin, 1);
++    return is;
++}
++
+ void
+ command_i2c_set_sw_bus(uint32_t *args)
+ {
+     struct i2cdev_s *i2c = i2cdev_oid_lookup(args[0]);
+-    struct i2c_software *is = alloc_chunk(sizeof(*is));
+-    is->ticks = args[3];
+-    is->addr = (args[4] & 0x7f) << 1; // address format shifted
+-    is->scl_out = gpio_out_setup(args[1], 1);
+-    is->scl_in = gpio_in_setup(args[1], 1);
+-    is->sda_out = gpio_out_setup(args[2], 1);
+-    is->sda_in = gpio_in_setup(args[2], 1);
++    struct i2c_software *is = i2c_software_setup(args[1], args[2], args[3]
++                                                 , args[4]);
+     i2cdev_set_software_bus(i2c, is);
+ }
+ DECL_COMMAND(command_i2c_set_sw_bus,
+diff --git a/src/i2c_software.h b/src/i2c_software.h
+index 843ab461a..1bc9f0d4f 100644
+--- a/src/i2c_software.h
++++ b/src/i2c_software.h
+@@ -4,6 +4,8 @@
+ #include <stdint.h> // uint8_t
+ 
+ struct i2c_software *i2c_software_oid_lookup(uint8_t oid);
++struct i2c_software *i2c_software_setup(uint32_t scl_pin, uint32_t sda_pin
++                                        , uint32_t pulse_ticks, uint8_t addr);
+ int i2c_software_write(struct i2c_software *sw_i2c
+                        , uint8_t write_len, uint8_t *write);
+ int i2c_software_read(struct i2c_software *sw_i2c
+diff --git a/src/stm32/Kconfig b/src/stm32/Kconfig
+index cdfccbb28..c5babf76e 100644
+--- a/src/stm32/Kconfig
++++ b/src/stm32/Kconfig
+@@ -111,6 +111,9 @@ choice
+         bool "Nation N32G455"
+         select MACH_N32G45x
+         select MACH_STM32F1
++    config MACH_GD32F303
++        bool "GD32F303 (GigaDevice; Anycubic ACE 2 Pro)"
++        select MACH_STM32F1
+ endchoice
+ 
+ config MACH_STM32F103x6
+@@ -197,6 +200,7 @@ config MCU
+     default "stm32h750xx" if MACH_STM32H750
+     default "stm32l412xx" if MACH_STM32L412
+     default "stm32f103xe" if MACH_N32G45x
++    default "stm32f103xe" if MACH_GD32F303
+ 
+ config CLOCK_FREQ
+     int
+@@ -218,6 +222,8 @@ config CLOCK_FREQ
+     default 64000000 if MACH_N32G45x && STM32_CLOCK_REF_INTERNAL
+     default 96000000 if MACH_N32G45x && USB
+     default 128000000 if MACH_N32G45x
++    default 120000000 if MACH_GD32F303 && ACE2K_CLOCK_120M
++    default 72000000 if MACH_GD32F303
+ 
+ config FLASH_SIZE
+     hex
+@@ -231,6 +237,7 @@ config FLASH_SIZE
+     default 0x20000 if MACH_STM32H750
+     default 0x200000 if MACH_STM32H743 || MACH_STM32F765
+     default 0x20000 if MACH_N32G45x
++    default 0x40000 if MACH_GD32F303
+ 
+ config FLASH_BOOT_ADDRESS
+     hex
+@@ -259,6 +266,7 @@ config RAM_SIZE
+     default 0x24000 if MACH_STM32G0Bx
+     default 0x20000 if MACH_STM32H7
+     default 0x10000 if MACH_N32G45x
++    default 0xc000 if MACH_GD32F303
+ 
+ config STACK_SIZE
+     int
+@@ -428,6 +436,10 @@ choice
+         bool "Serial (on USART3 PD9/PD8)" if LOW_LEVEL_OPTIONS
+         depends on !MACH_STM32F0 && !MACH_STM32F401
+         select SERIAL
++    config STM32_SERIAL_UART4_PC11_PC10_RS485
++        bool "Serial (on UART4 PC11/PC10, RS-485 driver-enable PA11)" if LOW_LEVEL_OPTIONS
++        depends on MACH_GD32F303
++        select SERIAL
+     config STM32_SERIAL_USART3_ALT_PC11_PC10
+         bool "Serial (on USART3 PC11/PC10)" if LOW_LEVEL_OPTIONS
+         depends on MACH_STM32G474
+@@ -558,4 +570,6 @@ config STM32_CANBUS_PH13_PH14
+     bool
+     default y if STM32_MMENU_CANBUS_PH13_PH14 || STM32_CMENU_CANBUS_PH13_PH14
+ 
++source "src/ace2k/Kconfig"
++
+ endif
+diff --git a/src/stm32/Makefile b/src/stm32/Makefile
+index 3c158d518..91acab2be 100644
+--- a/src/stm32/Makefile
++++ b/src/stm32/Makefile
+@@ -22,6 +22,8 @@ CFLAGS-$(CONFIG_HAVE_LIMITED_CODE_SIZE) += -Os
+ CFLAGS-$(CONFIG_MACH_STM32F0) += -mcpu=cortex-m0 -Ilib/stm32f0/include
+ CFLAGS-$(CONFIG_MACH_STM32F103) += -mcpu=cortex-m3
+ CFLAGS-$(CONFIG_MACH_N32G45x) += -mcpu=cortex-m4 -Ilib/n32g45x/include
++CFLAGS-$(CONFIG_MACH_GD32F303) += -mcpu=cortex-m4
++src-$(CONFIG_MACH_GD32F303) += stm32/gd32f30x.c
+ CFLAGS-$(CONFIG_MACH_STM32F1) += -Ilib/stm32f1/include
+ CFLAGS-$(CONFIG_MACH_STM32F2) += -mcpu=cortex-m3 -Ilib/stm32f2/include
+ CFLAGS-$(CONFIG_MACH_STM32F4) += -mcpu=cortex-m4 -Ilib/stm32f4/include
+@@ -77,6 +79,7 @@ serial-src-$(CONFIG_MACH_STM32F0) := stm32/stm32f0_serial.c
+ serial-src-$(CONFIG_MACH_STM32G0) := stm32/stm32f0_serial.c
+ serial-src-$(CONFIG_MACH_STM32G4) := stm32/stm32f0_serial.c
+ serial-src-$(CONFIG_MACH_STM32H7) := stm32/stm32f0_serial.c
++serial-src-$(CONFIG_STM32_SERIAL_UART4_PC11_PC10_RS485) := ace2k_board/serial.c
+ src-$(CONFIG_SERIAL) += $(serial-src-y) generic/serial_irq.c
+ usb-src-$(CONFIG_HAVE_STM32_USBFS) := stm32/usbfs.c
+ usb-src-$(CONFIG_HAVE_STM32_USBOTG) := stm32/usbotg.c
+@@ -109,3 +112,6 @@ flash: $(OUT)klipper.bin lib/hidflash/hid-flash
+ serialflash: $(OUT)klipper.bin
+ 	@echo "  Flashing $< to $(FLASH_DEVICE) via stm32flash"
+ 	$(Q)stm32flash -w $< -v -g 0 $(FLASH_DEVICE)
++
++# ace2k: the Anycubic ACE 2 Pro modules, overlaid into src/ace2k by the ace2k build
++-include src/ace2k/Makefile
+diff --git a/src/stm32/adc.c b/src/stm32/adc.c
+index 39d4f6432..627f37c97 100644
+--- a/src/stm32/adc.c
++++ b/src/stm32/adc.c
+@@ -17,6 +17,8 @@ DECL_CONSTANT("ADC_MAX", 4095);
+ 
+ #define ADC_TEMPERATURE_PIN 0xfe
+ DECL_ENUMERATION("pin", "ADC_TEMPERATURE", ADC_TEMPERATURE_PIN);
++#define ADC_VREFINT_PIN 0xfd
++DECL_ENUMERATION("pin", "ADC_VREFINT", ADC_VREFINT_PIN);
+ 
+ static const uint8_t adc_pins[] = {
+     GPIO('A', 0), GPIO('A', 1), GPIO('A', 2), GPIO('A', 3),
+@@ -26,6 +28,7 @@ static const uint8_t adc_pins[] = {
+ 
+ #if CONFIG_MACH_STM32F1
+     ADC_TEMPERATURE_PIN,
++    ADC_VREFINT_PIN,
+ #elif CONFIG_MACH_STM32F2 || CONFIG_MACH_STM32F4x5
+     ADC_TEMPERATURE_PIN, 0x00, 0x00,
+ #elif CONFIG_MACH_STM32F401 || CONFIG_MACH_STM32F446
+@@ -107,7 +110,7 @@ gpio_adc_setup(uint32_t pin)
+         adc->CR2 = CR2_FLAGS;
+     }
+ 
+-    if (pin == ADC_TEMPERATURE_PIN) {
++    if (pin == ADC_TEMPERATURE_PIN || pin == ADC_VREFINT_PIN) {
+ #if CONFIG_MACH_STM32F401
+         ADC1_COMMON->CCR = ADC_CCR_TSVREFE;
+ #elif !CONFIG_MACH_STM32F1
+diff --git a/src/stm32/internal.h b/src/stm32/internal.h
+index a30bb6219..fd78c5edf 100644
+--- a/src/stm32/internal.h
++++ b/src/stm32/internal.h
+@@ -39,6 +39,10 @@ GPIO_TypeDef *gpio_pin_to_regs(uint32_t pin);
+ #define GPIO_ANALOG 3
+ void gpio_peripheral(uint32_t gpio, uint32_t mode, int pullup);
+ 
++// gd32f30x.c
++void clock_setup_gd32f30x(void);
++void timer_note_stall(uint32_t grace_us); // generic/armcm_timer.c
++
+ // clockline.c
+ void enable_pclock(uint32_t periph_base);
+ int is_enabled_pclock(uint32_t periph_base);
+diff --git a/src/stm32/stm32f1.c b/src/stm32/stm32f1.c
+index 2c5050e72..12940db6a 100644
+--- a/src/stm32/stm32f1.c
++++ b/src/stm32/stm32f1.c
+@@ -46,6 +46,8 @@ get_pclock_frequency(uint32_t periph_base)
+             return CONFIG_CLOCK_FREQ / 2;
+         return CONFIG_CLOCK_FREQ;
+     }
++    if (CONFIG_MACH_GD32F303 && CONFIG_CLOCK_FREQ > 72000000)
++        return CONFIG_CLOCK_FREQ / 4;
+     return CONFIG_CLOCK_FREQ / 2;
+ }
+ 
+@@ -354,7 +356,9 @@ armcm_main(void)
+     RCC->APB2ENR = 0;
+ 
+     // Setup clocks
+-    if (CONFIG_MACH_N32G45x)
++    if (CONFIG_MACH_GD32F303)
++        clock_setup_gd32f30x();
++    else if (CONFIG_MACH_N32G45x)
+         clock_setup_n32g45x();
+     else
+         clock_setup();

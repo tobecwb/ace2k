@@ -1,0 +1,17 @@
+# Klipper's style, for src/stm32/gd32f30x.c: 79 columns, return type on its own line.
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 79
+BreakBeforeBraces: Linux
+AlwaysBreakAfterReturnType: AllDefinitions
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+IndentCaseLabels: false
+PointerAlignment: Right
+SortIncludes: Never
+ReflowComments: false
+BreakBeforeBinaryOperators: All
+Cpp11BracedListStyle: false

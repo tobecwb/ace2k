@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+# Every job reads only; the release job asks for write on its own.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi clang clang-format clang-tidy cppcheck llvm python3-pytest
+          pipx install ruff
+      - run: make -C firmware doctor
+      - run: make -C firmware lint lint-selftest
+      - run: make -C firmware test
+      - run: make -C firmware coverage
+
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: true
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
+      # flag-check builds the release image (it depends on build), then checks it
+      - run: make -C firmware flag-check
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ace2k-image
+          path: |
+            firmware/build/ace2k-*.bin
+            firmware/build/ace2k-*.dict
+            firmware/build/ace2k-*.elf
+
+  # A tag opens a draft release. The maintainer checks it against the bench-tested image and
+  # publishes it by hand: a heater firmware is not released by a robot.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint-test, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: true
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
+      - run: make -C firmware flag-check
+      - run: cd firmware/build && sha256sum ace2k-*.bin ace2k-*.dict > SHA256SUMS
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            firmware/build/ace2k-*.bin
+            firmware/build/ace2k-*.dict
+            firmware/build/SHA256SUMS
