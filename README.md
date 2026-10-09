@@ -69,8 +69,8 @@ may void your warranty. This project is not affiliated with or endorsed by Anycu
 > - one unit on ace2k and another on the factory firmware;
 > - units in a daisy chain, whatever firmware they run.
 >
-> Support for several units is planned but not implemented yet
-> ([`docs/limitations.md`](docs/limitations.md#planned)).
+> Support for several units is not implemented, and not decided yet
+> ([`docs/roadmap.md`](docs/roadmap.md)).
 
 > [!WARNING]
 > **Do not leave a drying cycle unattended.** The dryer switches mains power to a heater. Only the
@@ -107,7 +107,8 @@ All the documents:
   feed-forward, encoder calibration, spool tags, drying, the lane LEDs
 - [`docs/differences-from-stock.md`](docs/differences-from-stock.md) — what behaves differently
   from the factory firmware
-- [`docs/limitations.md`](docs/limitations.md) — known limitations and what is planned
+- [`docs/limitations.md`](docs/limitations.md) — known limitations
+- [`docs/roadmap.md`](docs/roadmap.md) — what may come next
 - [`docs/logging.md`](docs/logging.md) — recording a long run, and what to attach to a problem
   report
 - [`docs/hardware.md`](docs/hardware.md) — the board: pins, sensors, links
