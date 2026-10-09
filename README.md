@@ -6,24 +6,27 @@ You declare the unit as `[mcu ace2k]` in `printer.cfg`, and add a small `[ace2k]
 The unit does these jobs on its own:
 
 - It dries filament.
-- It pulls in a filament you insert in a bay, and parks it (the load).
+- It loads filament: when you insert a filament in a bay, the unit pulls it in and parks it.
 - It finds and reads the RFID tag of each spool. The host then decodes what the tag says.
 
 The main target is the Snapmaker U1.
 
 ace2k should work with any Klipper printer. The unit becomes a Klipper MCU, and the `[ace2k]` host
-module does not depend on the printer. But it has only been tested on a Snapmaker U1. On the U1,
-the printer's own filament functions drive the unit through the adapter
-[ace2k-u1](https://github.com/tobecwb/ace2k-u1). On another printer, you drive the lanes from your
-own macros with the `ACE_*` commands ([`docs/commands.md`](docs/commands.md)).
+module does not depend on the printer. But it has only been tested on a Snapmaker U1:
 
-**Spool tags from almost any brand.** Spools carry two kinds of tag: NTAG and MIFARE Classic. The
-firmware reads both. The host decides what the tag means: each brand is a small Python decoder.
+- On the U1, the adapter [ace2k-u1](https://github.com/tobecwb/ace2k-u1) connects the printer's
+  own filament functions to the unit.
+- On another printer, you control the lanes from your own macros with the `ACE_*` commands
+  ([`docs/commands.md`](docs/commands.md)).
+
+**Spool tags from almost any brand.** Spool tags come in two kinds, NTAG and MIFARE Classic, and
+the firmware reads both. The host decodes what the tag says, with one small Python decoder per
+brand.
 
 - Decoded today: Anycubic, Bambu Lab and Snapmaker.
-- Written but off until read on a real tag: Elegoo and Creality.
-- Any other brand can be added on the host if its tag layout is known. For a MIFARE tag, its key
-  (or how to derive the key) must be known too. No firmware change and no reflash are needed
+- Written, but turned off until they are tested on a real tag: Elegoo and Creality.
+- Another brand can be added on the host if its tag layout is known. For a MIFARE tag, the key
+  (or how to derive it) must be known too. This needs no firmware change and no reflash
   ([`docs/features.md`](docs/features.md#spool-tags), "Adding a brand").
 
 Nothing is ever written to a tag.
@@ -43,13 +46,12 @@ documentation may read a little oddly. Corrections are welcome.
 **Risks.** Flashing third-party firmware onto your ACE 2 Pro carries a small but real risk of
 damaging it. What limits that risk:
 - ace2k never writes to the bootloader or to the unit's factory calibration pages; it only reads them.
-- If a flash is interrupted, the unit's bootloader stays in recovery mode and accepts a new image
-  over the same cable (`docs/flashing.md`).
-- The heater only runs with both fans on, and it stops if a temperature sensor fails. The unit's
+- If a flash is interrupted, the unit's bootloader stays in recovery mode. It accepts a new image
+  over the same cable ([`docs/flashing.md`](docs/flashing.md)).
+- The heater runs only with both fans on, and it stops if a temperature sensor fails. The unit's
   own 115 °C thermal cutout stays in place.
 
-What remains: the dryer switches mains power. Do not leave a drying cycle unattended. Tested only
-at 127 V / 60 Hz; 220–240 V / 50 Hz has never been tried.
+The main remaining risk is the dryer, because it switches mains power. See the warning below.
 
 **Disclaimer.** This software is provided "as is", without warranty of any kind (see `LICENSE`).
 You use it at your own risk. The author is not responsible for any damage to your unit, your
@@ -57,8 +59,7 @@ printer, your filament or anything else that results from installing or running 
 may void your warranty. This project is not affiliated with or endorsed by Anycubic or Snapmaker.
 
 **Tested on.** One Anycubic ACE 2 Pro unit on a Snapmaker U1 running the paxx extended firmware
-`1.6.0-paxx12-22`, at 127 V / 60 Hz. Nothing else has been tested. This is a Release Candidate: the
-long-run print test (burn-in) has not been done yet.
+`1.6.0-paxx12-22`, at 127 V / 60 Hz. Nothing else has been tested.
 
 > [!WARNING]
 > **Connect only one unit to the printer.** ace2k has been tested with one ACE 2 Pro only. With
@@ -74,7 +75,7 @@ long-run print test (burn-in) has not been done yet.
 > [!WARNING]
 > **Do not leave a drying cycle unattended.** The dryer switches mains power to a heater. Only the
 > author has tested it, for at most four hours of continuous drying, and only at 127 V / 60 Hz.
-> Nobody has run it on 220–240 V / 50 Hz mains yet. If that is your mains, expect to be the first.
+> Nobody has run it on 220–240 V / 50 Hz mains yet. If that is your mains, you will be the first.
 >
 > The firmware has its own protections:
 >
@@ -83,9 +84,10 @@ long-run print test (burn-in) has not been done yet.
 > - The heater stops when the chamber goes past its limit (the target + 10 °C, or 80 °C).
 > - A lost sensor, lost mains or stopped fans end the cycle.
 >
-> Automated tests cover these protections, but they were **not provoked on a real unit**. Doing so
-> could damage it, and the units are few and, where the author lives, very expensive. Below the
-> firmware, the unit's own 115 °C thermal cutout remains as a last, hardware protection.
+> Automated tests cover these protections. They have **not been triggered on purpose on a real
+> unit**, because that could damage it. The author has only a few units, and they are very
+> expensive where the author lives. If everything else fails, the unit's own 115 °C thermal cutout
+> is a last protection, in hardware.
 
 ## Documentation
 
@@ -123,7 +125,7 @@ guide.
 
 ## Build
 
-    git clone --recurse-submodules <url> ace2k && cd ace2k
+    git clone --recurse-submodules https://github.com/tobecwb/ace2k.git && cd ace2k
     git submodule update --init firmware/klipper   # in a clone made without --recurse-submodules
     scripts/doctor.sh          # the toolchain: Arm GNU Toolchain (with newlib), llvm, cppcheck,
                                # ruff, pytest
