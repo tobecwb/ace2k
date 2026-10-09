@@ -1,18 +1,14 @@
-# Known limitations and planned features
+# Known limitations
 
-ace2k is a Release Candidate. This page lists:
-
-- what you can run into today, and what to do about it;
-- what may come next.
+ace2k is a Release Candidate. This page lists what you can run into today, and what to do about it.
+What may come next is in the [roadmap](roadmap.md).
 
 It is the whole list. If something is not here, it either works as documented or is not known to
 us. The Snapmaker U1 items belong to the [`ace2k-u1`](https://github.com/tobecwb/ace2k-u1)
 adapter. Its [install guide](https://github.com/tobecwb/ace2k-u1/blob/main/docs/install.md) covers
 them in more detail.
 
-## Known limitations
-
-### What has not been tested yet
+## What has not been tested yet
 
 - **No long-run test yet.** There has been no long print with all four lanes in use. Short prints,
   loads, unloads and drying cycles have been run. Hours of continuous use have not. Expect rough
@@ -22,7 +18,7 @@ them in more detail.
   that comes from the design, not from a measurement. Do not leave a drying cycle unattended. If
   your mains is 220–240 V / 50 Hz, expect to be the first to try it.
 
-### Changing a spool on the Snapmaker U1
+## Changing a spool on the Snapmaker U1
 
 - **A new spool inserted while the head still holds a piece of the old filament stops short.** By
   design, the unit pulls the new filament in until its gear holds it (40 mm by default) and the
@@ -50,7 +46,7 @@ them in more detail.
   [When a spool runs out during a print](https://github.com/tobecwb/ace2k-u1/blob/main/docs/install.md#when-a-spool-runs-out-during-a-print).
   Watch the first such runout yourself.
 
-### Moving filament
+## Moving filament
 
 - **A long unload may end marked `stuck`.** A long unload can pull the end of the filament past
   the motor. The lane can then end in the error `stuck`, even though the eject worked and the
@@ -61,7 +57,7 @@ them in more detail.
   filament or straighten the tube, then run [`ACE_CLEAR`](commands.md#ace_clear). The duty guard
   of the catch handling is off by default ([`ACE_SNAG_SET`](commands.md#ace_snag_set)).
 
-### Drying
+## Drying
 
 - **The outlet runs hot.** Outlet air reaches about the target plus 7 °C. That is near where PLA
   softens. For PLA, choose a target well below its limit, and check the first cycles.
@@ -82,7 +78,7 @@ them in more detail.
   speed sensor. The unit infers a stopped fan from a temperature that rises faster than the heater
   can explain. The unit's own 115 °C thermal cutout stays in place as the last line.
 
-### Tags
+## Tags
 
 - **Elegoo and Creality are off.** Both formats ship disabled. No spool with such a tag was
   available, so neither has been read from a real tag. You can enable them at your own risk in
@@ -96,17 +92,3 @@ them in more detail.
   `ace2k_tags_cache.json` are kept.
 - **The U1 can undo a colour set from a tag.** On the Snapmaker U1, the adapter can set only a
   head's colour from a tag. The U1's own reader can then write its own value back over it.
-
-## Planned
-
-No dates are promised.
-
-- Several ACE 2 Pro units on one printer, each on its own USB port or in a daisy chain, in ace2k
-  and in the Snapmaker U1 adapter. Today exactly one unit is supported and tested.
-- A remaining-filament estimate per spool.
-- Rotating the spool while drying (rotisserie).
-- Writing tags.
-- Variable fan speed (today the fans are on or off only).
-- An automatic baseline for the insert sensor.
-- A fixed address per unit.
-- A per-lane odometer.

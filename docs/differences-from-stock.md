@@ -88,7 +88,7 @@ sits. Its record's RSA signature is not checked in this release.
 ## Not in ace2k (yet)
 
 This is what the factory firmware has, or the original protocol offers, that ace2k does not. The
-list of what may come next is in [`limitations.md#planned`](limitations.md#planned).
+list of what may come next is in [`roadmap.md`](roadmap.md).
 
 - **Automatic rotation of filament in the lanes** (the factory firmware's `auto_roll`, shipped
   off). Not implemented. The factory version walks filament out of lanes that are not threaded.
