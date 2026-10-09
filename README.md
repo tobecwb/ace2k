@@ -61,11 +61,14 @@ may void your warranty. This project is not affiliated with or endorsed by Anycu
 long-run print test (burn-in) has not been done yet.
 
 > [!WARNING]
-> **Connect only one unit to the printer.** ace2k has been tested with a single ACE 2 Pro
-> connected. Nobody knows what happens with more than one unit connected. That is true with both
-> units on ace2k, and with one on ace2k and one on the factory firmware. It is also true for two or
-> more units in a daisy chain, whatever firmware they run. To stay safe, connect one unit only.
-> Support for several units is not implemented yet; it is planned
+> **Connect only one unit to the printer.** ace2k has been tested with one ACE 2 Pro only. With
+> two or more units, the behaviour is unknown. This applies to every combination:
+>
+> - all units on ace2k;
+> - one unit on ace2k and another on the factory firmware;
+> - units in a daisy chain, whatever firmware they run.
+>
+> Support for several units is planned but not implemented yet
 > ([`docs/limitations.md`](docs/limitations.md#planned)).
 
 > [!WARNING]
