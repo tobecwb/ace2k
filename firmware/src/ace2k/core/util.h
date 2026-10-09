@@ -71,7 +71,7 @@ static inline uint16_t ace2k_crc16_ccitt(const uint8_t *data, size_t len)
     uint16_t crc = ACE2K_CRC16_INIT;
     for (size_t i = 0; i < len; i++) {
         crc ^= (uint16_t)((uint32_t)data[i] << 8U);
-        for (int bit = 0; bit < 8; bit++) {
+        for (int n = 0; n < 8; n++) {
             /* Shift in 32 bits: a uint16_t promotes to int, and the lint refuses a bitwise
              * operator on a signed operand. */
             uint32_t shifted = (uint32_t)crc << 1U;
@@ -91,7 +91,7 @@ static inline uint16_t ace2k_crc16_mcrf4xx_update(uint16_t crc, const uint8_t *d
 {
     for (size_t i = 0; i < len; i++) {
         crc ^= data[i];
-        for (int bit = 0; bit < 8; bit++) {
+        for (int n = 0; n < 8; n++) {
             uint32_t shifted = (uint32_t)crc >> 1U;
             crc = (crc & 1U) ? (uint16_t)(shifted ^ ACE2K_CRC16_MCRF4XX_POLY) : (uint16_t)shifted;
         }
@@ -114,7 +114,7 @@ static inline uint32_t ace2k_crc32_update(uint32_t crc, const uint8_t *data, siz
 {
     for (size_t i = 0; i < len; i++) {
         crc ^= data[i];
-        for (int bit = 0; bit < 8; bit++) {
+        for (int n = 0; n < 8; n++) {
             crc = (crc & 1U) ? (crc >> 1U) ^ ACE2K_CRC32_POLY : crc >> 1U;
         }
     }
