@@ -2334,8 +2334,9 @@ The G-code commands are a separate surface, described in [`commands.md`](command
 - a new value of a field whose values this section says may grow (a new event kind, a new refusal
   reason).
 
-Each addition raises `API_VERSION` by one, is listed with its number in the list at the top of this
-section, and has a line in the changelog.
+`API_VERSION` rises only with a public release, and only when that release adds to this section: by
+one, whatever the number of additions it carries. Each addition is listed under that number in the
+list at the top of this section, and has a line in the changelog.
 
 **What never changes without notice.** These are breaking changes:
 
