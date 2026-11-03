@@ -33,6 +33,8 @@ jobs:
           sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi clang clang-tidy cppcheck llvm
           pip install clang-format==23.1.2 ruff==0.16.9 'pytest>=8'
       - run: make -C firmware doctor
+      # the lint's binding check (tidy-bind) reads the configuration a build leaves in klipper/out
+      - run: make -C firmware build
       - run: make -C firmware lint lint-selftest
       - run: make -C firmware test
       - run: make -C firmware coverage
