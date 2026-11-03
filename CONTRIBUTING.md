@@ -451,7 +451,7 @@ not start (observed on the unit).
 
 ### Releases
 
-- SemVer `vX.Y.Z`.
+- SemVer `vX.Y.Z`. The version changes only with a public release, and only when it is needed.
 - A changelog by module.
 - The host interface only grows. A change that would break a caller follows
   [`docs/protocol.md`](docs/protocol.md), "What a caller can rely on": announced one release ahead,
