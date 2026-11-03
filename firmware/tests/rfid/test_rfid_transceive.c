@@ -14,6 +14,7 @@ struct ace2k_fake_rc522 {
     uint8_t fifo_out_len, fifo_out_pos;
     uint8_t log_reg[LOG_MAX], log_val[LOG_MAX];
     int log_len;
+    int xfers;
 };
 
 static void fake_nss(void *ctx, uint8_t reader, bool selected)
@@ -78,6 +79,7 @@ static void fake_xfer(void *ctx, uint8_t *buf, uint8_t len)
     struct ace2k_fake_rc522 *f = ctx;
     int r = sel(f);
     (void)len;
+    f->xfers++;
     if (r < 0) {
         return;
     }
@@ -95,7 +97,7 @@ static void fake_delay(void *ctx, uint32_t us)
     (void)us;
 }
 
-static const struct ace2k_rfid_reader_ops ace2k_fake_ops = {
+static const struct ace2k_rfid_reader_ops fake_ops = {
     .nss = fake_nss,
     .rst = fake_rst,
     .spi_xfer = fake_xfer,
@@ -114,7 +116,7 @@ static void rig_init(struct rig *g)
     *g = (struct rig){ 0 };
     g->f.regs[0][ACE2K_RFID_REG_VERSION] = 0x18;
     g->f.regs[1][ACE2K_RFID_REG_VERSION] = 0x18;
-    ace2k_rfid_reader_init(&g->r, &ace2k_fake_ops, &g->f);
+    ace2k_rfid_reader_init(&g->r, &fake_ops, &g->f);
     ace2k_rfid_transceive_init(&g->t, &g->r);
 }
 
@@ -171,6 +173,22 @@ TEST(the_field_is_bits_zero_and_one_of_tx_control_read_modify_write_and_read_bac
     ASSERT_TRUE(ace2k_rfid_transceive_field_driven(&g.t, ACE2K_RFID_READER_A));
     g.f.regs[0][ACE2K_RFID_REG_TX_CONTROL] = 0x82;
     ASSERT_TRUE(ace2k_rfid_transceive_field_driven(&g.t, ACE2K_RFID_READER_A));
+}
+
+TEST(the_field_calls_on_a_reader_out_of_range_touch_no_line_and_read_off)
+{
+    struct rig g;
+    rig_init(&g);
+    ASSERT_EQ(ace2k_rfid_transceive_configure(&g.t, ACE2K_RFID_READER_A), 0);
+    ace2k_rfid_transceive_field_set(&g.t, ACE2K_RFID_READER_A, true);
+    int xfers = g.f.xfers;
+    ace2k_rfid_transceive_field_set(&g.t, 2, true);
+    ace2k_rfid_transceive_field_set(&g.t, 2, false);
+    ASSERT_TRUE(!ace2k_rfid_transceive_field_is_on(&g.t, 2));
+    ASSERT_TRUE(!ace2k_rfid_transceive_field_driven(&g.t, 2));
+    ace2k_rfid_transceive_crypto_off(&g.t, 2);
+    ASSERT_EQ(g.f.xfers, xfers);
+    ASSERT_TRUE(ace2k_rfid_transceive_field_is_on(&g.t, ACE2K_RFID_READER_A)); /* untouched */
 }
 
 TEST(start_writes_idle_clear_flush_fifo_framing_command_then_start_send)

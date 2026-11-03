@@ -1,454 +1,435 @@
-"""ace2k_feed — the filament lanes of the ace2k firmware on the host.
+"""The filament lanes of the ace2k firmware, on the host.
 
-The G-codes a macro needs — ``ACE_FEED``, ``ACE_ROLLBACK``, ``ACE_UNLOAD``, ``ACE_LOAD`` (waiting
-by default: the command returns on the move's final event, and an error kind is a G-code error;
-``WAIT=0`` returns at once), ``ACE_ASSIST`` (``DIR=BACK``, ``DIR=BOTH`` the follow,
-``OFF=1``), ``ACE_STOP``, ``ACE_CLEAR``, ``ACE_SPEED``, ``ACE_CALIBRATE_ENCODER``,
-``ACE_LOAD_SET``, ``ACE_SNAG_SET``, ``ACE_FOLLOW_SET`` (``FLIP_MS``, ``TAKE_MM``, ``TAIL_MM``),
-``ACE_FF_SET``, ``ACE_FEED_FORWARD`` and ``ACE_GRIP`` (a lane's grip: its next automatic load
-pulls only that much, without the tag search)
-(``ace2k_ff.py``, the feed-forward: the planner's moves metered to the lane in follow) — and the
-tunables of ``[ace2k]`` sent
-to the unit: the encoder scales and the supervisors' thresholds as config commands (a change
-restarts the MCU, as the insert thresholds do); every lane's encoder scale again, the load
-settings, the tip snag's, the follow's and the feed-forward's values as init commands (at every
-connect, so a value set live — a scale applied by the automatic calibration too — never outlives
-the session), the last four again on every ``ACE_LOAD_SET`` / ``ACE_SNAG_SET`` /
-``ACE_FOLLOW_SET`` / ``ACE_FF_SET``.  The ``ace2k_feed_state`` and ``ace2k_feed_ff_state`` reports
-and the ``ace2k_feed_event`` events land in the lanes' status; every
-event is a log line and the Klipper event ``ace2k:feed_event`` (lane, event) for other modules,
-and a ``snag`` notice is printed to the console too.  A runout in the follow is its tail:
-the ``tail`` notice, the lane's ``tail`` True in its status until the tail's final event or the lane
-leaving ``following`` (a filament pushed in at the bay during the tail changes nothing), and the
-final ``tail_out`` — no error.  A push toward the head that meets what cannot move ends ``blocked``,
-no error either: the lane idle, the filament waiting where it stopped. Every start carries a
-per-lane sequence (1..255) the unit echoes in the events of the move it started, and a waiting
-G-code completes only on its own sequence — a late event of an earlier move, or one of a motion the
-unit started itself (sequence 0), passes by; until a lane's first start of the session the counter
-follows the sequence the state report shows for the lane — the last start issued on it, kept through
-idle and error — so a new session continues after an earlier one and never shares a sequence with a
-move still running or one that just ended (a start before the session's first report waits for it).
-Loaded by ``[ace2k]``; a firmware built without ``CONFIG_ACE2K_FEED`` (no ``ace2k_feed_start`` in
-its dictionary) is logged, and every G-code here then answers with an error.  A waiting G-code holds
-the G-code queue as Klipper's own ``G4`` does; on a bench, ``WAIT=0`` and the event log are the
-tools.  Other host modules start, stop and clear a lane's move, and map a lane to the extruder it
-feeds, through the host interface (``API_VERSION``: ``start_move``, ``stop``, ``clear``,
-``set_lane_extruder``, ``set_lane_grip``, ``Move``, ``FeedRefused``), callable where a G-code is not
-— see ``docs/protocol.md``.
+This module provides the G-codes that a macro needs:
+
+- ``ACEK_FEED``, ``ACEK_ROLLBACK``, ``ACEK_UNLOAD`` and ``ACEK_LOAD`` wait by default. The
+  command returns on the final event of the move, and an error event becomes a G-code error.
+  ``WAIT=0`` returns at once.
+- ``ACEK_ASSIST`` arms the assist. ``DIR=BACK`` is the reverse, ``DIR=BOTH`` is the follow, and
+  ``OFF=1`` disarms it.
+- ``ACEK_STOP``, ``ACEK_CLEAR``, ``ACEK_SPEED`` and ``ACEK_CALIBRATE_ENCODER``.
+- ``ACEK_LOAD_SET``, ``ACEK_SNAG_SET``, ``ACEK_FOLLOW_SET`` (``FLIP_MS``, ``TAKE_MM``,
+  ``TAIL_MM``) and ``ACEK_FF_SET`` change the settings.
+- ``ACEK_FEED_FORWARD`` controls the feed-forward (see ``ace2k_ff.py``). The feed-forward meters
+  the moves of the planner out to the lane that is in the follow.
+- ``ACEK_GRIP`` sets the grip of a lane. The next automatic load of the lane then pulls only that
+  much, without the tag search.
+
+Config keys
+-----------
+The module sends the tunable keys of ``[ace2k]`` to the unit as init commands at every connect.
+They are never part of the config checksum of Klipper, so a changed key never resets the MCU.
+The keys are:
+
+- the thresholds of the supervisors,
+- the encoder scale of each lane,
+- the load settings,
+- the values of the tip snag, the follow and the feed-forward.
+
+The values go out as init commands at every connect. So a value that was set live, such as a scale
+from the automatic calibration, never outlives the session. The load, snag, follow and
+feed-forward values are sent again by every ``ACEK_LOAD_SET``, ``ACEK_SNAG_SET``,
+``ACEK_FOLLOW_SET`` and ``ACEK_FF_SET``.
+
+Reports and events
+------------------
+The reports ``ace2k_feed_state`` and ``ace2k_feed_ff_state`` and the events ``ace2k_feed_event``
+update the status of the lanes. Every event is written to the log and sent as the Klipper event
+``ace2k:feed_event`` (lane, event) for other modules. A ``snag`` notice is also printed to the
+console.
+
+When the filament runs out during the follow, the lane enters its tail. The ``tail`` notice
+arrives, and the ``tail`` value of the lane is True in its status. It stays True until the final
+event of the tail, or until the lane leaves ``following``. A filament that is pushed into the bay
+during the tail changes nothing. The tail ends with the final event ``tail_out``, which is not an
+error.
+
+A push toward the head can meet something that cannot move. It then ends as ``blocked``, which is
+also not an error. The lane is idle, and the filament waits where it stopped.
+
+Sequence numbers
+----------------
+Every start carries a sequence number for its lane (1..255). The unit repeats it in the events of
+the move that it started. A G-code that waits completes only on its own sequence. A late event
+of an earlier move passes by. So does an event of a motion that the unit started itself
+(sequence 0).
+
+Until the first start on a lane in a session, the counter follows the sequence that the state
+report shows for the lane. That is the last start on it, which the unit keeps through idle and
+error. So a new session continues after an earlier one. It never shares a sequence with a move that
+still runs or has just ended. A start before the first report of the session waits for it.
+
+Other notes
+-----------
+``[ace2k]`` loads this module. If the firmware is built without ``CONFIG_ACE2K_FEED`` (there is no
+``ace2k_feed_start`` in its dictionary), a log line says so, and every G-code here answers with an
+error. A G-code that waits holds the G-code queue, as the ``G4`` of Klipper does. When you test
+by hand, use ``WAIT=0`` and the event log.
+
+Other host modules can use the host interface instead of G-codes. It can start, stop and clear
+the move of a lane, change its speed, and map a lane to the extruder that it feeds. It consists
+of ``start_move``, ``stop``, ``clear``, ``set_speed``, ``set_lane_extruder``, ``set_lane_grip``,
+``set_lane_park``, ``set_lane_wait``, ``set_lane_follow``, ``default_move``, ``Move`` and
+``FeedRefused``. These work where a G-code cannot be used. The version is ``API_VERSION``, and
+``docs/protocol.md`` describes the interface.
+
+Only one start can be in flight per lane. A start is refused as ``busy`` and nothing is sent if
+the previous start of the lane still waits for its answer. A ``stopped`` event carries
+``stop_by``, which says who sent the stop that it answers. It is ``"command"`` for a G-code and
+``"host"`` for a host module.
+
+``follow_default`` (see ``ace2k_follow.py``) arms the follow on every lane that has filament at
+the start, and after an insertion.
+
+Example configuration::
 
     [ace2k]
-    #feed_speed: 30             # mm/s, the default of ACE_FEED and ACE_ROLLBACK
-    #unload_speed: 30
-    #load_speed: 30
-    #load_park_mm: 300          # the load's parking distance: the path from the drive to the outlet
-    #                            # (323 mm on the development unit) minus a margin
-    #auto_load: True            # pull a filament in to the parking point when it is inserted
+    #feed_speed: 30             # mm/s, the default of ACEK_FEED and ACEK_ROLLBACK
+    #unload_speed: 70
+    #load_speed: 60
+    #load_park_mm: 300          # the parking distance of the load: the path from the motor to the
+    #                           # outlet (323 mm on the development unit), minus a margin
+    #auto_load: True            # pull in a filament to the parking point when it is inserted
     #assist_speed: 50
-    #slip_check_mm: 50          # the supervisors' thresholds; an absent key leaves the firmware's
-    #slip_allow_mm: 15          # under slip_check_mm, or the partial slip check could never trip
-    #stall_check_mm: 20
-    #snag_fwd_mm: 20            # the tip snag: motor past a full before the touch (5–50)
-    #snag_lag_mm: 5             # the filament behind the motor that is a jam (1–20, under fwd)
-    #snag_duty_pct: 0           # the duty above the feed-forward that is a jam (0 off, 0–100)
-    #snag_back_mm: 5            # the touch (2–20)
-    #snag_rest_ms: 500          # the wait for the plunger at rest (100–2000)
-    #snag_free_mm: 50           # reverse: the filament back before a taut trip is forgiven (20–200)
-    #follow_flip_ms: 200        # the follow: the wait before a move against the last one (50–2000)
-    #follow_take_mm: 15         # the follow's take-up on this lane's full (5–30)
-    #follow_tail_mm: 2000       # the follow's tail: motor after a runout before it ends (200–2000)
-    #ff_chunk_mm: 3             # the feed-forward's dose (1–10)
-    #ff_pulse: 15               # mm/s, a dose's speed (the lane's speed bounds)
-    #lane1_encoder_scale: 1.2342   # mm per encoder count, lane1..lane4 (ACE_CALIBRATE_ENCODER)
-    #feed_report_hz: 1          # 0.05–10 Hz; 1, 2, 5 and 10 are exact, the rest snap to the grid
+    #slip_check_mm: 50          # thresholds of the supervisors; a missing key leaves the firmware
+    #slip_allow_mm: 15          # default; keep it under slip_check_mm, or the partial slip check
+    #stall_check_mm: 20         # can never trip
+    #snag_fwd_mm: 20            # tip snag: motor travel past "full" before the touch (5-50)
+    #snag_lag_mm: 5             # filament lag behind the motor that counts as a jam (1.5-20, < fwd)
+    #snag_duty_pct: 0           # motor duty above the feed-forward that counts as a jam (0-100)
+    #snag_back_mm: 5            # the touch (2-20)
+    #snag_rest_ms: 500          # wait for the plunger to be at rest (100-2000)
+    #snag_free_mm: 50           # reverse: filament travel back before a taut trip is forgiven
+    #                           # (20-200)
+    #follow_default: True       # arm the follow on every lane with filament (ace2k_follow.py)
+    #follow_lanes: all          # all, or extruder: only a lane that feeds an extruder
+    #follow_flip_ms: 200        # follow: wait before a move against the last one (50-2000)
+    #follow_take_mm: 15         # follow: take-up on the full signal of this lane (5-30)
+    #follow_tail_mm: 2000       # follow: motor travel after a runout before the tail ends
+    #                           # (200-2000)
+    #unload_clear_mm: 20        # an unload: motor travel past the bay's sensor before it ends
+    #                           # (0-100)
+    #ff_chunk_mm: 3             # feed-forward: size of a dose (1-10)
+    #ff_pulse: 15               # retired: the next version removes it. mm/s, least speed of a
+    #                           # reverse dose; a forward dose runs at the floor speed
+    #lane1_encoder_scale: 1.2342   # mm per encoder count, lane1..lane4 (ACEK_CALIBRATE_ENCODER)
+    #feed_report_hz: 1          # 0.05-10 Hz; 1, 2, 5 and 10 are exact, others snap to the grid
 
-The tip snag's values are the firmware's own, settled at the bench.
-``snag_duty_pct`` stays 0, the duty guard off: built as a second guard for a hold the filament
-slips through, it did not prove effective there — the lag ended every jam first, and a fixed
-excess over the feed-forward has no margin (≤ 9 points healthy, 10–14 a jam) — and it is kept for
-a possible future case; the rise since the full, which cancels a spool's drag, would be the better
-reading (not built).  ``snag_lag_mm: 12`` was tried there and is an option.
+The snag values are the values of the firmware. ``snag_duty_pct`` stays at 0, which means that
+the duty guard is off. The guard was built as a second check for a hold that the filament slips
+through, but it did not prove effective. The lag check ended every jam first, and a fixed excess
+over the feed-forward has no safe margin. A healthy lane shows up to 9 points of excess, and a
+jam shows 10 to 14. The key stays for a possible future case. A better signal would be the rise
+since the full signal, which cancels the drag of a spool. That is not built.
+``snag_lag_mm: 12`` is an option.
 
-With the tag reader (``ace2k_rfid.py``, whose ``rfid_search_mm`` this module reads too) a load
-whose tag is not read by the parking point searches on and comes back, and a waited ``ACE_LOAD``
-allows for that travel; unset, the reach is the firmware's default.
+With the tag reader (``ace2k_rfid.py``, whose ``rfid_search_mm`` this module also reads), a load
+whose tag is not read by the parking point searches further and then comes back. A waited
+``ACEK_LOAD`` allows time for that travel. If ``rfid_search_mm`` is not set, the reach is the
+default of the firmware.
 """
 
+from __future__ import annotations
+
 import logging
-import math
 import struct
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 try:
-    from . import ace2k_encoder_cal, ace2k_ff
-    from .ace2k import probe_format, refuse_format, subscribe_response
-except ImportError:  # the host tests put klippy/extras on the path and import by bare name
-    import ace2k_encoder_cal
-    import ace2k_ff
-    from ace2k import probe_format, refuse_format, subscribe_response
+    from .ace2k_feed_connect import (
+        DEFAULT_SCALE_MM,
+        NO_GRIP,
+        NO_PARK,
+        NO_WAIT,
+        SCALE_TOLERANCE,
+    )
+    from .ace2k_feed_motion import (  # noqa: F401 — re-exported
+        CMD_MODES,
+        COMMANDED_KEEP,
+        GONE_REPORTS,
+        NO_FOLLOW,
+        PAUSE_WAIT_S,
+        SESSION_ALLOWANCE_MM,
+        WAIT_MARGIN_S,
+        LaneMotion,
+        Start,
+    )
+    from .ace2k_feed_proto import (  # noqa: F401 — re-exported
+        API_VERSION,
+        BASE_FMT,
+        BASE_FMT_FORWARD,
+        CLEAR_FMT,
+        DEFAULT_SEARCH_MM,
+        ERROR_KIND_NAMES,
+        ERROR_KINDS,
+        EVENT_FMT,
+        FAILED_KIND_NAMES,
+        FF_FMT,
+        FF_QUERY_FMT,
+        FF_STATE_FMT,
+        FF_STATE_FMT_FORWARD,
+        FOLLOW_FMT,
+        GRIP_FMT,
+        HELD_SET_FMT,
+        KIND_NAMES,
+        LOAD_SET_FMT,
+        MODE_NAMES,
+        NO_CLEAR,
+        NO_FF,
+        NO_STOP,
+        NOTICE_KIND_NAMES,
+        NOTICE_KINDS,
+        PARK_FMT,
+        REFUSAL_NAMES,
+        REVERSE_CONSTANT,
+        SCALE_FMT,
+        SEARCH_FMT,
+        SNAG_FMT,
+        SPEED_FMT,
+        SPEED_RESP,
+        STALE_SENSORS_KIND,
+        STALE_SENSORS_TEXT,
+        START_FMT,
+        START_RESP,
+        STATE_FMT,
+        STOP_FMT,
+        STOP_KINDS,
+        STOP_WHEN_FMT,
+        STOP_WHEN_RESP,
+        UNLOAD_SET_FMT,
+        WAIT_FMT,
+        Move,
+        firmware_search_mm,
+        half_mm,
+        scale_x10,
+        to_mm,
+        to_um,
+    )
+    from .ace2k_feed_settings import (  # noqa: F401 — re-exported
+        FF,
+        FF_SETTINGS,
+        FOLLOW,
+        FOLLOW_INT_KEYS,
+        FOLLOW_SETTINGS,
+        HELD,
+        HELD_SETTINGS,
+        SNAG,
+        SNAG_DEFAULT_CONSTANTS,
+        SNAG_INT_KEYS,
+        SNAG_SETTINGS,
+        THRESHOLD_DEFAULT_CONSTANTS,
+        THRESHOLD_DEFAULTS,
+        UNLOAD,
+        UNLOAD_SETTINGS,
+        old_lag_text,
+        raise_old_lag,
+        read_thresholds,
+        setting_bound_error,
+        setting_round,
+        setting_text,
+        threshold_defaults,
+        threshold_error,
+        thresholds_cmd_text,
+    )
+    from .ace2k_link import (  # noqa: F401 — LANE_ALL, FeedRefused
+        LANE_ALL,
+        LANES,
+        NO_FEED,
+        NO_LANE,
+        FeedRefused,
+        check_lane,
+    )
+    from .ace2k_units import unprefixed
+except ImportError:  # the host tests import by bare name, with klippy/extras on the path
+    from ace2k_feed_connect import (  # type: ignore[import-not-found, no-redef]
+        DEFAULT_SCALE_MM,
+        NO_GRIP,
+        NO_PARK,
+        NO_WAIT,
+        SCALE_TOLERANCE,
+    )
+    from ace2k_feed_motion import (  # type: ignore[import-not-found, no-redef]  # noqa: F401 — re-exported
+        CMD_MODES,
+        COMMANDED_KEEP,
+        GONE_REPORTS,
+        NO_FOLLOW,
+        PAUSE_WAIT_S,
+        SESSION_ALLOWANCE_MM,
+        WAIT_MARGIN_S,
+        LaneMotion,
+        Start,
+    )
+    from ace2k_feed_proto import (  # type: ignore[import-not-found, no-redef]  # noqa: F401 — re-exported
+        API_VERSION,
+        BASE_FMT,
+        BASE_FMT_FORWARD,
+        CLEAR_FMT,
+        DEFAULT_SEARCH_MM,
+        ERROR_KIND_NAMES,
+        ERROR_KINDS,
+        EVENT_FMT,
+        FAILED_KIND_NAMES,
+        FF_FMT,
+        FF_QUERY_FMT,
+        FF_STATE_FMT,
+        FF_STATE_FMT_FORWARD,
+        FOLLOW_FMT,
+        GRIP_FMT,
+        HELD_SET_FMT,
+        KIND_NAMES,
+        LOAD_SET_FMT,
+        MODE_NAMES,
+        NO_CLEAR,
+        NO_FF,
+        NO_STOP,
+        NOTICE_KIND_NAMES,
+        NOTICE_KINDS,
+        PARK_FMT,
+        REFUSAL_NAMES,
+        REVERSE_CONSTANT,
+        SCALE_FMT,
+        SEARCH_FMT,
+        SNAG_FMT,
+        SPEED_FMT,
+        SPEED_RESP,
+        STALE_SENSORS_KIND,
+        STALE_SENSORS_TEXT,
+        START_FMT,
+        START_RESP,
+        STATE_FMT,
+        STOP_FMT,
+        STOP_KINDS,
+        STOP_WHEN_FMT,
+        STOP_WHEN_RESP,
+        UNLOAD_SET_FMT,
+        WAIT_FMT,
+        Move,
+        firmware_search_mm,
+        half_mm,
+        scale_x10,
+        to_mm,
+        to_um,
+    )
+    from ace2k_feed_settings import (  # type: ignore[import-not-found, no-redef]  # noqa: F401 — re-exported
+        FF,
+        FF_SETTINGS,
+        FOLLOW,
+        FOLLOW_INT_KEYS,
+        FOLLOW_SETTINGS,
+        HELD,
+        HELD_SETTINGS,
+        SNAG,
+        SNAG_DEFAULT_CONSTANTS,
+        SNAG_INT_KEYS,
+        SNAG_SETTINGS,
+        THRESHOLD_DEFAULT_CONSTANTS,
+        THRESHOLD_DEFAULTS,
+        UNLOAD,
+        UNLOAD_SETTINGS,
+        old_lag_text,
+        raise_old_lag,
+        read_thresholds,
+        setting_bound_error,
+        setting_round,
+        setting_text,
+        threshold_defaults,
+        threshold_error,
+        thresholds_cmd_text,
+    )
+    from ace2k_link import (  # type: ignore[import-not-found, no-redef]  # noqa: F401 — LANE_ALL and FeedRefused re-exported
+        LANE_ALL,
+        LANES,
+        NO_FEED,
+        NO_LANE,
+        FeedRefused,
+        check_lane,
+    )
+    from ace2k_units import unprefixed  # type: ignore[import-not-found, no-redef]
 
-LANES = 4
-LANE_ALL = 255
-MODE_NAMES = {
-    0: "idle",
-    1: "feeding",
-    2: "rolling_back",
-    3: "unloading",
-    4: "loading",
-    5: "assisting",
-    6: "assisting_back",
-    7: "error",
-    8: "following",
-}
-MODE_ERROR = 7
-KIND_NAMES = {
-    0: "done",
-    1: "stopped",
-    2: "stopped_link",
-    3: "stopped_shutdown",
-    4: "runout",
-    5: "loaded",
-    6: "unloaded",
-    7: "stuck",
-    8: "tangled",
-    9: "motor_stalled",
-    10: "timeout",
-    11: "assist_stall",  # reserved, never sent: the comparator's tangled answers the case
-    12: "assist_overrun",
-    13: "unload_incomplete",
-    14: "behind",
-    15: "snag",
-    16: "tail",  # a notice: the insert fell in the follow, which feeds on as the filament's tail
-    17: "tail_out",  # final, no error: the tail has left the drive, or the tail's bound reached
-    18: "blocked",  # final, no error: a feed or a load's pull met what cannot move; the lane idle
-}
-ERROR_KINDS = frozenset(range(7, 14))
-NOTICE_KINDS = frozenset({14, 15, 16})
-KIND_TAIL = 16
-CMD_MODES = {
-    "feed": 0,
-    "rollback": 1,
-    "assist": 2,
-    "assist_back": 3,
-    "unload": 4,
-    "load": 5,
-    "assist_both": 6,
-}
-# ACE_ASSIST's DIR: absent or FORWARD the forward assist, BACK the reverse, BOTH the follow
+try:
+    from . import ace2k_encoder_cal, ace2k_ff, ace2k_follow
+    from .ace2k_feed_connect import FeedConnect
+    from .ace2k_feed_motion import FeedMotion
+except ImportError:  # the host tests import by bare name, with klippy/extras on the path
+    import ace2k_encoder_cal  # type: ignore[import-not-found, no-redef]
+    import ace2k_ff  # type: ignore[import-not-found, no-redef]
+    import ace2k_follow  # type: ignore[import-not-found, no-redef]
+    from ace2k_feed_connect import FeedConnect  # type: ignore[no-redef]
+    from ace2k_feed_motion import FeedMotion  # type: ignore[no-redef]
+
+if TYPE_CHECKING:
+    from .ace2k_feed_base import UnitProto
+    from .ace2k_klipper_types import Command, Config, GCodeCommand, Params
+
+# The DIR argument of ACEK_ASSIST. If it is missing or FORWARD, the assist goes forward.
+# BACK is the reverse and BOTH is the follow.
 ASSIST_DIRS = {"": "assist", "FORWARD": "assist", "BACK": "assist_back", "BOTH": "assist_both"}
-REFUSAL_NAMES = {
-    0: "ok",
-    1: "busy",
-    2: "in_error",
-    3: "no_filament",
-    4: "no_link",
-    5: "bounds",
-    6: "other_lane",
-}
-DEFAULT_SCALE_MM = 1.2342  # the firmware's default: mm per encoder count
-SCALE_TOLERANCE = 0.2  # the firmware accepts ±20 % of the default
-# The firmware's defaults (docs/protocol.md): sent, all three, only when a key is present
-THRESHOLD_DEFAULTS = {
-    "slip_check_mm": 50.0,
-    "slip_allow_mm": 15.0,
-    "stall_check_mm": 20.0,
-}
-# The tip snag's values: config key, ACE_SNAG_SET argument, the
-# multiplier to the unit's unit, and the bounds in the key's unit — the firmware's (feed.h
-# ACE2K_FEED_SNAG_*_MIN/_MAX; a host test reads the header).  Sent, all six, as an init command
-# at every connect, as the load settings.
-SNAG_SETTINGS = (
-    ("snag_fwd_mm", "FWD", 1000, 5.0, 50.0),
-    ("snag_lag_mm", "LAG", 1000, 1.0, 20.0),
-    ("snag_duty_pct", "DUTY", 1, 0, 100),
-    ("snag_back_mm", "BACK", 1000, 2.0, 20.0),
-    ("snag_rest_ms", "REST", 1, 100, 2000),
-    ("snag_free_mm", "FREE", 1000, 20.0, 200.0),
-)
-# the firmware's defaults, read from its dictionary at connect
-SNAG_DEFAULT_CONSTANTS = {
-    "snag_fwd_mm": "ACE2K_FEED_SNAG_FWD_UM",
-    "snag_lag_mm": "ACE2K_FEED_SNAG_LAG_UM",
-    "snag_duty_pct": "ACE2K_FEED_SNAG_DUTY_PCT",
-    "snag_back_mm": "ACE2K_FEED_SNAG_BACK_UM",
-    "snag_rest_ms": "ACE2K_FEED_SNAG_REST_MS",
-    "snag_free_mm": "ACE2K_FEED_SNAG_FREE_UM",
-}
-SNAG_INT_KEYS = frozenset({"snag_duty_pct", "snag_rest_ms"})
-# The follow's values: config key, ACE_FOLLOW_SET argument, the
-# multiplier to the unit's unit, and the dictionary constant of the default — the bounds are the
-# constants beside it (<name>_MIN, <name>_MAX), read at connect.  Sent, both, as an init command
-# at every connect, as the snag's values; an image without the constants — the tail's included
-# (the command carries it since v0.11.0) — has no follow.
-FOLLOW_SETTINGS = (
-    ("follow_flip_ms", "FLIP_MS", 1, "ACE2K_FEED_FOLLOW_FLIP_MS"),
-    ("follow_take_mm", "TAKE_MM", 1000, "ACE2K_FEED_FOLLOW_TAKE_UM"),
-    ("follow_tail_mm", "TAIL_MM", 1000, "ACE2K_FEED_FOLLOW_TAIL_UM"),
-)
-FOLLOW_INT_KEYS = frozenset({"follow_flip_ms"})
-FOLLOW_FMT = "ace2k_feed_follow_set flip_ms=%u take_um=%u tail_um=%u"
-NO_FOLLOW = "the unit's firmware has no follow tail (or no follow); flash v0.11.0"
-# The grip: a lane's next automatic load pulls only grip_um, without
-# the tag search, and ends loaded.  Its default and bounds are the dictionary's (read at connect,
-# with the command); an image without them has no grip — set_lane_grip and ACE_GRIP say so.
-GRIP_FMT = "ace2k_feed_lane_grip lane=%c grip_um=%u"
-GRIP_CONSTANT = "ACE2K_FEED_GRIP_UM"
-NO_GRIP = "the unit's firmware has no grip; flash v0.11.0"
-# The feed-forward's unit values, as the follow's: config key,
-# ACE_FF_SET argument, the multiplier to the unit's unit, the dictionary constant of the default
-# (<name>_MIN, <name>_MAX beside it).  Sent, both, as an init command at every connect; an image
-# without the constants has no feed-forward — it is off, said once on the console, never sent to.
-FF_SETTINGS = (
-    ("ff_chunk_mm", "CHUNK_MM", 1000, "ACE2K_FEED_FF_CHUNK_UM"),
-    ("ff_pulse", "PULSE", 1000, "ACE2K_FEED_FF_PULSE_UM_S"),
-)
-FF_FMT = "ace2k_feed_ff_set chunk_um=%u pulse_um_s=%u"
-FF_STATE_FMT = "ace2k_feed_ff_state doses=%*s taut=%*s full=%*s epoch=%*s"
-FF_QUERY_FMT = "ace2k_feed_ff_query rest_ticks=%u"
-# ACE_FF_SET's host-side arguments: argument, attribute, (key, default, min, max), integer
+# The tables of the thresholds, the snag, the follow and the feed-forward are in
+# ace2k_feed_settings. The constants and texts of the keys are in ace2k_feed_connect.
+# The host-side arguments of ACEK_FF_SET. Each entry is: argument, attribute,
+# (key, default, min, max), and whether the value is an integer.
 FF_HOST_ARGS = (
     ("WINDOW_MS", "window_ms", ace2k_ff.WINDOW_MS, True),
     ("LEAD_MS", "lead_ms", ace2k_ff.LEAD_MS, True),
-    ("DEADBAND", "deadband", ace2k_ff.DEADBAND, False),
+    ("DEADBAND", "deadband_mm_s", ace2k_ff.DEADBAND, False),
+    ("RETRACT_MIN_MM", "retract_min_mm", ace2k_ff.RETRACT_MIN_MM, False),
 )
-# The unit takes every value whole in its own unit (µm, %, ms): a value is rounded to that
-# resolution as it is read, and the bounds, lag < fwd, the value staged and the value sent are all
-# judged on the rounded one — the firmware's own checks see exactly what the host checked.
-SNAG_FMT = "ace2k_feed_snag_set fwd_um=%u lag_um=%u duty_pct=%c back_um=%u rest_ms=%u free_um=%u"
-WAIT_FACTOR = 1.5  # a waited move's timeout: this × the expected time …
-WAIT_MARGIN_S = 5.0  # … plus this
-SEQ_MAX = 255  # the sequence wraps past it to 1; 0 is the unit's own (a motion it started itself)
-COMMANDED_KEEP = 8  # starts whose length is kept per lane until their event lands
-# A start before the session's first state report waits this many report periods for it, plus
-# WAIT_MARGIN_S: two, so that a first report lost on the way — to a full transmit buffer, or to
-# the half-duplex turnaround — is covered by the next
-STATE_WAIT_PERIODS = 2
-FEED_REPORT_HZ = 1.0
-# The report phases (docs/protocol.md "Reports") keep the unit's periodic reports on different
-# ticks only for periods on this grid, so the asked rate is snapped to it
-REPORT_GRID_MS = 100
-START_FMT = "ace2k_feed_start lane=%c mode=%c length_um=%u speed_um_s=%u seq=%c"
-START_RESP = "ace2k_feed_start_response lane=%c accepted=%c reason=%c"
-STATE_FMT = "ace2k_feed_state mode=%*s error=%*s speed_um_s=%*s duty_pct=%*s bursts=%*s seq=%*s"
-EVENT_FMT = "ace2k_feed_event lane=%c kind=%c mode=%c motor_um=%u filament_um=%i seq=%c"
-SCALE_FMT = "ace2k_lane_scale_set lane=%c um_per_count_x10=%u"
-SEARCH_FMT = "ace2k_rfid_search_set search_um=%u"
-DEFAULT_SEARCH_MM = 750.0  # only for an image that does not declare its own default
-# what a waited load, or a MOVE=1 read, allows for the read sessions that pause it: a few of up
-# to 0.5 s each, at the load's 30 mm/s
-SESSION_ALLOWANCE_MM = 60.0
 GCODES = (
-    "ACE_FEED",
-    "ACE_ROLLBACK",
-    "ACE_UNLOAD",
-    "ACE_LOAD",
-    "ACE_ASSIST",
-    "ACE_STOP",
-    "ACE_CLEAR",
-    "ACE_SPEED",
-    "ACE_CALIBRATE_ENCODER",
-    "ACE_LOAD_SET",
-    "ACE_SNAG_SET",
-    "ACE_FOLLOW_SET",
-    "ACE_FF_SET",
-    "ACE_FEED_FORWARD",
-    "ACE_GRIP",
+    "ACEK_FEED",
+    "ACEK_ROLLBACK",
+    "ACEK_UNLOAD",
+    "ACEK_LOAD",
+    "ACEK_ASSIST",
+    "ACEK_STOP",
+    "ACEK_CLEAR",
+    "ACEK_SPEED",
+    "ACEK_CALIBRATE_ENCODER",
+    "ACEK_LOAD_SET",
+    "ACEK_SNAG_SET",
+    "ACEK_FOLLOW_SET",
+    "ACEK_FF_SET",
+    "ACEK_FEED_FORWARD",
+    "ACEK_GRIP",
+    "ACEK_LANE_ACTIVE",
 )
 
 
-# the host interface below; bumped on any change a caller must check for, a call or a mode added
-# as much as one changed (2: assist_both; 3: set_lane_extruder; 4: the tail — the kinds tail and
-# tail_out, the lane's tail in the status; 5: the kind blocked, and the lane's tail no longer
-# ending on the insert rising; 6: set_lane_grip, with has_grip and the grip's bounds)
-API_VERSION = 6
+class Ace2kFeed(FeedConnect, FeedMotion):
+    """The feed of one unit: its status, its settings and its G-codes.
 
+    The keys and the connect step come from ``FeedConnect`` (ace2k_feed_connect.py). The lane
+    motions come from ``FeedMotion`` (ace2k_feed_motion.py)."""
 
-class FeedRefused(Exception):  # noqa: N818 — the interface's name (API_VERSION 1)
-    """The unit refused a start: .reason is the REFUSAL_NAMES name (busy, in_error, no_filament,
-    no_link, bounds, other_lane)."""
+    API_VERSION = API_VERSION  # so that a caller with only the feed object can read it
 
-    def __init__(self, lane, mode, reason):
-        super().__init__(f"ace2k: lane {lane + 1} {mode} refused: {reason}")
-        self.lane = lane
-        self.mode = mode
-        self.reason = reason
+    # The helpers that this feed builds. Each has its own class. The two parts declare what they
+    # read.
+    ff: ace2k_ff.FeedForward
+    follow_auto: ace2k_follow.FollowDefault
 
-
-class Move:
-    """A started move: completed by the final feed event that echoes its sequence."""
-
-    def __init__(self, lane, mode, seq, completion, reactor=None):
-        self.lane = lane
-        self.mode = mode
-        self.seq = seq
-        self._completion = completion
-        self._reactor = reactor
-
-    def done(self):
-        return self._completion.test()
-
-    def result(self):
-        """The final event dict once done, else None — never blocks."""
-        return self._completion.wait(0.0, None) if self._completion.test() else None
-
-    def wait(self, timeout_s, reactor=None):
-        """Block (greenlet) until the final event or timeout_s; the event or None.  reactor
-        defaults to the feed's."""
-        reactor = reactor if reactor is not None else self._reactor
-        return self._completion.wait(reactor.monotonic() + timeout_s, None)
-
-
-def firmware_search_mm(mcu):
-    """The firmware's default reach of the load's search (ACE2K_FEED_SEARCH_DEFAULT_UM), in mm;
-    DEFAULT_SEARCH_MM when the image does not declare it."""
-    try:
-        return mcu.get_constant_float("ACE2K_FEED_SEARCH_DEFAULT_UM") / 1000.0
-    except Exception:  # Klipper's msgproto error; KeyError in the tests' fake
-        return DEFAULT_SEARCH_MM
-
-
-def setting_round(key, value, scale):
-    """A snag or follow value at the unit's resolution: a millimetre key to the whole µm, a whole
-    key as it is; a non-finite one (inf, nan — Klipper's float parser takes both) as it is, for
-    setting_bound_error to refuse: round() would raise on it."""
-    if key in SNAG_INT_KEYS or key in FOLLOW_INT_KEYS or not math.isfinite(value):
-        return value
-    return round(value * scale) / scale
-
-
-def setting_bound_error(key, value, low, high):
-    """None when a rounded snag or follow value is within its bounds, else the reason, in the
-    key's unit."""
-    if not math.isfinite(value):
-        return f"({value}) must be a finite number"
-    if low <= value <= high:
-        return None
-    return f"({setting_text(value)}) must be within {setting_text(low)}..{setting_text(high)}"
-
-
-def setting_text(value):
-    """A snag or follow value as printed and staged: exact to the µm (three decimals at most, no
-    trailing zeros), so SAVE_CONFIG writes back the value in effect."""
-    if isinstance(value, int):
-        return str(value)
-    return f"{value:.3f}".rstrip("0").rstrip(".")
-
-
-def to_mm(um):
-    return round(um / 1000.0, 3)
-
-
-def to_um(mm):
-    return int(round(mm * 1000.0))
-
-
-def scale_x10(scale):
-    """A scale in mm per count as the unit takes it: in tenths of a µm per count."""
-    return int(round(scale * 10000.0))
-
-
-class Ace2kFeed:
-    SESSION_ALLOWANCE_MM = SESSION_ALLOWANCE_MM
-    API_VERSION = API_VERSION  # a caller holding only the feed object reads it here
-    # and catches a refusal through it — ace2k_encoder_cal.py, which cannot import this module
-    FeedRefused = FeedRefused
-
-    def __init__(self, config):
+    def __init__(self, config: Config, unit: UnitProto) -> None:
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
-        mcu_name = config.get("mcu", "ace2k")
-        self.mcu = self.printer.lookup_object("mcu" if mcu_name == "mcu" else "mcu " + mcu_name)
+        # The unit object that built this feed. The feed uses it for the period of the lane
+        # counters, and to keep the reported encoder continuous across a live scale change.
+        self.unit = unit
+        self.mcu = unit.mcu  # the MCU of the unit, resolved once from the mcu key of its section
         self.section = config.get_name()
-        self.feed_speed = config.getfloat("feed_speed", 30.0, above=0.0)
-        self.unload_speed = config.getfloat("unload_speed", 30.0, above=0.0)
-        self.load_speed = config.getfloat("load_speed", 30.0, above=0.0)
-        self.assist_speed = config.getfloat("assist_speed", 50.0, above=0.0)
+        self.feed_speed_mm_s = config.getfloat("feed_speed", 30.0, above=0.0)
+        self.unload_speed_mm_s = config.getfloat("unload_speed", 70.0, above=0.0)
+        self.load_speed_mm_s = config.getfloat("load_speed", 60.0, above=0.0)
+        self.assist_speed_mm_s = config.getfloat("assist_speed", 50.0, above=0.0)
         self.load_park_mm = config.getfloat("load_park_mm", 300.0, above=0.0)
         self.auto_load = config.getboolean("auto_load", True)
-        # the load's tag search, the key ace2k_rfid.py sends to the unit; unset, the firmware's
-        # default (read at connect) — only the ACE_LOAD budget reads it here
+        # The reach of the tag search of the load. ace2k_rfid.py sends this key to the unit. If it
+        # is not set, the firmware default is used (read at connect). Here only the time budget of
+        # ACEK_LOAD reads it.
         self.search_mm = config.getfloat("rfid_search_mm", None, minval=100.0, maxval=1000.0)
         self.has_search = False
-        self.thresholds = {}
-        for key in THRESHOLD_DEFAULTS:
-            value = config.getfloat(key, None, above=0.0)
-            if value is not None:
-                self.thresholds[key] = value
-        if self.thresholds:
-            # the pair as the unit will see it, an absent key at the firmware's default: the
-            # partial slip check trips when the filament is short by more than slip_allow_mm over
-            # slip_check_mm of motor — an allowance at or above the window can never be exceeded,
-            # and the unit refuses the pair as a host bug (a shutdown), so it is refused here first
-            th = dict(THRESHOLD_DEFAULTS, **self.thresholds)
-            if th["slip_allow_mm"] >= th["slip_check_mm"]:
-                raise config.error(
-                    f"{self.section}: slip_allow_mm ({th['slip_allow_mm']:g}) must be under"
-                    f" slip_check_mm ({th['slip_check_mm']:g}): the partial slip check could never"
-                    " trip"
-                )
-        # the tip snag's keys; the lag against the forward travel is checked at connect, where
-        # the firmware's defaults for the absent keys are known
-        self.snag_keys = {}
-        for key, _arg, scale, low, high in SNAG_SETTINGS:
-            read = config.getint if key in SNAG_INT_KEYS else config.getfloat
-            value = read(key, None)
-            if value is None:
-                continue
-            value = setting_round(key, value, scale)  # the bounds judged on what the unit gets
-            reason = setting_bound_error(key, value, low, high)
-            if reason is not None:
-                raise config.error(f"{self.section}: {key} {reason}")
-            self.snag_keys[key] = value
-        self.snag = {}  # the values in effect, the firmware's defaults under the keys (at connect)
-        # the follow's keys, rounded to the unit's resolution here; their bounds are the
-        # dictionary's, so they are judged at connect
-        self.follow_keys = {}
-        for key, _arg, scale, _name in FOLLOW_SETTINGS:
-            read = config.getint if key in FOLLOW_INT_KEYS else config.getfloat
-            value = read(key, None)
-            if value is not None:
-                self.follow_keys[key] = setting_round(key, value, scale)
-        self.has_follow = False  # the image carries the follow (its constants, at connect)
-        self.follow = {}  # the values in effect, the firmware's defaults under the keys
-        self.follow_bounds = {}  # key -> (low, high) in the key's unit, from the dictionary
-        # the feed-forward's unit values, as the follow's: judged at connect against the
-        # dictionary; on an image without them, ignored (the feed-forward is off)
-        self.ff_keys = {}
-        for key, _arg, scale, _name in FF_SETTINGS:
-            value = config.getfloat(key, None)
-            if value is not None:
-                self.ff_keys[key] = setting_round(key, value, scale)
-        self.has_ff = False  # the image carries the feed-forward (its constants, at connect)
-        self.ff_values = {}  # the values in effect, the firmware's defaults under the keys
-        self.ff_bounds = {}
-        # the grip (at connect): the image carries it, its default and bounds in mm
-        self.has_grip = False
-        self.grip_mm = self.grip_min_mm = self.grip_max_mm = None
-        # 0.05 Hz is a 20 s period, 2.4 × 10⁹ ticks at 120 MHz — under the 2^32 (35.8 s) the
-        # unit's rest_ticks carries; a start before the session's first report waits two periods
-        # plus the margin, so the floor also bounds that wait (45 s at 0.05 Hz)
-        asked_hz = config.getfloat("feed_report_hz", FEED_REPORT_HZ, minval=0.05, maxval=10.0)
-        # 1, 2, 5 and 10 Hz are on the grid; anything else moves to the nearest 100 ms period
-        self.report_period_ms = max(
-            REPORT_GRID_MS, round(1000.0 / asked_hz / REPORT_GRID_MS) * REPORT_GRID_MS
-        )
-        self.report_hz = 1000.0 / self.report_period_ms
-        if abs(self.report_hz - asked_hz) > 1e-9:
-            logging.warning(
-                "ace2k: feed_report_hz %g snapped to %.3g Hz (a %d ms period on the %d ms grid)",
-                asked_hz,
-                self.report_hz,
-                self.report_period_ms,
-                REPORT_GRID_MS,
-            )
-        # the window the unit accepts a scale in: ace2k_lane_scale_set shuts the MCU down outside it
-        self.scale_low = DEFAULT_SCALE_MM * (1.0 - SCALE_TOLERANCE)
-        self.scale_high = DEFAULT_SCALE_MM * (1.0 + SCALE_TOLERANCE)
-        self.scales = {}
-        for lane in range(LANES):
-            value = config.getfloat(
-                f"lane{lane + 1}_encoder_scale", None, minval=self.scale_low, maxval=self.scale_high
-            )
-            if value is not None:
-                self.scales[lane] = value
+        self._init_settings(config)
+        self._init_report_rate(config)
+        self._init_scales(config)
         self.lanes = [
             dict(
                 mode=None,
@@ -458,8 +439,9 @@ class Ace2kFeed:
                 speed=None,
                 duty=None,
                 bursts=None,
-                tail=False,  # the follow's tail: from the tail notice to its end
+                tail=False,  # True in the tail of the follow, from the tail notice to its end
                 ff_doses=None,
+                ff_back_doses=None,
                 ff_taut_fixes=None,
                 ff_full_fixes=None,
                 encoder_scale=self.scales.get(lane, DEFAULT_SCALE_MM),
@@ -469,442 +451,96 @@ class Ace2kFeed:
         ]
         self.present = False
         self.speed_min = self.speed_max = self.move_max_mm = self.landing_mm = None
-        self.tail_mm = None  # the motor an unload or a rollback runs past the slot mouth
-        # lane -> (seq, completion): the waiting G-code's sequence and the completion it holds
-        self.completions = {}
-        # lane -> the last final (non-notice) event, the dict _dispatch completes with: a refused
-        # start whose round trip swallowed the running move's end completes that move from it
-        self.final_events = [None] * LANES
-        # lane -> the sequence of the last start sent.  Until this session issues a start on a
-        # lane, every state report seeds the counter with the seq the unit holds for the lane
-        # (the last start issued on it, kept through idle and error; 0 before any since the
-        # unit powered up), so the first start is reported + 1 and never the running move's
-        # nor the one that just ended (the unit takes a repeat of its last start, within a
-        # second of its end, as this transport's retry); after that the counter is the
-        # host's and the reports leave it alone.  A start before the first report of the
-        # session waits on first_report, which the first _seed() completes.  _next_seq() keeps
-        # it in 1..255.
-        self.seq = [0] * LANES
-        self.started = [False] * LANES  # a start was issued on the lane this session
+        self.tail_mm = None  # the motor travel of an unload or rollback past the bay entrance
+        self.unload_clear_mm = 0.0  # an unload's travel past the bay's sensor (0: none)
+        # The commands and queries that the connect builds. They are None until then.
+        self.start_query = self.speed_query = self.stop_when_query = None
+        self.stop_cmd = self.clear_cmd = self.scale_cmd = self.load_set_cmd = None
+        self.ff_base_cmd = self.ff_query_cmd = self.grip_cmd = self.park_cmd = None
+        self.wait_cmd = None
+        # The motion record of each lane (ace2k_feed_motion.LaneMotion). It holds the sequences,
+        # the label of the stop, the accepted start and the waits. The state reports set the
+        # sequences until the first start of the lane in the session. A start before the first
+        # report of the session waits on first_report, which the first _seed() completes.
+        self.motion = [LaneMotion() for _ in range(LANES)]
+        self.reports = 0  # state reports in this session (the clock of follow_default)
         self.state_reported = False  # a state report has arrived this session
         self.first_report = self.reactor.completion()
-        # lane -> {seq: length_mm} of the starts whose terminal event has not landed
-        self.commanded_mm = [{} for _ in range(LANES)]
-        self.calibration = {}  # lane -> (filament_mm, scale_in_use) of the last calibration feed
-        # the [ace2k] object, set by it once it has loaded this module: the lane counters' period
-        # and the reported encoder kept continuous across a live scale change
-        self.unit = None
+        # lane -> (filament_mm, scale_in_use) of the last calibration feed.
+        self.calibration: dict[int, tuple[float, float]] = {}
         self.ff = ace2k_ff.FeedForward(self.printer, self, config)
-        # ACE_CALIBRATE_ENCODER AUTO=1: the lane's scale read off its extruder
+        # ACEK_CALIBRATE_ENCODER AUTO=1 reads the scale of the lane from its extruder.
         self.cal = ace2k_encoder_cal.EncoderCalibration(self.printer, self)
+        # follow_default arms the follow on every lane with filament, at the start and after an
+        # insertion (see ace2k_follow.py).
+        self.follow_auto = ace2k_follow.FollowDefault(self.printer, self, config)
+        self.follow_default = self.follow_auto.enabled
         self.mcu.register_config_callback(self._build_config)
-        gcode = self.printer.lookup_object("gcode")
         for name in GCODES:
-            gcode.register_command(
-                name, getattr(self, "cmd_" + name), desc=getattr(self, "cmd_" + name + "_help")
+            unit.register_command(
+                name, getattr(self, "cmd_" + name), getattr(self, "cmd_" + name + "_help")
             )
 
-    # --- configuration -------------------------------------------------------------------
+    # --- the counters of the feed-forward (the serial thread) ----------------------------------
 
-    def _build_config(self):
-        """The scales and the thresholds as config commands; every lane's scale again, the load
-        settings, the snag values and the report query as init commands; the subscriptions — only
-        for a firmware that carries the feed.  A start command present with another format is a
-        firmware from another commit, refused at connect; one absent is a firmware built without
-        the feed, logged."""
-        verdict, detail = probe_format(self.mcu, START_FMT)
-        if verdict == "differs":
-            raise refuse_format(self.printer, self.section, START_FMT, detail)
-        if verdict == "absent":
-            logging.warning(
-                "ace2k: firmware built without CONFIG_ACE2K_FEED; the feed G-codes are disabled"
-                " (%s)",
-                detail,
-            )
-            self.present = False
-            return
-        self.present = True
-        self.speed_min = self.mcu.get_constant_float("ACE2K_LANE_SPEED_MIN_UM_S") / 1000.0
-        self.speed_max = self.mcu.get_constant_float("ACE2K_LANE_SPEED_MAX_UM_S") / 1000.0
-        self.move_max_mm = self.mcu.get_constant_float("ACE2K_LANE_MOVE_MAX_UM") / 1000.0
-        self.landing_mm = self.mcu.get_constant_float("ACE2K_LANE_LANDING_UM") / 1000.0
-        self.tail_mm = self.mcu.get_constant_float("ACE2K_FEED_UNLOAD_TAIL_UM") / 1000.0
-        # a firmware with the reader's binding searches past the parking point for the tag
-        self.has_search = self.mcu.try_lookup_command(SEARCH_FMT) is not None
-        if self.search_mm is None:
-            self.search_mm = firmware_search_mm(self.mcu)
-        for key, speed in (
-            ("feed_speed", self.feed_speed),
-            ("unload_speed", self.unload_speed),
-            ("load_speed", self.load_speed),
-            ("assist_speed", self.assist_speed),
-        ):
-            if not self.speed_min <= speed <= self.speed_max:
-                raise self.printer.config_error(
-                    f"{self.section}: {key} must be within"
-                    f" {self.speed_min:g}..{self.speed_max:g} mm/s"
-                )
-        if self.load_park_mm > self.move_max_mm:
-            raise self.printer.config_error(
-                f"{self.section}: load_park_mm must be at most {self.move_max_mm:g} mm"
-            )
-        # Every forward assist burst takes the comparator's bases afresh and chains into the next
-        # while the filament is taut: a window as long as a burst never closes, and a filament held
-        # during an assist would be ground on burst after burst.  The unit refuses such a window
-        # as a host bug (a shutdown), so it is refused here first.
-        burst_mm = self.mcu.get_constant_float("ACE2K_FEED_ASSIST_BURST_UM") / 1000.0
-        for key in ("stall_check_mm", "slip_check_mm"):
-            value = self.thresholds.get(key)
-            if value is not None and value >= burst_mm:
-                raise self.printer.config_error(
-                    f"{self.section}: {key} ({value:g}) must be under {burst_mm:g} mm, an assist's"
-                    " burst: a longer window never closes during an assist"
-                )
-        for lane, scale in sorted(self.scales.items()):
-            # A config command: it enters Klipper's config checksum, so editing or removing the
-            # key and restarting resets the MCU, which starts from its default again.
-            self.mcu.add_config_cmd(self._scale_cmd_text(lane, scale))
-        for lane in range(LANES):
-            # And every lane's scale as an init command, the key's or the default: a host
-            # restart finds the unit configured and sends it only the init commands, so a scale
-            # applied live (the automatic calibration's, not saved) ends with the session.
-            scale = self.lanes[lane]["encoder_scale"]
-            self.mcu.add_config_cmd(self._scale_cmd_text(lane, scale), is_init=True)
-        if self.thresholds:
-            th = dict(THRESHOLD_DEFAULTS, **self.thresholds)
-            self.mcu.add_config_cmd(
-                f"ace2k_feed_thresholds_set slip_check_um={to_um(th['slip_check_mm'])}"
-                f" slip_allow_um={to_um(th['slip_allow_mm'])}"
-                f" stall_check_um={to_um(th['stall_check_mm'])}"
-            )
-        # unguarded, as ACE2K_FEED_UNLOAD_TAIL_UM: host and image are the same release
-        defaults = {
-            key: self.mcu.get_constant_float(name) / (1000.0 if key.endswith("_mm") else 1.0)
-            for key, name in SNAG_DEFAULT_CONSTANTS.items()
-        }
-        self.snag = dict(defaults, **self.snag_keys)
-        if self.snag["snag_lag_mm"] >= self.snag["snag_fwd_mm"]:
-            # the unit refuses the set as a host bug (a shutdown), so it is refused here first
-            raise self.printer.config_error(
-                f"{self.section}: snag_lag_mm ({setting_text(self.snag['snag_lag_mm'])}) must be"
-                f" under snag_fwd_mm ({setting_text(self.snag['snag_fwd_mm'])}): a lag the watch"
-                " never reaches"
-            )
-        self.mcu.add_config_cmd(self._load_set_cmd(), is_init=True)
-        # all six at every connect, keys or not, as the load settings: a config command reaches
-        # only an unconfigured MCU, so a RESTART after ACE_SNAG_SET would leave the unit on the
-        # live values while the host shows these
-        self.mcu.add_config_cmd(self._snag_cmd_text(), is_init=True)
-        self._build_follow()
-        self._build_ff()
-        self._build_grip()
-        ticks = self.mcu.seconds_to_clock(self.report_period_ms / 1000.0)
-        self.mcu.add_config_cmd(f"ace2k_feed_query rest_ticks={ticks}", is_init=True)
-        self._subscribe(self._handle_state, STATE_FMT)
-        self._subscribe(self._handle_event, EVENT_FMT)
-        if self.has_ff:
-            # the counters at the state report's rate, on the unit's own phase for them
-            self.mcu.add_config_cmd(f"ace2k_feed_ff_query rest_ticks={ticks}", is_init=True)
-            self._subscribe(self._handle_ff_state, FF_STATE_FMT)
-
-    def _build_follow(self):
-        """The follow's defaults and bounds from the dictionary, the keys judged against them, and
-        both values as an init command — at every connect, as the snag's, so a RESTART after
-        ACE_FOLLOW_SET never leaves the unit on the live values.  An image without the follow's
-        constants has no follow: a key for it is a config error, and nothing is sent."""
-        try:
-            constants = {
-                key: (
-                    self.mcu.get_constant_float(name) / scale,
-                    self.mcu.get_constant_float(name + "_MIN") / scale,
-                    self.mcu.get_constant_float(name + "_MAX") / scale,
-                )
-                for key, _arg, scale, name in FOLLOW_SETTINGS
-            }
-        except Exception:  # Klipper's msgproto error; KeyError in the tests' fake
-            self.has_follow = False
-            if self.follow_keys:
-                key = next(iter(self.follow_keys))
-                raise self.printer.config_error(f"{self.section}: {key}: {NO_FOLLOW}") from None
-            return
-        follow = {}
-        for key, (default, low, high) in constants.items():
-            if key in FOLLOW_INT_KEYS:
-                default, low, high = int(default), int(low), int(high)
-            self.follow_bounds[key] = (low, high)
-            value = self.follow_keys.get(key, default)
-            # the unit refuses a value out of bounds as a host bug (a shutdown)
-            reason = setting_bound_error(key, value, low, high)
-            if reason is not None:
-                raise self.printer.config_error(f"{self.section}: {key} {reason}")
-            follow[key] = value
-        self.follow = follow
-        self.has_follow = True
-        self.mcu.add_config_cmd(self._follow_cmd_text(), is_init=True)
-
-    def _build_ff(self):
-        """The feed-forward's defaults and bounds from the dictionary, the keys judged against
-        them, and both values as an init command at every connect, as the follow's.  An image
-        without the constants has no feed-forward: nothing is sent to it, the keys are left
-        unused, and ace2k_ff.py says so on the console at ready.  With the constants, the
-        commands and the report must be there as this module knows them — another commit's
-        firmware otherwise, refused."""
-        try:
-            constants = {
-                key: (
-                    self.mcu.get_constant_float(name) / scale,
-                    self.mcu.get_constant_float(name + "_MIN") / scale,
-                    self.mcu.get_constant_float(name + "_MAX") / scale,
-                )
-                for key, _arg, scale, name in FF_SETTINGS
-            }
-        except Exception:  # Klipper's msgproto error; KeyError in the tests' fake
-            self.has_ff = False
-            logging.info("ace2k: %s", ace2k_ff.NO_FF)
-            return
-        # the counters without their epoch: an image from before it, whose counts the host
-        # cannot place — no feed-forward, as an image without one
-        verdict, detail = probe_format(self.mcu, FF_STATE_FMT)
-        if verdict != "ok":
-            self.has_ff = False
-            logging.info("ace2k: %s (%s)", ace2k_ff.NO_FF, detail)
-            return
-        for msgformat in (FF_FMT, ace2k_ff.BASE_FMT, FF_QUERY_FMT):
-            verdict, detail = probe_format(self.mcu, msgformat)
-            if verdict != "ok":
-                raise refuse_format(
-                    self.printer, self.section, msgformat, detail, verdict, START_FMT
-                )
-        values = {}
-        for key, (default, low, high) in constants.items():
-            self.ff_bounds[key] = (low, high)
-            value = self.ff_keys.get(key, default)
-            # the unit refuses a value out of bounds as a host bug (a shutdown)
-            reason = setting_bound_error(key, value, low, high)
-            if reason is not None:
-                raise self.printer.config_error(f"{self.section}: {key} {reason}")
-            values[key] = value
-        self.ff_values = values
-        self.has_ff = True
-        self.mcu.add_config_cmd(self._ff_cmd_text(), is_init=True)
-
-    def _build_grip(self):
-        """The grip's default and bounds from the dictionary, and every lane's grip cleared as an
-        init command.  An image without the constants has no grip: nothing is sent,
-        set_lane_grip and ACE_GRIP say to flash.  With them, the command must be there as this
-        module knows it — another commit's firmware otherwise, refused."""
-        try:
-            grip, low, high = (
-                self.mcu.get_constant_float(GRIP_CONSTANT + suffix) / 1000.0
-                for suffix in ("", "_MIN", "_MAX")
-            )
-        except Exception:  # Klipper's msgproto error; KeyError in the tests' fake
-            self.has_grip = False
-            logging.info("ace2k: %s", NO_GRIP)
-            return
-        verdict, detail = probe_format(self.mcu, GRIP_FMT)
-        if verdict != "ok":
-            raise refuse_format(self.printer, self.section, GRIP_FMT, detail, verdict, START_FMT)
-        self.grip_mm, self.grip_min_mm, self.grip_max_mm = grip, low, high
-        self.has_grip = True
-        # every lane's grip cleared at every connect: the grip lives in the unit's RAM, and a host
-        # restart that leaves the MCU running (RESTART, SAVE_CONFIG) sends it only the init
-        # commands — a grip set in the last session must never outlive it
-        for lane in range(LANES):
-            self.mcu.add_config_cmd(f"{GRIP_FMT.split()[0]} lane={lane} grip_um=0", is_init=True)
-
-    def _ff_args(self):
-        return [int(round(self.ff_values[key] * scale)) for key, _a, scale, _n in FF_SETTINGS]
-
-    def _ff_cmd_text(self):
-        chunk_um, pulse_um_s = self._ff_args()
-        return f"ace2k_feed_ff_set chunk_um={chunk_um} pulse_um_s={pulse_um_s}"
-
-    def _ff_line(self):
-        v = {key: setting_text(value) for key, value in self.ff_values.items()}
-        return (
-            f"ace2k: feed-forward chunk {v['ff_chunk_mm']} mm, pulse {v['ff_pulse']} mm/s,"
-            f" {self.ff.settings_text()}"
-        )
-
-    def _subscribe(self, handler, msgformat):
-        """A subscription for a report the dictionary carries as this module knows it.  Called
-        once the start command is known to be there, and the binding declares the start, the
-        state report and the event in one file: a report with another format, or none at all, is
-        a firmware from another commit either way — the config error names which, and the
-        absent one names the start that is there."""
-        verdict, detail = probe_format(self.mcu, msgformat)
-        if verdict != "ok":
-            raise refuse_format(self.printer, self.section, msgformat, detail, verdict, START_FMT)
-        subscribe_response(self.mcu, handler, msgformat)
-
-    def _scale_cmd_text(self, lane, scale):
-        return f"{SCALE_FMT.split()[0]} lane={lane} um_per_count_x10={scale_x10(scale)}"
-
-    def _load_set_cmd(self):
-        return (
-            f"ace2k_feed_load_set park_um={to_um(self.load_park_mm)}"
-            f" speed_um_s={to_um(self.load_speed)} auto_load={1 if self.auto_load else 0}"
-        )
-
-    def _snag_args(self):
-        return [int(round(self.snag[key] * scale)) for key, _a, scale, _l, _h in SNAG_SETTINGS]
-
-    def _snag_cmd_text(self):
-        names = ("fwd_um", "lag_um", "duty_pct", "back_um", "rest_ms", "free_um")
-        args = " ".join(f"{n}={v}" for n, v in zip(names, self._snag_args()))
-        return f"ace2k_feed_snag_set {args}"
-
-    def _follow_args(self):
-        return [int(round(self.follow[key] * scale)) for key, _a, scale, _n in FOLLOW_SETTINGS]
-
-    def _follow_cmd_text(self):
-        flip_ms, take_um, tail_um = self._follow_args()
-        return f"ace2k_feed_follow_set flip_ms={flip_ms} take_um={take_um} tail_um={tail_um}"
-
-    def _follow_line(self):
-        f = {key: setting_text(value) for key, value in self.follow.items()}
-        return (
-            f"ace2k: follow flip {f['follow_flip_ms']} ms, take {f['follow_take_mm']} mm,"
-            f" tail {f['follow_tail_mm']} mm"
-        )
-
-    def _snag_line(self):
-        s = {key: setting_text(value) for key, value in self.snag.items()}
-        return (
-            f"ace2k: snag fwd {s['snag_fwd_mm']} mm, lag {s['snag_lag_mm']} mm,"
-            f" duty {s['snag_duty_pct']} %, back {s['snag_back_mm']} mm,"
-            f" rest {s['snag_rest_ms']} ms, free {s['snag_free_mm']} mm"
-        )
-
-    # --- reports and events (the serial thread) -------------------------------------------
-
-    def _handle_state(self, params):
-        mode = params["mode"]
-        error = params["error"]
-        speed = struct.unpack(f"<{LANES}I", params["speed_um_s"])
-        duty = params["duty_pct"]
-        bursts = struct.unpack(f"<{LANES}H", params["bursts"])
-        for i, lane in enumerate(self.lanes):
-            lane["mode"] = MODE_NAMES.get(mode[i], mode[i])
-            lane["error"] = KIND_NAMES.get(error[i], error[i]) if mode[i] == MODE_ERROR else None
-            lane["speed"] = speed[i] / 1000.0
-            lane["duty"] = duty[i]
-            lane["bursts"] = bursts[i]
-            if lane["mode"] != "following":
-                lane["tail"] = False  # the lane left the follow (its final event lost on the way)
-        # the seeding on the reactor thread, where _start runs: a check-then-write here could
-        # cross a _start between the check and the write and hand the next start a used seq.
-        # Scheduled only while a lane still follows the reports: state_reported and each started
-        # flag go False -> True once and never back, so a stale read here (the serial thread)
-        # can only take a True for a False — one callback more, which seeds nothing — never
-        # skip one that is owed.
-        if not self.state_reported or not all(self.started):
-            seqs = list(params["seq"])
-            self.reactor.register_async_callback(lambda eventtime, seqs=seqs: self._seed(seqs))
-
-    def _handle_ff_state(self, params):
+    def _handle_ff_state(self, params: Params) -> None:
         doses = struct.unpack(f"<{LANES}H", params["doses"])
         taut = struct.unpack(f"<{LANES}H", params["taut"])
         full = struct.unpack(f"<{LANES}H", params["full"])
+        raw = params.get("back")
+        back = struct.unpack(f"<{LANES}H", raw) if raw is not None else (None,) * LANES
         for i, lane in enumerate(self.lanes):
             lane["ff_doses"] = doses[i]
+            lane["ff_back_doses"] = back[i]
             lane["ff_taut_fixes"] = taut[i]
             lane["ff_full_fixes"] = full[i]
         self.ff.on_counts(taut, full, params["epoch"])
-        # after the counters are stored: the calibration reads this frame's full count from them
+        # This comes after the counters are stored. The calibration reads the full count of this
+        # report from them.
         self.cal.on_ff_state(params.get("#receive_time", 0.0), taut, params["epoch"])
-
-    def _seed(self, seqs):
-        """The reactor thread: the unit's seq of every lane this session has not started on;
-        the first frame of the session releases a start parked on first_report."""
-        for i in range(LANES):
-            if not self.started[i]:
-                self.seq[i] = seqs[i]
-        if not self.state_reported:
-            self.state_reported = True
-            self.first_report.complete(True)
-
-    def _handle_event(self, params):
-        index = params["lane"]
-        kind = params["kind"]
-        seq = params["seq"]
-        event = dict(
-            kind=KIND_NAMES.get(kind, kind),
-            mode=MODE_NAMES.get(params["mode"], params["mode"]),
-            motor_mm=to_mm(params["motor_um"]),
-            filament_mm=to_mm(params["filament_um"]),
-            seq=seq,
-        )
-        lane = self.lanes[index]
-        lane["last_event"] = event
-        if kind == KIND_TAIL:
-            # the unit read the insert fall; the tail runs to its own final event, a filament pushed
-            # in at the bay meanwhile changing nothing
-            lane["tail"] = True
-        elif kind not in NOTICE_KINDS:
-            lane["tail"] = False  # a final event ends the mode, the tail with it
-            # the commanded length of the start this event ends — None for a motion the unit
-            # started itself (seq 0) or a start whose entry was pruned long ago
-            lane["last_move"] = dict(event, commanded_mm=self.commanded_mm[index].pop(seq, None))
-            self.final_events[index] = event
-        logging.info(
-            "ace2k feed: lane %d %s (%s) — motor %.1f mm, filament %.1f mm",
-            index + 1,
-            event["kind"],
-            event["mode"],
-            event["motor_mm"],
-            event["filament_mm"],
-        )
-        self.reactor.register_async_callback(
-            lambda eventtime, index=index, event=event, kind=kind: self._dispatch(
-                index, event, kind
-            )
-        )
-
-    def _dispatch(self, index, event, kind):
-        # The reactor thread, as the G-codes: the completion is taken and completed in one step
-        # against a _start that registers one and then yields in its send.  Only the event that
-        # echoes the waiting G-code's sequence completes it; a terminal event with another — a
-        # stale one from a move the host no longer waits for, or 0, a motion the unit started
-        # itself — neither completes nor blocks anything.  The completion comes first, so a
-        # listener of "ace2k:feed_event" sees the move already done and cannot hold it back.
-        if kind not in NOTICE_KINDS:
-            self._complete(index, event)
-        self.printer.send_event("ace2k:feed_event", index, event)
-        if event["kind"] == "snag":
-            # a notice, not an error: the tip caught, the unit touched it back and went on
-            self.printer.lookup_object("gcode").respond_info(
-                f"ace2k: lane {index + 1} snag ({event['mode']}) — the tip caught at motor"
-                f" {event['motor_mm']:.1f} mm, filament {event['filament_mm']:.1f} mm; went on"
-            )
-
-    def _complete(self, index, event):
-        """Complete the lane's tracked move with its final event when the sequences match; the
-        slot is taken first, so a move completes once."""
-        pending = self.completions.get(index)
-        if pending is not None and pending[0] == event["seq"]:
-            del self.completions[index]
-            pending[1].complete(event)
 
     # --- status ------------------------------------------------------------------------------
 
-    def lane_status(self, index):
+    @property
+    def has_motor_travel(self) -> bool:
+        """True when the image reports the motor's travel each way (host interface 25)."""
+        return self.unit.has_motor_travel
+
+    def motor_watch(self, on: bool) -> bool:
+        """Turn the 1 Hz motor report on or off for one watcher (see Ace2k.motor_watch).
+
+        The lane status then carries motor_fwd_mm and motor_back_mm. It returns
+        has_motor_travel; on an image without the report it does nothing."""
+        return self.unit.motor_watch(on)
+
+    def lane_status(self, index: int) -> dict[str, object]:
         status = dict(self.lanes[index])
         status.update(self.ff.lane_status(index))
+        status["follow_default"] = self.follow_auto.lane_state(index)
+        status["follow_why"] = self.follow_auto.why_not(index)
+        status["active"] = self.follow_auto.eligible(index)
         return status
 
-    def any_busy(self):
-        # the 1 Hz state report alone: a move accepted since the last one is what the unit's own
-        # veto refuses — the backstop for this blind window
+    def any_busy(self) -> bool:
+        """Return True if any lane may be running a motion.
+
+        This uses only the state report, which arrives at the state report rate (1 Hz by default).
+        A move that the unit accepted since the last report is not seen here. The unit refuses a
+        conflicting move itself, which is the safety net for this blind window.
+        """
+        # Idle, error and no report yet (None) mean that nothing runs. An unknown mode code may be
+        # a motion, so it counts as busy.
         return any(lane["mode"] not in (None, "idle", "error") for lane in self.lanes)
 
-    def status_lines(self):
-        lines = []
+    def status_lines(self) -> list[str]:
+        lines: list[str] = []
         for i, lane in enumerate(self.lanes):
             ev = lane["last_event"]
             if ev is None:
                 last = "none"
+            elif ev.get("tag_search"):
+                # A read with motion went out and came back: its filament figure is about 0.
+                last = f"tag search (about {half_mm(ev['motor_mm'])} mm out and back)"
             else:
                 last = (
                     f"{ev['kind']} ({ev['mode']}, motor {ev['motor_mm']} mm,"
@@ -914,89 +550,159 @@ class Ace2kFeed:
                 f"lane {i + 1}: mode={lane['mode']} error={lane['error']}"
                 f" speed={lane['speed']} mm/s duty={lane['duty']} % bursts={lane['bursts']}"
                 f" scale={lane['encoder_scale']} ({lane['scale_source']}) last={last}"
+                f" follow={self.follow_auto.follow_text(i)}"
             )
+        # The shared extruders that this unit feeds. Each line shows the whole group across every
+        # unit, such as "1, 2" with one unit and "a:1, b:3" with several.
+        units = self.unit.units
+        active = units.active_map()
+        groups = units.groups()
+        for name in self.follow_auto.groups():
+            lanes = units.members_text(groups[name])
+            active_lane = active[name]
+            chosen = f"lane {active_lane}" if active_lane is not None else "none (ACEK_LANE_ACTIVE)"
+            lines.append(f"{name}: lanes {lanes} — active {chosen}")
         return lines
 
-    # --- the host interface (API_VERSION) -----------------------------------------------------
+    # --- the host interface (see API_VERSION) -----------------------------------------------------
 
-    def start_move(self, lane_index, mode, length_mm, speed_mm_s):
-        """Host interface: start mode (a CMD_MODES name) on lane_index (0..3), not waiting.
-        Callable from G-code handlers, timers and async callbacks. Returns a Move; raises
-        FeedRefused, ValueError for an unknown lane or mode, or RuntimeError when the firmware
-        has no feed, never reported, or has no follow for "assist_both"."""
-        if not self.present:
-            raise RuntimeError("ace2k: firmware built without CONFIG_ACE2K_FEED")
-        if mode not in CMD_MODES or not 0 <= lane_index < LANES:
-            raise ValueError(f"ace2k: no lane {lane_index} / mode {mode!r}")
-        completion = self.reactor.completion()
-        seq = self._send_start(lane_index, mode, length_mm, speed_mm_s, completion)
-        return Move(lane_index, mode, seq, completion, self.reactor)
+    def set_lane_extruder(self, lane_index: int, extruder_name: str | None) -> None:
+        """Host interface: set the extruder that lane ``lane_index`` (0..3) feeds.
 
-    def stop(self, lane_index):
-        """Host interface: stop lane_index's motor (LANE_ALL = every lane); never clears an
-        error.  ValueError for another lane."""
-        if lane_index != LANE_ALL and not 0 <= lane_index < LANES:
-            raise ValueError(f"ace2k: no lane {lane_index}")
-        self.mcu.lookup_command("ace2k_feed_stop lane=%c").send([lane_index])
-
-    def clear(self, lane_index):
-        """Host interface: leave lane_index's error state.  ValueError for another lane."""
-        if not 0 <= lane_index < LANES:
-            raise ValueError(f"ace2k: no lane {lane_index}")
-        self.mcu.lookup_command("ace2k_feed_clear lane=%c").send([lane_index])
-
-    def set_lane_extruder(self, lane_index, extruder_name):
-        """Host interface (API_VERSION 3): the extruder lane_index (0..3) feeds, for the
-        feed-forward; None unmaps it.  A laneN_extruder key wins over it.  ValueError for
-        another lane."""
+        The feed-forward uses this mapping. None removes it. A laneN_extruder config key takes
+        priority over it. Raises ValueError for another lane."""
         self.ff.set_lane_extruder(lane_index, extruder_name)
 
-    def set_lane_grip(self, lane_index, grip_mm):
-        """Host interface (API_VERSION 6): lane_index's (0..3) next automatic load pulls only
-        grip_mm, without the tag search, and ends loaded; that load consumes the grip, and any
-        start on the lane, or a read with motion, clears it.  0 clears it.  ValueError, before
-        anything is sent, for another lane or a grip outside grip_min_mm..grip_max_mm (the unit
-        shuts down on one); RuntimeError when the firmware has no feed or no grip."""
-        if not self.present:
-            raise RuntimeError("ace2k: firmware built without CONFIG_ACE2K_FEED")
-        if not self.has_grip:
-            raise RuntimeError(f"ace2k: {NO_GRIP}")
-        if not 0 <= lane_index < LANES:
-            raise ValueError(f"ace2k: no lane {lane_index}")
+    def set_lane_follow(
+        self, lane_index: int, speed_mm_s: float | None = None, on_insert: bool = True
+    ) -> None:
+        """Host interface: set how follow_default arms lane ``lane_index`` (0..3).
+
+        The follow is armed at ``speed_mm_s``. If it is None, assist_speed is used. With
+        ``on_insert`` False, the lane is armed only at the start. A module that runs its own flow
+        on the insertions of the lane can use this. It arms the lane itself when its flow ends.
+        This can be called from config time on. It only stores the values and sends nothing.
+
+        Raises ValueError for another lane or a speed that is not above 0. The unit has its own
+        speed limits and refuses a speed outside them when the lane is armed."""
+        self.follow_auto.set_lane(lane_index, speed_mm_s, on_insert)
+
+    def follow_paused(self, lane_index: int) -> bool:
+        """Host interface: return True while a G-code move holds lane ``lane_index``.
+
+        In that case ace2k stopped the follow for the move, and the move has not ended. A module
+        must not arm the lane in the meantime. Raises ValueError for another lane."""
+        check_lane(lane_index, NO_LANE)
+        return self.follow_auto.is_paused(lane_index)
+
+    def hold_follow(self, lane_index: int, held: bool, why: str | None = None) -> None:
+        """Host interface: while ``held`` is True, follow_default arms nothing on the lane.
+
+        An example is a lane whose filament waits behind another piece. ``why`` (since
+        API_VERSION 21) is the reason the lane's status and ACEK_STATUS show (``follow_why``).
+        Raises ValueError for another lane."""
+        self.follow_auto.hold(lane_index, held, why)
+
+    def default_move(self, lane_index: int) -> Move | None:
+        """Host interface: return the Move of the follow that follow_default armed on the lane.
+
+        The Move is returned until its final event arrives. After that, return None. Raises
+        ValueError for another lane."""
+        check_lane(lane_index, NO_LANE)
+        return self.follow_auto.current(lane_index)
+
+    def set_lane_grip(self, lane_index: int, grip_mm: float) -> None:
+        """Host interface: make the next automatic load of lane ``lane_index`` pull ``grip_mm``.
+
+        That load skips the tag search and ends loaded. It uses up the grip. Any start on the
+        lane, or a read with motion, also clears the grip. A value of 0 clears it.
+
+        Raises ValueError, before anything is sent, for another lane or for a grip outside
+        grip_min_mm..grip_max_mm. The unit would shut down on such a value. Raises RuntimeError
+        when the firmware has no feed or no grip."""
+        grip_cmd = self._slot_cmd(lane_index, self.has_grip, NO_GRIP, self.grip_cmd)
         grip_um = to_um(grip_mm)
+        # With has_grip, the connect has read the limits.
+        assert self.grip_min_mm is not None and self.grip_max_mm is not None
         if grip_um and not to_um(self.grip_min_mm) <= grip_um <= to_um(self.grip_max_mm):
             raise ValueError(
                 f"ace2k: a grip of {grip_mm:g} mm is outside the unit's"
                 f" {self.grip_min_mm:g}..{self.grip_max_mm:g} mm (0 clears)"
             )
-        self.mcu.lookup_command(GRIP_FMT).send([lane_index, grip_um])
+        grip_cmd.send([lane_index, grip_um])
+
+    def set_lane_park(self, lane_index: int) -> None:
+        """Host interface: make the next automatic load of lane ``lane_index`` stop at the park.
+
+        The load pulls to the parking point (load_park_mm) and reads the tag on the way, like any
+        load. It does no tag search past that point, and it ends loaded. Use it for a bay whose
+        search could reach a tube that another lane shares.
+
+        The park uses the slot of the grip on the unit. The load uses it up. Any start on the
+        lane, a read with motion, and set_lane_grip(lane_index, 0) clear it. A grip that is set
+        later replaces it. This only sends a command and never yields.
+
+        Raises ValueError, before anything is sent, for another lane. Raises RuntimeError when the
+        firmware has no feed or no park (has_park)."""
+        self._slot_cmd(lane_index, self.has_park, NO_PARK, self.park_cmd).send([lane_index])
+
+    def set_lane_wait(self, lane_index: int) -> None:
+        """Host interface: make an insert edge on lane ``lane_index`` start no automatic load.
+
+        The filament then stays where the hand left it, however often it goes in. Use it for a
+        lane whose head still holds a piece that the lane does not own.
+
+        The wait uses the slot of the grip on the unit. An insertion does not use it up. Any start
+        on the lane, a read with motion, and set_lane_grip(lane_index, 0) clear it. A grip or a
+        park that is set later replaces it. This only sends a command and never yields.
+
+        Raises ValueError, before anything is sent, for another lane. Raises RuntimeError when the
+        firmware has no feed or no wait (has_wait)."""
+        self._slot_cmd(lane_index, self.has_wait, NO_WAIT, self.wait_cmd).send([lane_index])
+
+    def _slot_cmd(self, lane_index: int, has: bool, missing: str, cmd: Command | None) -> Command:
+        """Return ``cmd``, a command that writes the grip slot of a lane, after the checks of
+        set_lane_grip, set_lane_park and set_lane_wait.
+
+        Raises RuntimeError when the firmware has no feed, or lacks the command (``has`` is
+        False; the text says ``missing``). Raises ValueError for another lane."""
+        if not self.present:
+            raise RuntimeError(f"ace2k: {NO_FEED}")
+        if not has:
+            raise RuntimeError(f"ace2k: {missing}")
+        check_lane(lane_index, NO_LANE)
+        assert cmd is not None  # the connect built it, because ``has`` is set
+        return cmd
 
     # --- the automatic encoder calibration (ace2k_encoder_cal.py) ----------------------------
 
-    def set_counts_period(self, seconds):
-        """The feed-forward counters' period from now on (10 Hz for an automatic calibration,
-        the state report's afterwards)."""
+    def set_counts_period(self, seconds: float) -> None:
+        """Set the period of the feed-forward counters from now on, in seconds.
+
+        The automatic calibration uses 10 Hz. Afterwards the period of the state report is used."""
         if self.has_ff:
             ticks = self.mcu.seconds_to_clock(seconds)
-            self.mcu.lookup_command(FF_QUERY_FMT).send([ticks])
+            assert self.ff_query_cmd is not None  # the connect built it, because has_ff is set
+            self.ff_query_cmd.send([ticks])
 
-    def apply_scale(self, index, scale):
-        """A lane's encoder scale in use at once, and staged for SAVE_CONFIG.  ValueError, before
-        anything is sent, for a lane outside 0..3 or a scale outside the unit's window
-        (scale_low..scale_high): the unit shuts down on one."""
-        if not 0 <= index < LANES:
-            raise ValueError(f"ace2k: no lane {index}")
+    def apply_scale(self, index: int, scale: float) -> None:
+        """Use the encoder scale of a lane at once, and stage it for SAVE_CONFIG.
+
+        ``scale`` is in mm per count. Raises ValueError, before anything is sent, for a lane
+        outside 0..3 or a scale outside the range that the unit accepts (scale_low..scale_high).
+        The unit would shut down on such a scale."""
+        check_lane(index, NO_LANE)
         if not self.scale_low <= scale <= self.scale_high:
             raise ValueError(
                 f"ace2k: {scale:.4f} mm/count is outside the unit's window"
                 f" {self.scale_low:.4f}..{self.scale_high:.4f}"
             )
         old = self.lanes[index]["encoder_scale"]
-        cmd = self.mcu.lookup_command(SCALE_FMT)
-        if self.unit is not None:
-            # the reference before the send: the unit cannot be on the new scale before it has
-            # the command, so the last frame read now is at the old one
-            self.unit.keep_encoder_continuous(index, old, scale)
+        cmd = self.scale_cmd
+        assert cmd is not None  # only the calibration applies a scale, on a feed that it found
+        # Set the reference before the send. The unit cannot use the new scale before it has the
+        # command, so the last frame that was read until now used the old scale.
+        self.unit.keep_encoder_continuous(index, old, scale)
         cmd.send([index, scale_x10(scale)])
         self.scales[index] = scale
         self.lanes[index]["encoder_scale"] = scale
@@ -1004,201 +710,45 @@ class Ace2kFeed:
         configfile = self.printer.lookup_object("configfile")
         configfile.set(self.section, f"lane{index + 1}_encoder_scale", f"{scale:.4f}")
 
+    # --- settings staged for SAVE_CONFIG -------------------------------------------------------
+
+    def _stage(self, values: Mapping[str, float]) -> None:
+        """Stage each key of ``values`` for SAVE_CONFIG, written as setting_text writes it."""
+        configfile = self.printer.lookup_object("configfile")
+        for key, value in values.items():
+            configfile.set(self.section, key, setting_text(value))
+
+    def _ff_host_asked(self, gcmd: GCodeCommand) -> dict[str, tuple[str, float]]:
+        """Return the host-side arguments of ACEK_FF_SET that were given, each checked.
+
+        The result maps an attribute name to (config key, value)."""
+        host: dict[str, tuple[str, float]] = {}
+        for arg, attr, (key, _default, low, high), whole in FF_HOST_ARGS:
+            value = (gcmd.get_int if whole else gcmd.get_float)(arg, None)
+            if value is None:
+                continue
+            reason = setting_bound_error(key, value, low, high)
+            if reason is not None:
+                raise gcmd.error(f"ace2k: {arg} {reason}")
+            host[attr] = (key, value)
+        return host
+
     # --- the G-codes -------------------------------------------------------------------------
 
-    def _require(self, gcmd):
-        if not self.present:
-            raise gcmd.error("ace2k: firmware built without CONFIG_ACE2K_FEED")
+    def _lane_args(self, index: int) -> str:
+        """Return the lane arguments for a command that is printed ready to run.
 
-    def _lane(self, gcmd):
-        return gcmd.get_int("LANE", minval=1, maxval=LANES) - 1
+        With several units, this includes UNIT=."""
+        return self.unit.units.lane_args(self.unit, index)
 
-    def _speed(self, gcmd, default):
-        speed = gcmd.get_float("SPEED", default)
-        if not self.speed_min <= speed <= self.speed_max:
-            raise gcmd.error(
-                f"ace2k: SPEED must be within {self.speed_min:g}..{self.speed_max:g} mm/s"
-            )
-        return speed
-
-    def _next_seq(self, index):
-        """The lane's next sequence: 1..255, wrapping past 255 to 1 — never 0, which marks a
-        motion the unit started on its own."""
-        self.seq[index] = self.seq[index] % SEQ_MAX + 1
-        return self.seq[index]
-
-    def _move_s(self, travel_mm, speed_mm_s):
-        """One move's expected time, as the firmware budgets it: the landing (the last
-        ACE2K_LANE_LANDING_UM, or the whole of a shorter move) at the floor speed, the rest at the
-        commanded one."""
-        if travel_mm > self.landing_mm:
-            return (travel_mm - self.landing_mm) / speed_mm_s + self.landing_mm / self.speed_min
-        return travel_mm / self.speed_min
-
-    def _wait_timeout(self, travel_mm, speed_mm_s, tail_mm=0.0):
-        """The mirror of the firmware's deadline, WAIT_FACTOR × the expected time plus
-        WAIT_MARGIN_S; the tail of an unload or a rollback (tail_mm) is a second move of its own."""
-        expected = self._move_s(travel_mm, speed_mm_s)
-        if tail_mm:
-            expected += self._move_s(tail_mm, speed_mm_s)
-        return WAIT_FACTOR * expected + WAIT_MARGIN_S
-
-    def _load_budget_mm(self, park_mm):
-        """What a waited load may travel: the pull, and with the unit's tag search the search past
-        the parking point, the way back and the sessions' pauses."""
-        if not self.has_search or self.search_mm <= park_mm:
-            return park_mm
-        return park_mm + 2 * (self.search_mm - park_mm) + self.SESSION_ALLOWANCE_MM
-
-    def load_wait_s(self, travel_mm):
-        """How long a wait for travel_mm of the unit's load may take: the budget of a waited move
-        at the current load speed (load_speed, or the last ACE_LOAD_SET) — the speed the unit's
-        load, and its tag search, run at.  For ace2k_rfid.py's MOVE=1 read."""
-        return self._wait_timeout(travel_mm, self.load_speed)
-
-    def _send_start(self, index, mode, length_mm, speed_mm_s, completion):
-        """The start, sent with the lane's next sequence; completion (or None) registered before
-        the send. Returns the sequence; a refusal raises FeedRefused, registering nothing.
-        Before the session's first state report the counter is not seeded past a move the unit
-        may still be running, so the start waits for that report — STATE_WAIT_PERIODS of the
-        configured rate plus WAIT_MARGIN_S — and only none within that is an error
-        (RuntimeError).  The follow on an image without it is a RuntimeError, nothing sent."""
-        if mode == "assist_both" and not self.has_follow:
-            raise RuntimeError(f"ace2k: {NO_FOLLOW}")
-        if not self.state_reported:
-            timeout = STATE_WAIT_PERIODS / self.report_hz + WAIT_MARGIN_S
-            if self.first_report.wait(self.reactor.monotonic() + timeout, None) is None:
-                raise RuntimeError(
-                    f"ace2k: no feed state report within {timeout:g} s (the unit reports at"
-                    f" feed_report_hz = {self.report_hz:.3g} Hz; check the link)"
-                )
-        cmd = self.mcu.lookup_query_command(START_FMT, START_RESP)
-        self.started[index] = True  # from here the counter is the host's; reports leave it alone
-        seq = self._next_seq(index)
-        # the lane's tracked move until the unit answers: a refusal (busy) gives it back, so
-        # the move still running there completes on its own event
-        previous = self.completions.get(index)
-        if completion is not None:
-            self.completions[index] = (seq, completion)
-        # before the send: the final event of a short move can land during the round trip.  The
-        # oldest entries go once more than COMMANDED_KEEP wait, so a lost event never grows the
-        # map.  The serial thread pops entries meanwhile, so the keys are snapshotted first —
-        # iterating the live dict could see its size change — and popped with a default — the
-        # entry may be gone by then.
-        lengths = self.commanded_mm[index]
-        lengths[seq] = length_mm
-        for old in list(lengths)[:-COMMANDED_KEEP]:
-            lengths.pop(old, None)
-        params = cmd.send([index, CMD_MODES[mode], to_um(length_mm), to_um(speed_mm_s), seq])
-        if not params["accepted"]:
-            if completion is not None and self.completions.get(index) == (seq, completion):
-                if previous is None:
-                    del self.completions[index]
-                else:
-                    self.completions[index] = previous
-                    # the running move may have ended during the round trip, its event
-                    # dispatched while this start held the slot: complete it from that event
-                    # (a _dispatch still to come finds the slot gone)
-                    final = self.final_events[index]
-                    if final is not None and final["seq"] == previous[0]:
-                        self._complete(index, final)
-            lengths.pop(seq, None)  # entered no mode: the earlier starts' entries stay
-            reason = REFUSAL_NAMES.get(params["reason"], params["reason"])
-            raise FeedRefused(index, mode, reason)
-        return seq
-
-    def _start(self, gcmd, index, mode, length_mm, speed_mm_s, wait, expected_mm=None, tail_mm=0.0):
-        """Send the start (_send_start); a refusal or no state report → a G-code error; waiting →
-        the event that echoes the sequence, or a timeout that stops the lane."""
-        completion = self.reactor.completion() if wait else None
-        try:
-            self._send_start(index, mode, length_mm, speed_mm_s, completion)
-        except (FeedRefused, RuntimeError) as e:
-            raise gcmd.error(str(e)) from e
-        if not wait:
-            gcmd.respond_info(f"ace2k: lane {index + 1} {mode} started")
-            return None
-        travel = expected_mm if expected_mm is not None else length_mm
-        timeout = self._wait_timeout(travel, speed_mm_s, tail_mm)
-        event = completion.wait(self.reactor.monotonic() + timeout, None)
-        if event is None:
-            # the unit is still moving as far as the host knows (a slower ACE_SPEED, a long
-            # landing): stop it rather than leave a motor running behind an error
-            self.completions.pop(index, None)
-            self.stop(index)
-            raise gcmd.error(
-                f"ace2k: lane {index + 1} {mode}: no completion event within {timeout:.0f} s;"
-                " a stop was sent"
-            )
-        summary = f"motor {event['motor_mm']} mm, filament {event['filament_mm']} mm"
-        if event["kind"] in {KIND_NAMES[k] for k in ERROR_KINDS}:
-            raise gcmd.error(f"ace2k: lane {index + 1} {mode} failed: {event['kind']} — {summary}")
-        gcmd.respond_info(f"ace2k: lane {index + 1} {mode} {event['kind']} — {summary}")
-        return event
-
-    cmd_ACE_FEED_help = "Feed LENGTH=<mm> on LANE=<1-4> at SPEED=<mm/s>; WAIT=0 returns at once"
-
-    def cmd_ACE_FEED(self, gcmd):
-        self._require(gcmd)
-        index = self._lane(gcmd)
-        length = gcmd.get_float("LENGTH", above=0.0, maxval=self.move_max_mm)
-        speed = self._speed(gcmd, self.feed_speed)
-        self._start(gcmd, index, "feed", length, speed, gcmd.get_int("WAIT", 1))
-
-    cmd_ACE_ROLLBACK_help = (
-        "Rewind LENGTH=<mm> on LANE=<1-4> at SPEED=<mm/s>; WAIT=0 returns at once"
-    )
-
-    def cmd_ACE_ROLLBACK(self, gcmd):
-        self._require(gcmd)
-        index = self._lane(gcmd)
-        length = gcmd.get_float("LENGTH", above=0.0, maxval=self.move_max_mm)
-        speed = self._speed(gcmd, self.feed_speed)
-        wait = gcmd.get_int("WAIT", 1)
-        # once the filament leaves the drive the unit runs the unload's tail: the wait counts it
-        self._start(gcmd, index, "rollback", length, speed, wait, tail_mm=self.tail_mm)
-
-    cmd_ACE_UNLOAD_help = (
-        "Rewind LANE=<1-4> until the filament leaves the slot mouth (LENGTH=<budget mm>, SPEED=)"
-    )
-
-    def cmd_ACE_UNLOAD(self, gcmd):
-        self._require(gcmd)
-        index = self._lane(gcmd)
-        budget = gcmd.get_float("LENGTH", 0.0, minval=0.0, maxval=self.move_max_mm)
-        speed = self._speed(gcmd, self.unload_speed)
-        expected = budget if budget else self.move_max_mm
-        wait = gcmd.get_int("WAIT", 1)
-        # the unit runs the tail past the drive (a rollback too): the wait counts it
-        self._start(gcmd, index, "unload", budget, speed, wait, expected, self.tail_mm)
-
-    cmd_ACE_LOAD_help = (
-        "Pull the filament of LANE=<1-4> in to the parking point (LENGTH=<mm>, SPEED=)"
-    )
-
-    def cmd_ACE_LOAD(self, gcmd):
-        self._require(gcmd)
-        index = self._lane(gcmd)
-        length = gcmd.get_float("LENGTH", self.load_park_mm, above=0.0, maxval=self.move_max_mm)
-        speed = self._speed(gcmd, self.load_speed)
-        self._start(
-            gcmd,
-            index,
-            "load",
-            length,
-            speed,
-            gcmd.get_int("WAIT", 1),
-            expected_mm=self._load_budget_mm(length),
-        )
-
-    cmd_ACE_ASSIST_help = (
+    cmd_ACEK_ASSIST_help = (
         "Arm the assist on LANE=<1-4> at SPEED=<mm/s> (DIR=BACK for the reverse, DIR=BOTH for the"
         " follow); OFF=1 disarms; SOFT=1 reports a refusal instead of raising"
     )
 
-    def cmd_ACE_ASSIST(self, gcmd):
-        # SOFT=1 is for print hooks: a lane that cannot be armed is named, never raised, so the
-        # print goes on.  Disarming (OFF=1) is the same with or without it.
+    def cmd_ACEK_ASSIST(self, gcmd: GCodeCommand) -> None:
+        # SOFT=1 is for print hooks. A lane that cannot be armed is named in a message and no error
+        # is raised, so the print goes on. Disarming (OFF=1) works the same with or without it.
         if not gcmd.get_int("SOFT", 0, minval=0, maxval=1) or gcmd.get_int("OFF", 0):
             self._assist(gcmd)
             return
@@ -1206,74 +756,77 @@ class Ace2kFeed:
         try:
             self._assist(gcmd)
         except gcmd.error as e:
-            reason = str(e)
-            if reason.startswith("ace2k: "):
-                reason = reason[len("ace2k: ") :]
-            gcmd.respond_info(f"ace2k: lane {index + 1} not armed — {reason}")
+            gcmd.respond_info(f"ace2k: lane {index + 1} not armed — {unprefixed(e)}")
 
-    def _assist(self, gcmd):
+    def _assist(self, gcmd: GCodeCommand) -> None:
         self._require(gcmd)
         index = self._lane(gcmd)
         if gcmd.get_int("OFF", 0):
-            self.stop(index)
+            self.stop(index, by="command")
             gcmd.respond_info(f"ace2k: lane {index + 1} assist off")
             return
         direction = gcmd.get("DIR", "").upper()
         if direction not in ASSIST_DIRS:
             raise gcmd.error("ace2k: DIR must be BACK or BOTH (or absent for the forward assist)")
         mode = ASSIST_DIRS[direction]
-        speed = self._speed(gcmd, self.assist_speed)
-        self._start(gcmd, index, mode, 0.0, speed, False)
+        speed = self._speed(gcmd, self.assist_speed_mm_s)
+        if mode == "assist_both":
+            why = self.not_active_text(index)
+            if why is not None:
+                raise gcmd.error(why)
+        self._start(gcmd, index, Start(mode, 0.0, speed), False)
 
-    cmd_ACE_STOP_help = "Stop the motor of LANE=<1-4>, or every lane"
+    def lane_unavailable(self, index: int, allow: tuple[str, ...] | None = ("idle",)) -> str | None:
+        """Return the reason why the lane takes no new motion, or None if it does.
 
-    def cmd_ACE_STOP(self, gcmd):
-        self._require(gcmd)
-        index = LANE_ALL if gcmd.get("LANE", None) is None else self._lane(gcmd)
-        self.stop(index)
-        which = "every lane" if index == LANE_ALL else f"lane {index + 1}"
-        gcmd.respond_info(f"ace2k: stop sent to {which}")
+        The checks run in this order. "no_filament" means there is no filament. "error" means the
+        lane is in error, unless "error" is in ``allow``. "busy" means that the mode of the lane
+        is not in ``allow``. A follow whose end has come counts as idle. If ``allow`` is None, the
+        mode is not checked. Each caller writes its own message."""
+        if self.unit.lanes[index]["insert"] is not True:
+            return "no_filament"
+        mode = self.lanes[index]["mode"]
+        if mode == "error" and "error" not in (allow or ()):
+            return "error"
+        if mode == "following" and not self.in_follow(index):
+            mode = "idle"
+        return None if allow is None or mode in allow else "busy"
 
-    cmd_ACE_CLEAR_help = "Leave the error state on LANE=<1-4>"
+    def not_active_text(self, index: int) -> str | None:
+        """Return the text with which a G-code refuses the follow on the lane, or None.
 
-    def cmd_ACE_CLEAR(self, gcmd):
-        self._require(gcmd)
-        index = self._lane(gcmd)
-        self.clear(index)
-        gcmd.respond_info(f"ace2k: lane {index + 1} cleared")
-
-    cmd_ACE_SPEED_help = "Change the speed of a running move on LANE=<1-4>: SPEED=<mm/s>"
-
-    def cmd_ACE_SPEED(self, gcmd):
-        self._require(gcmd)
-        index = self._lane(gcmd)
-        speed = self._speed(gcmd, self.feed_speed)
-        self.mcu.lookup_command("ace2k_feed_speed_set lane=%c speed_um_s=%u").send(
-            [index, to_um(speed)]
+        The text is returned when the lane shares its extruder (on any unit) and is not its active
+        lane. It names ACEK_LANE_ACTIVE."""
+        if self.unit.units.may_follow(self.unit, index):
+            return None
+        return (
+            f"ace2k: lane {self.unit.lane_text(index)} shares {self.ff.extruder_of(index)}"
+            f" and is not its active lane: choose it with ACEK_LANE_ACTIVE {self._lane_args(index)}"
         )
-        gcmd.respond_info(f"ace2k: lane {index + 1} speed {speed:g} mm/s")
 
-    cmd_ACE_CALIBRATE_ENCODER_help = (
+    cmd_ACEK_CALIBRATE_ENCODER_help = (
         "LENGTH=<mm> feeds that much and keeps the encoder's reading; then measure the filament and"
         " run MEASURED=<mm> to stage laneN_encoder_scale for SAVE_CONFIG; or AUTO=1"
         " [LENGTH=<mm>] [SPEED=<mm/s>] extrudes through the lane's extruder and sets the scale"
         " from it"
     )
 
-    def cmd_ACE_CALIBRATE_ENCODER(self, gcmd):
+    def cmd_ACEK_CALIBRATE_ENCODER(self, gcmd: GCodeCommand) -> None:
         self._require(gcmd)
         index = self._lane(gcmd)
         if gcmd.get_int("AUTO", 0, minval=0, maxval=1):
-            # the automatic calibration: the scale read off the lane's extruder
+            # The automatic calibration reads the scale from the extruder of the lane.
             self.cal.run(gcmd, index)
             return
         measured = gcmd.get_float("MEASURED", None, above=0.0)
         if measured is None:
             length = gcmd.get_float("LENGTH", 200.0, above=0.0, maxval=self.move_max_mm)
-            event = self._start(gcmd, index, "feed", length, self.feed_speed, True)
+            event = self._start(gcmd, index, Start("feed", length, self.feed_speed_mm_s), True)
+            assert event is not None  # a waited start returns its final event
             if event["kind"] == "blocked":
-                # the feed met what cannot move: its reading is no sample of the length; an
-                # earlier sample goes too, so a MEASURED of this filament cannot scale against it
+                # The feed met something that cannot move, so its reading is not a sample of the
+                # length. Remove an earlier sample too, so that a MEASURED value for this
+                # filament cannot be scaled against it.
                 self.calibration.pop(index, None)
                 raise gcmd.error(
                     f"ace2k: lane {index + 1} calibration feed blocked — motor"
@@ -1285,18 +838,21 @@ class Ace2kFeed:
             gcmd.respond_info(
                 f"ace2k: lane {index + 1} fed {length:g} mm, the encoder read"
                 f" {event['filament_mm']} mm at {scale:.4f} mm/count; measure the filament"
-                f" that came out, then ACE_CALIBRATE_ENCODER LANE={index + 1} MEASURED=<mm>"
+                " that came out, then ACEK_CALIBRATE_ENCODER"
+                f" {self._lane_args(index)} MEASURED=<mm>"
             )
             return
         if index not in self.calibration:
-            raise gcmd.error("ace2k: run ACE_CALIBRATE_ENCODER LANE=n LENGTH=<mm> first")
+            raise gcmd.error(
+                f"ace2k: run ACEK_CALIBRATE_ENCODER {self._lane_args(index)} LENGTH=<mm> first"
+            )
         filament_mm, scale = self.calibration[index]
         if filament_mm <= 0:
             raise gcmd.error("ace2k: the calibration feed moved no filament; nothing to scale")
         counts = filament_mm / scale
         new_scale = measured / counts
         if not self.scale_low <= new_scale <= self.scale_high:
-            # staged, the value would restart Klipper into a config error at SAVE_CONFIG
+            # If this value were staged, SAVE_CONFIG would restart Klipper into a config error.
             raise gcmd.error(
                 f"ace2k: lane {index + 1}: {new_scale:.4f} mm/count is outside the window the"
                 f" unit accepts, {self.scale_low:.4f}..{self.scale_high:.4f}"
@@ -1310,167 +866,139 @@ class Ace2kFeed:
             f" {new_scale:.4f} mm/count staged; run SAVE_CONFIG (the unit takes it at the restart)"
         )
 
-    cmd_ACE_LOAD_SET_help = (
+    cmd_ACEK_LOAD_SET_help = (
         "The automatic load's settings from now on: PARK=<mm> SPEED=<mm/s> AUTO=0/1 (staged for"
-        " SAVE_CONFIG)"
+        " SAVE_CONFIG); alone, the values in effect"
     )
 
-    def cmd_ACE_LOAD_SET(self, gcmd):
+    def cmd_ACEK_LOAD_SET(self, gcmd: GCodeCommand) -> None:
         self._require(gcmd)
-        # Every argument read and checked before anything changes: a rejected one leaves the
-        # settings, the staged SAVE_CONFIG values and the unit as they were
+        # Read and check every argument before anything changes. A rejected argument leaves the
+        # settings, the values staged for SAVE_CONFIG, and the unit as they were.
         park = gcmd.get_float("PARK", None, above=0.0, maxval=self.move_max_mm)
         speed = gcmd.get_float("SPEED", None)
         auto = gcmd.get_int("AUTO", None, minval=0, maxval=1)
-        if speed is not None and not self.speed_min <= speed <= self.speed_max:
-            raise gcmd.error(
-                f"ace2k: SPEED must be within {self.speed_min:g}..{self.speed_max:g} mm/s"
-            )
+        if park is None and speed is None and auto is None:
+            gcmd.respond_info(self._load_line())
+            return
+        if speed is not None and self.speed_out(speed):
+            raise gcmd.error(f"ace2k: SPEED must be within {self.speed_out(speed)}")
         configfile = self.printer.lookup_object("configfile")
         if park is not None:
             self.load_park_mm = park
             configfile.set(self.section, "load_park_mm", f"{park:g}")
         if speed is not None:
-            self.load_speed = speed
+            self.load_speed_mm_s = speed
             configfile.set(self.section, "load_speed", f"{speed:g}")
         if auto is not None:
             self.auto_load = bool(auto)
             configfile.set(self.section, "auto_load", "True" if auto else "False")
-        self.mcu.lookup_command("ace2k_feed_load_set park_um=%u speed_um_s=%u auto_load=%c").send(
-            [to_um(self.load_park_mm), to_um(self.load_speed), 1 if self.auto_load else 0]
+        assert self.load_set_cmd is not None  # the connect built it, as _require checked
+        self.load_set_cmd.send(
+            [to_um(self.load_park_mm), to_um(self.load_speed_mm_s), 1 if self.auto_load else 0]
         )
-        gcmd.respond_info(
-            f"ace2k: load park {self.load_park_mm:g} mm, speed {self.load_speed:g} mm/s, auto"
-            f" {self.auto_load}; staged for SAVE_CONFIG"
+        gcmd.respond_info(self._load_line() + "; staged for SAVE_CONFIG")
+
+    def _load_line(self) -> str:
+        return (
+            f"ace2k: load park {self.load_park_mm:g} mm, speed {self.load_speed_mm_s:g} mm/s, auto"
+            f" {self.auto_load}"
         )
 
-    cmd_ACE_SNAG_SET_help = (
+    cmd_ACEK_SNAG_SET_help = (
         "The tip snag's values from now on: FWD=<mm> LAG=<mm> DUTY=<%> BACK=<mm> REST=<ms>"
         " FREE=<mm> (staged for SAVE_CONFIG); alone, the values in effect"
     )
 
-    def cmd_ACE_SNAG_SET(self, gcmd):
+    def cmd_ACEK_SNAG_SET(self, gcmd: GCodeCommand) -> None:
         self._require(gcmd)
-        # Every argument read and checked before anything changes, as ACE_LOAD_SET: a rejected
-        # one leaves the values, the staged SAVE_CONFIG values and the unit as they were
-        asked = {}
-        for key, arg, scale, low, high in SNAG_SETTINGS:
-            read = gcmd.get_int if key in SNAG_INT_KEYS else gcmd.get_float
-            value = read(arg, None)
-            if value is None:
-                continue
-            value = setting_round(key, value, scale)  # the bounds judged on what the unit gets
-            reason = setting_bound_error(key, value, low, high)
-            if reason is not None:
-                raise gcmd.error(f"ace2k: {arg} {reason}")
-            asked[key] = value
+        # Read and check every argument before anything changes, as ACEK_LOAD_SET does. A rejected
+        # argument leaves the values, the values staged for SAVE_CONFIG, and the unit as they were.
+        # A LAG from 1 mm up to 1.5 mm is raised to 1.5 mm, as in printer.cfg, and 1.5 mm is
+        # what is staged. So SAVE_CONFIG never writes a value that the next version refuses.
+        raised: list[float] = []
+        asked, values = self.snag_group.from_gcmd(
+            gcmd, self.snag, lambda key, value: raise_old_lag(key, value, raised)
+        )
         if not asked:
-            gcmd.respond_info(self._snag_line())
+            gcmd.respond_info(SNAG.line(self.snag))
             return
-        values = dict(self.snag, **asked)
         if values["snag_lag_mm"] >= values["snag_fwd_mm"]:
-            # the unit would take the set as a host bug (a shutdown)
+            # The unit would treat this as a host bug and shut down.
             raise gcmd.error(
                 f"ace2k: LAG ({setting_text(values['snag_lag_mm'])}) must be under FWD"
                 f" ({setting_text(values['snag_fwd_mm'])}) mm"
             )
+        for lag in raised:
+            warning = f"{self.unit.head()} {old_lag_text(lag)}"
+            logging.warning("%s", warning)
+            gcmd.respond_info(warning)
         self.snag = values
-        configfile = self.printer.lookup_object("configfile")
-        for key, value in asked.items():
-            configfile.set(self.section, key, setting_text(value))
-        self.mcu.lookup_command(SNAG_FMT).send(self._snag_args())
-        gcmd.respond_info(self._snag_line() + "; staged for SAVE_CONFIG")
+        self._stage(asked)
+        SNAG.send(self.mcu, values)
+        gcmd.respond_info(SNAG.line(values) + "; staged for SAVE_CONFIG")
 
-    cmd_ACE_FOLLOW_SET_help = (
+    cmd_ACEK_FOLLOW_SET_help = (
         "The follow's values from now on: FLIP_MS=<ms> TAKE_MM=<mm> TAIL_MM=<mm> (staged for"
         " SAVE_CONFIG); alone, the values in effect"
     )
 
-    def cmd_ACE_FOLLOW_SET(self, gcmd):
+    def cmd_ACEK_FOLLOW_SET(self, gcmd: GCodeCommand) -> None:
         self._require(gcmd)
         if not self.has_follow:
             raise gcmd.error(f"ace2k: {NO_FOLLOW}")
-        # Every argument read and checked before anything changes, as ACE_SNAG_SET: a rejected
-        # one leaves the values, the staged SAVE_CONFIG values and the unit as they were
-        asked = {}
-        for key, arg, scale, _name in FOLLOW_SETTINGS:
-            read = gcmd.get_int if key in FOLLOW_INT_KEYS else gcmd.get_float
-            value = read(arg, None)
-            if value is None:
-                continue
-            value = setting_round(key, value, scale)  # the bounds judged on what the unit gets
-            low, high = self.follow_bounds[key]
-            reason = setting_bound_error(key, value, low, high)
-            if reason is not None:
-                raise gcmd.error(f"ace2k: {arg} {reason}")
-            asked[key] = value
+        # Read and check every argument before anything changes, as ACEK_SNAG_SET does. A rejected
+        # argument leaves the values, the values staged for SAVE_CONFIG, and the unit as they were.
+        asked, values = self.follow_group.from_gcmd(gcmd, self.follow)
         if not asked:
-            gcmd.respond_info(self._follow_line())
+            gcmd.respond_info(FOLLOW.line(self.follow))
             return
-        self.follow = dict(self.follow, **asked)
-        configfile = self.printer.lookup_object("configfile")
-        for key, value in asked.items():
-            configfile.set(self.section, key, setting_text(value))
-        self.mcu.lookup_command(FOLLOW_FMT).send(self._follow_args())
-        gcmd.respond_info(self._follow_line() + "; staged for SAVE_CONFIG")
+        self.follow = values
+        self._stage(asked)
+        FOLLOW.send(self.mcu, values)
+        gcmd.respond_info(FOLLOW.line(values) + "; staged for SAVE_CONFIG")
 
-    cmd_ACE_FF_SET_help = (
+    cmd_ACEK_FF_SET_help = (
         "The feed-forward's values from now on: CHUNK_MM=<mm> PULSE=<mm/s> (the unit's)"
         " WINDOW_MS=<ms> LEAD_MS=<ms> DEADBAND=<mm/s> (the host's), staged for SAVE_CONFIG;"
         " alone, the values in effect"
     )
 
-    def cmd_ACE_FF_SET(self, gcmd):
+    def cmd_ACEK_FF_SET(self, gcmd: GCodeCommand) -> None:
         self._require(gcmd)
         if not self.has_ff:
-            raise gcmd.error(f"ace2k: {ace2k_ff.NO_FF}")
-        # Every argument read and checked before anything changes, as ACE_FOLLOW_SET
-        asked = {}
-        for key, arg, scale, _name in FF_SETTINGS:
-            value = gcmd.get_float(arg, None)
-            if value is None:
-                continue
-            value = setting_round(key, value, scale)  # the bounds judged on what the unit gets
-            low, high = self.ff_bounds[key]
-            reason = setting_bound_error(key, value, low, high)
-            if reason is not None:
-                raise gcmd.error(f"ace2k: {arg} {reason}")
-            asked[key] = value
-        host = {}
-        for arg, attr, (key, _default, low, high), whole in FF_HOST_ARGS:
-            value = (gcmd.get_int if whole else gcmd.get_float)(arg, None)
-            if value is None:
-                continue
-            reason = setting_bound_error(key, value, low, high)
-            if reason is not None:
-                raise gcmd.error(f"ace2k: {arg} {reason}")
-            host[attr] = (key, value)
+            raise gcmd.error(f"ace2k: {NO_FF}")
+        # Read and check every argument before anything changes, as ACEK_FOLLOW_SET does.
+        asked, values = self.ff_group.from_gcmd(gcmd, self.ff_values)
+        host = self._ff_host_asked(gcmd)
         if not asked and not host:
             gcmd.respond_info(self._ff_line())
             return
-        configfile = self.printer.lookup_object("configfile")
         for attr, (key, value) in host.items():
             if attr == "lead_ms":
-                self.ff.set_lead(value)  # a new lead restarts each extruder's sweep
+                self.ff.set_lead(int(value))  # a new lead restarts the sweep of each extruder
             else:
                 setattr(self.ff, attr, value)
-            configfile.set(self.section, key, setting_text(value))
+            self._stage({key: value})
         if asked:
-            self.ff_values = dict(self.ff_values, **asked)
-            for key, value in asked.items():
-                configfile.set(self.section, key, setting_text(value))
-            self.mcu.lookup_command(FF_FMT).send(self._ff_args())
+            self.ff_values = values
+            self._stage(asked)
+            FF.send(self.mcu, values)
         gcmd.respond_info(self._ff_line() + "; staged for SAVE_CONFIG")
+        if gcmd.get("PULSE", None) is not None:
+            gcmd.respond_info(f"{self.unit.head()} {ace2k_ff.FF_PULSE_RETIRED}")
 
-    cmd_ACE_FEED_FORWARD_help = (
+    cmd_ACEK_FEED_FORWARD_help = (
         "Switch the feed-forward ON=1 or OFF=1 on LANE=<1-4>, or every lane; alone, the state"
     )
 
-    def cmd_ACE_FEED_FORWARD(self, gcmd):
+    def cmd_ACEK_FEED_FORWARD(self, gcmd: GCodeCommand) -> None:
         self._require(gcmd)
         if not self.has_ff:
-            raise gcmd.error(f"ace2k: {ace2k_ff.NO_FF}")
-        lanes = range(LANES) if gcmd.get("LANE", None) is None else [self._lane(gcmd)]
+            raise gcmd.error(f"ace2k: {NO_FF}")
+        lanes: Sequence[int] = (
+            range(LANES) if gcmd.get("LANE", None) is None else [self._lane(gcmd)]
+        )
         on = gcmd.get_int("ON", 0, minval=0, maxval=1)
         off = gcmd.get_int("OFF", 0, minval=0, maxval=1)
         if on and off:
@@ -1478,17 +1006,50 @@ class Ace2kFeed:
         if on or off:
             self.ff.set_on(lanes, bool(on))
         gcmd.respond_info(self.ff.switch_line())
+        if on and not self.has_follow:
+            gcmd.respond_info(
+                f"{self.unit.head()} the feed-forward doses only a lane in the follow: {NO_FOLLOW}"
+            )
+        elif on:
+            for line in self.ff.not_following_lines(lanes):
+                gcmd.respond_info(line)
 
-    cmd_ACE_GRIP_help = (
+    cmd_ACEK_LANE_ACTIVE_help = (
+        "Make LANE=<1-4> the active lane of its extruder: the follow stopped on the other lanes"
+        " that feed the same extruder, and armed on this one"
+    )
+
+    def cmd_ACEK_LANE_ACTIVE(self, gcmd: GCodeCommand) -> None:
+        self._require(gcmd)
+        if not self.has_follow:
+            raise gcmd.error(f"ace2k: {NO_FOLLOW}")
+        index = self._lane(gcmd)
+        n = index + 1
+        lane = self.lanes[index]
+        why = self.lane_unavailable(index, None)
+        if why == "no_filament":
+            raise gcmd.error(f"ace2k: lane {n} has no filament")
+        if why == "error":
+            raise gcmd.error(f"ace2k: lane {n} is in error ({lane['error']}); ACEK_CLEAR first")
+        if self.motion[index].inflight or (
+            self.open_seq(index) is not None and not self.follow_running(index)
+        ):
+            raise gcmd.error(f"ace2k: lane {n} is busy ({lane['mode']})")
+        # Stop the other followers of the group, on any unit, and wait until they have ended.
+        # Then arm this lane.
+        self.unit.units.lane_active(self.unit, index, gcmd, PAUSE_WAIT_S)
+
+    cmd_ACEK_GRIP_help = (
         "Grip on LANE=<1-4>: its next automatic load pulls only MM=<mm> (the firmware's default"
         " when absent), without the tag search; MM=0 clears"
     )
 
-    def cmd_ACE_GRIP(self, gcmd):
+    def cmd_ACEK_GRIP(self, gcmd: GCodeCommand) -> None:
         self._require(gcmd)
         if not self.has_grip:
             raise gcmd.error(f"ace2k: {NO_GRIP}")
         index = self._lane(gcmd)
+        assert self.grip_mm is not None  # the connect read the default, because has_grip is set
         grip = gcmd.get_float("MM", self.grip_mm, minval=0.0)
         try:
             self.set_lane_grip(index, grip)
@@ -1501,11 +1062,3 @@ class Ace2kFeed:
             )
         else:
             gcmd.respond_info(f"ace2k: lane {index + 1} grip cleared")
-
-
-def load_config(config):
-    # [ace2k] loads this module with printer.load_object(config, "ace2k_feed"), which hands it
-    # the [ace2k_feed] section — one that does not exist.  The keys live in [ace2k]; reading
-    # them through this wrapper puts them in Klipper's access tracking, so its unused-option
-    # check passes.
-    return Ace2kFeed(config.getsection("ace2k"))

@@ -1,23 +1,28 @@
-"""Anycubic — NTAG213, the record from page 4 (DnG-Crafts ACE-RFID's layout): the magic
-7B 00 65 00, then SKU, brand and material strings, a packed colour, the temperature ranges, the
-diameter and the weight, little-endian.  No key."""
+"""Decodes the Anycubic tag, an NTAG213 with the record from page 4.
+
+The layout is the one of ACE-RFID by DnG-Crafts. The record starts with the magic bytes
+7B 00 65 00. Then come the SKU, brand and material strings, a packed colour, the temperature
+ranges, the diameter and the weight. All numbers are little-endian. The tag needs no key.
+"""
+
+from __future__ import annotations
 
 import struct
 
-from .base import SpoolRecord, TagFormat, cstr, ntag_steps
+from .base import Chip, Got, SpoolRecord, Step, TagFormat, cstr, ntag_steps
 
 MAGIC = b"\x7b\x00\x65\x00"
-FIRST_PAGE, LAST_PAGE = 4, 39  # the NTAG213 user area
+FIRST_PAGE, LAST_PAGE = 4, 39  # the user area of the NTAG213
 
 
 class Anycubic(TagFormat):
     name = "anycubic"
     chip = "ntag"
 
-    def steps(self, chip, got):
+    def steps(self, _chip: Chip, got: Got) -> list[Step]:
         return ntag_steps(got, FIRST_PAGE, LAST_PAGE)
 
-    def decode(self, chip, got):
+    def decode(self, chip: Chip, got: Got) -> SpoolRecord | None:
         img = got.image(FIRST_PAGE, LAST_PAGE)
         if img is None or img[0:4] != MAGIC:
             return None
@@ -27,7 +32,7 @@ class Anycubic(TagFormat):
         bmin, bmax = struct.unpack_from("<HH", img, 100)
         return SpoolRecord(
             format=self.name,
-            uid=chip.uid.hex().upper(),
+            uid=chip.uid_text,
             brand=cstr(img, 24, 20) or "Anycubic",
             material=cstr(img, 44, 20) or None,
             color_rgba=f"{r:02X}{g:02X}{b:02X}FF",

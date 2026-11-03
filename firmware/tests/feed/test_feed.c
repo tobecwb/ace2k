@@ -1,118 +1,6 @@
 #include "test.h"
-#include "feed/feed.h"
-
-/* The world: the lane's fake counters and lines, the feed's inputs, one clock. */
-// NOLINTNEXTLINE(readability-identifier-naming)
-struct world {
-    uint16_t enc[ACE2K_LANE_COUNT];
-    uint32_t fg[ACE2K_LANE_COUNT];
-    uint8_t duty[ACE2K_LANE_COUNT];
-    bool run[ACE2K_LANE_COUNT];
-    bool reverse[ACE2K_LANE_COUNT];
-    /* every forward start of the motor, even one stopped again within the same tick */
-    uint32_t forward_starts[ACE2K_LANE_COUNT];
-    struct ace2k_feed_inputs in;
-    uint32_t now;
-    struct ace2k_lane lane;
-    struct ace2k_feed feed;
-};
-
-static uint16_t w_enc(void *ctx, uint8_t lane)
-{
-    return ((struct world *)ctx)->enc[lane];
-}
-
-static uint32_t w_fg(void *ctx, uint8_t lane)
-{
-    return ((struct world *)ctx)->fg[lane];
-}
-
-static void w_pwm(void *ctx, uint8_t lane, uint8_t duty_pct)
-{
-    ((struct world *)ctx)->duty[lane] = duty_pct;
-}
-
-static void w_run(void *ctx, uint8_t lane, bool on)
-{
-    struct world *w = ctx;
-    w->run[lane] = on;
-    if (on && !w->reverse[lane]) {
-        w->forward_starts[lane]++;
-    }
-}
-
-static void w_dir(void *ctx, uint8_t lane, bool reverse)
-{
-    ((struct world *)ctx)->reverse[lane] = reverse;
-}
-
-static const struct ace2k_lane_ops ace2k_w_ops = {
-    .encoder_read = w_enc,
-    .fg_read = w_fg,
-    .pwm_set = w_pwm,
-    .run_set = w_run,
-    .dir_set = w_dir,
-};
-
-/* Both cores primed at t = 10 ms, the link up, filament in lane 1 (bit 0), every plunger at
- * rest. */
-static void world_init(struct world *w)
-{
-    *w = (struct world){ 0 };
-    w->now = 10;
-    w->in.link_ok = true;
-    w->in.insert = 0x01;
-    w->in.rest = 0x0F;
-    ace2k_lane_init(&w->lane, &ace2k_w_ops, w);
-    ace2k_feed_init(&w->feed, &w->lane);
-    w->feed.load.auto_load = false; /* the automatic load's own test arms it */
-    ace2k_lane_tick(&w->lane, w->now, true);
-    ace2k_feed_tick(&w->feed, w->now, &w->in);
-}
-
-/* One 10 ms tick: lane 0's tach and encoder advance by the given amounts, both cores tick. */
-static void step(struct world *w, uint32_t pulses, int counts)
-{
-    w->now += 10;
-    w->fg[0] += pulses;
-    w->enc[0] = (uint16_t)(w->enc[0] + counts);
-    ace2k_lane_tick(&w->lane, w->now, w->in.link_ok);
-    ace2k_feed_tick(&w->feed, w->now, &w->in);
-}
-
-static void steps(struct world *w, int n, uint32_t pulses, int counts)
-{
-    for (int i = 0; i < n; i++) {
-        step(w, pulses, counts);
-    }
-}
-
-/* n ticks with the tach at `pulses` a tick and the encoder advancing count_step (+1 forward, −1
- * in reverse) once every `every` ticks — on the every-th, 2·every-th … tick of the call: n / every
- * counts in all.  A move ends on the encoder (the length is the strand's travel), so this is what
- * finishes one: 4 pulses a tick is ≈ 32 mm/s of motor, a count every four ticks ≈ 31 mm/s of
- * strand — the few per cent the drive gear slips under a spool.  At 1234.2 µm a count 10 mm is 8 counts, 20 mm 16, 50 mm 41, 100 mm 81. */
-static void paced(struct world *w, int n, uint32_t pulses, int every, int count_step)
-{
-    for (int i = 0; i < n; i++) {
-        step(w, pulses, ((i + 1) % every == 0) ? count_step : 0);
-    }
-}
-
-/* n ticks with a tach pulse every `every` ticks and the strand still: a motor turning too slowly
- * for the standstill's 20 mm to come before a short move's deadline, yet never silent for the
- * lane's own second. */
-static void crawl(struct world *w, int n, int every)
-{
-    for (int i = 0; i < n; i++) {
-        step(w, ((i + 1) % every == 0) ? 1U : 0U, 0);
-    }
-}
-
-static bool pop(struct world *w, struct ace2k_feed_event *e)
-{
-    return ace2k_feed_pop_event(&w->feed, e);
-}
+#include "fake_feed_world.h"
+#include "ace2k/feed/feed_internal.h" /* for the direct call in the wait test */
 
 TEST(start_refusals_no_link_in_error_busy_bounds)
 {
@@ -441,6 +329,9 @@ TEST(the_insert_falling_is_a_runout_in_feed_and_rollback_and_the_goal_of_an_unlo
 {
     struct world w;
     world_init(&w);
+    /* the fall ends the unload at once: the clear past it has its own tests
+     * (test_feed_unload.c) */
+    ASSERT_EQ(ace2k_feed_unload_set(&w.feed, 0), 0);
     struct ace2k_feed_event e;
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 500000, 30000, 61, w.now),
               ACE2K_FEED_ACCEPTED);
@@ -625,12 +516,23 @@ TEST(set_speed_reaches_a_running_move_and_is_refused_idle_or_in_error)
 {
     struct world w;
     world_init(&w);
-    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 30000, w.now), -ACE2K_EREFUSED);
+    /* idle: no move to change, nothing kept for the next one; the bounds are judged first */
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 30000, w.now), ACE2K_FEED_REFUSED_NO_MOVE);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 4, 30000, w.now), ACE2K_FEED_REFUSED_BOUNDS);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 1000, w.now), ACE2K_FEED_REFUSED_BOUNDS);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, ACE2K_LANE_SPEED_MAX_UM_S + 1, w.now),
+              ACE2K_FEED_REFUSED_BOUNDS);
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 500000, 30000, 101, w.now),
               ACE2K_FEED_ACCEPTED);
-    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 60000, w.now), 0);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 60000, w.now), ACE2K_FEED_ACCEPTED);
     ASSERT_EQ(w.lane.lane[0].move.speed_um_s, 60000);
-    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 1000, w.now), -ACE2K_EINVAL);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 1000, w.now), ACE2K_FEED_REFUSED_BOUNDS);
+    ASSERT_EQ(w.lane.lane[0].move.speed_um_s, 60000);
+    /* the tach never moves: a stall, an error, and the speed refused there */
+    steps(&w, 101, 0, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ERROR);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 30000, w.now), ACE2K_FEED_REFUSED_IN_ERROR);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 1000, w.now), ACE2K_FEED_REFUSED_BOUNDS);
 }
 
 TEST(the_done_event_echoes_the_seq_of_the_start)
@@ -786,7 +688,7 @@ TEST(a_start_repeating_the_last_seq_is_the_transports_retry_and_starts_nothing)
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 10000, 30000, 11, w.now),
               ACE2K_FEED_ACCEPTED);
     paced(&w, 5, 4, 4, 1);
-    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 40000, w.now), 0);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 40000, w.now), ACE2K_FEED_ACCEPTED);
     ASSERT_EQ(w.feed.l[0].speed_um_s, 40000);
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 10000, 30000, 11, w.now),
               ACE2K_FEED_ACCEPTED);
@@ -861,6 +763,31 @@ TEST(a_start_repeating_the_last_seq_is_the_transports_retry_and_starts_nothing)
               ACE2K_FEED_ACCEPTED);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 1), ACE2K_FEED_FEEDING);
     ASSERT_TRUE(w.run[1]);
+}
+
+/* The strand leaving a lane in error ends the error as a clear does, and like a clear it ends no
+ * mode: the retry window stays the failure's.  The failed start resent right after the runout,
+ * long after the failure, is a new command (refused: no strand), not its retry. */
+TEST(a_runout_out_of_error_keeps_the_failures_retry_window)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 100000, ACE2K_LANE_SPEED_MAX_UM_S,
+                               51, w.now),
+              ACE2K_FEED_ACCEPTED);
+    steps(&w, 105, 0, 0); /* the tach never moves: a stall after one second, an error */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ERROR);
+    ASSERT_TRUE(pop(&w, &e));
+    steps(&w, 101, 0, 0); /* past the failure's retry window */
+    w.in.insert = 0x00;   /* the strand withdrawn */
+    step(&w, 0, 0);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_RUNOUT);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 100000, ACE2K_LANE_SPEED_MAX_UM_S,
+                               51, w.now),
+              ACE2K_FEED_REFUSED_NO_FILAMENT);
 }
 
 TEST(a_mode_the_unit_enters_on_its_own_leaves_the_last_host_starts_retry_window_as_it_was)
@@ -1011,7 +938,8 @@ TEST(the_same_standstill_with_the_buffer_full_is_blocked_and_any_reverse_mode_ta
     ASSERT_TRUE(!ace2k_feed_clear(&w.feed, 0)); /* nothing to clear */
     w.in.pulled_any = false;
     /* toward the spool the kind is read from the plunger: a tip held in the hot end pulls the
-     * strand taut (pushed) while the drive grinds — stuck at once (measured on the unit); at rest the same standstill is the tail past the drive, tested further down */
+     * strand taut (pushed) while the drive grinds — stuck at once (measured on the unit); at rest
+     * the same standstill is the tail past the drive, tested further down */
     w.in.rest = 0x0E;
     w.in.pushed = 0x01;
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_ROLLBACK, 500000, 30000, 132, w.now),
@@ -1083,7 +1011,8 @@ TEST(the_partial_trigger_trips_at_fifty_millimetres_when_the_filament_is_short_b
     }
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING);
     ASSERT_TRUE(!pop(&w, &e));
-    ASSERT_EQ(w.feed.l[0].fg_window, w.lane.lane[0].fg_raw); /* the second window closed here */
+    ASSERT_EQ(w.feed.l[0].fg_window_pulses,
+              w.lane.lane[0].fg_raw); /* the second window closed here */
 }
 
 TEST(a_healthy_move_never_trips_and_the_thresholds_command_takes_effect)
@@ -1124,7 +1053,7 @@ TEST(a_healthy_move_never_trips_and_the_thresholds_command_takes_effect)
         .slip_allow_um = 1000,
         .stall_check_um = 20000,
     };
-    ace2k_feed_thresholds_set(&w.feed, &th);
+    ASSERT_EQ(ace2k_feed_thresholds_set(&w.feed, &th), 0);
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 200000, 30000, 153, w.now),
               ACE2K_FEED_ACCEPTED);
     paced(&w, 154, 4, 4, 1); /* 616 pulses: the window still open */
@@ -1153,8 +1082,8 @@ TEST(a_strand_the_head_pulls_ahead_of_the_motor_never_trips_and_the_move_ends_on
               ACE2K_FEED_ACCEPTED);
     paced(&w, 155, 4, 3, 1);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING);
-    ASSERT_EQ(w.feed.l[0].fg_window, w.lane.lane[0].fg_raw); /* the window restarted */
-    paced(&w, 330, 4, 3, 1);                                 /* 161 counts in all */
+    ASSERT_EQ(w.feed.l[0].fg_window_pulses, w.lane.lane[0].fg_raw); /* the window restarted */
+    paced(&w, 330, 4, 3, 1);                                        /* 161 counts in all */
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING);
     step(&w, 4, 1);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
@@ -1180,7 +1109,7 @@ TEST(a_jam_after_the_strand_followed_is_a_standstill_twenty_millimetres_of_motor
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_ROLLBACK, 500000, 30000, 171, w.now),
               ACE2K_FEED_ACCEPTED);
     paced(&w, 20, 4, 4, -1); /* the strand follows: 5 counts back, 80 pulses */
-    ASSERT_EQ(w.feed.l[0].fg_still, 64);
+    ASSERT_EQ(w.feed.l[0].fg_still_pulses, 64);
     w.in.rest = 0x0E; /* held ahead: the drive pulls the strand taut against the hold */
     w.in.pushed = 0x01;
     steps(&w, 57, 4, 0); /* held: 308 pulses, 244 since the base — 19.8 mm, not yet */
@@ -1205,9 +1134,10 @@ TEST(a_jam_after_the_strand_followed_is_a_standstill_twenty_millimetres_of_motor
               ACE2K_FEED_ACCEPTED);
     paced(&w, 168, 4, 4, 1);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING);
-    ASSERT_EQ(w.feed.l[0].fg_still, w.lane.lane[0].fg_raw); /* moved on this very tick */
-    ASSERT_EQ(w.feed.l[0].fg_window, w.lane.lane[0].fg_raw - 672 + 620); /* the window's base */
-    steps(&w, 61, 4, 0); /* 916 pulses: 244 since the base — not yet */
+    ASSERT_EQ(w.feed.l[0].fg_still_pulses, w.lane.lane[0].fg_raw); /* moved on this very tick */
+    ASSERT_EQ(w.feed.l[0].fg_window_pulses,
+              w.lane.lane[0].fg_raw - 672 + 620); /* the window's base */
+    steps(&w, 61, 4, 0);                          /* 916 pulses: 244 since the base — not yet */
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING);
     step(&w, 4, 0);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
@@ -1230,7 +1160,7 @@ TEST(one_count_is_still_and_two_are_a_move_at_every_accepted_scale)
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 500000, 30000, 181, w.now),
               ACE2K_FEED_ACCEPTED);
     step(&w, 4, 1);
-    ASSERT_EQ(w.feed.l[0].fg_still, 0);
+    ASSERT_EQ(w.feed.l[0].fg_still_pulses, 0);
     steps(&w, 60, 4, 0); /* 244 pulses: not yet */
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING);
     step(&w, 4, 0);
@@ -1245,7 +1175,7 @@ TEST(one_count_is_still_and_two_are_a_move_at_every_accepted_scale)
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 500000, 30000, 182, w.now),
               ACE2K_FEED_ACCEPTED);
     steps(&w, 2, 4, 1);
-    ASSERT_EQ(w.feed.l[0].fg_still, w.lane.lane[0].fg_raw);
+    ASSERT_EQ(w.feed.l[0].fg_still_pulses, w.lane.lane[0].fg_raw);
     steps(&w, 61, 4, 0); /* 252 pulses, 244 since the base: not yet */
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING);
     step(&w, 4, 0);
@@ -1260,7 +1190,7 @@ TEST(one_count_is_still_and_two_are_a_move_at_every_accepted_scale)
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 500000, 30000, 183, w.now),
               ACE2K_FEED_ACCEPTED);
     step(&w, 4, 1);
-    ASSERT_EQ(w.feed.l[0].fg_still, w.lane.lane[0].fg_raw - 4);
+    ASSERT_EQ(w.feed.l[0].fg_still_pulses, w.lane.lane[0].fg_raw - 4);
     steps(&w, 61, 4, 0); /* the 62nd tick, 248 pulses */
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
     ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
@@ -1272,7 +1202,7 @@ TEST(one_count_is_still_and_two_are_a_move_at_every_accepted_scale)
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 500000, 30000, 184, w.now),
               ACE2K_FEED_ACCEPTED);
     steps(&w, 2, 4, 1);
-    ASSERT_EQ(w.feed.l[0].fg_still, w.lane.lane[0].fg_raw);
+    ASSERT_EQ(w.feed.l[0].fg_still_pulses, w.lane.lane[0].fg_raw);
     steps(&w, 61, 4, 0); /* 244 since the base: not yet */
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING);
     step(&w, 4, 0);
@@ -1289,8 +1219,9 @@ TEST(the_comparator_judges_only_a_mode_the_feed_entered)
     struct world w;
     world_init(&w);
     struct ace2k_feed_event e;
-    /* a lane the lane core moves for someone else — the bench, a test — while the feed is idle:
-     * 400 pulses (32 mm) with no filament is nobody's tangle; the feed's bases were never taken */
+    /* a lane the lane core moves for someone else — a manual command, a test — while the feed is
+     * idle: 400 pulses (32 mm) with no filament is nobody's tangle; the feed's bases were never
+     * taken */
     ASSERT_EQ(ace2k_lane_move(&w.lane, 0, ACE2K_LANE_FORWARD, 500000, 30000, w.now), 0);
     steps(&w, 100, 4, 0);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
@@ -1400,16 +1331,19 @@ TEST(the_load_grace_skips_the_first_fifty_millimetres)
     ASSERT_EQ(ace2k_lane_move(&w.lane, 0, ACE2K_LANE_FORWARD, 500000, 30000, w.now), 0);
     w.feed.l[0].mode = ACE2K_FEED_LOADING;
     w.feed.l[0].sub = ACE2K_FEED_SUB_MOVING; /* the pull */
-    w.feed.l[0].fg_start = w.lane.lane[0].fg_raw;
+    w.feed.l[0].grace = true;                /* a load from the bay, as begin_load sets it */
+    w.feed.l[0].fg_start_pulses = w.lane.lane[0].fg_raw;
     w.feed.l[0].enc_um_start = ace2k_lane_encoder_um(&w.lane, 0);
-    w.feed.l[0].fg_window = w.feed.l[0].fg_start; /* the bases enter() would have taken */
+    w.feed.l[0].fg_window_pulses =
+        w.feed.l[0].fg_start_pulses; /* the bases enter() would have taken */
     w.feed.l[0].enc_um_window = w.feed.l[0].enc_um_start;
-    w.feed.l[0].fg_still = w.feed.l[0].fg_start;
+    w.feed.l[0].fg_still_pulses = w.feed.l[0].fg_start_pulses;
     w.feed.l[0].enc_um_still = w.feed.l[0].enc_um_start;
     steps(&w, 150, 4, 0); /* 600 pulses ≈ 48.6 mm of motor, no filament: inside the grace */
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
-    ASSERT_EQ(w.feed.l[0].fg_still, w.lane.lane[0].fg_raw); /* both bases restart meanwhile */
-    ASSERT_EQ(w.feed.l[0].fg_window, w.lane.lane[0].fg_raw);
+    ASSERT_EQ(w.feed.l[0].fg_still_pulses,
+              w.lane.lane[0].fg_raw); /* both bases restart meanwhile */
+    ASSERT_EQ(w.feed.l[0].fg_window_pulses, w.lane.lane[0].fg_raw);
     /* the grace ends on the 155th tick (620 pulses ≥ 50 mm), the standstill's base the 154th's
      * 616; it trips 248 pulses later — 864 pulses, the 216th tick */
     steps(&w, 65, 4, 0); /* 860 pulses: 244 in the window, 19.8 mm — not yet */
@@ -1430,6 +1364,44 @@ TEST(the_load_grace_skips_the_first_fifty_millimetres)
     ASSERT_TRUE(!pop(&w, &e));
 }
 
+/* The grace is the bay load's alone: its strand comes in by hand and the pinch catches it.  A
+ * read with motion starts on a strand already gripped, and the comparator judges it from its
+ * first millimetre: a strand that stands still under the motor is the search's obstacle, at the
+ * standstill's 20 mm, not after 50 mm (up to v0.12.0 the grace covered it too). */
+TEST(a_read_with_motion_is_judged_from_its_first_millimetre)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
+    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, 0, w.now), ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
+    steps(&w, 70, 4, 0); /* 280 pulses ≈ 22.7 mm of motor, the strand still: inside 50 mm */
+    ASSERT_TRUE(ace2k_lane_fg_to_um(280) < ACE2K_FEED_LOAD_GRACE_UM);
+    ASSERT_EQ(ace2k_feed_search_end(&w.feed, 0), ACE2K_FEED_SEARCH_OBSTACLE);
+    ASSERT_TRUE(w.feed.l[0].sub != ACE2K_FEED_SUB_SEARCH ||
+                ace2k_feed_mode(&w.feed, 0) != ACE2K_FEED_LOADING);
+}
+
+TEST(a_bay_load_keeps_its_grace)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_LOAD, 0, 0, 73, w.now),
+              ACE2K_FEED_ACCEPTED);
+    for (int i = 0; i < 100 && !w.run[0]; i++) {
+        step(&w, 0, 0); /* the settle */
+    }
+    ASSERT_TRUE(w.run[0] && !w.reverse[0]);
+    steps(&w, 150, 4, 0); /* 600 pulses ≈ 48.6 mm of motor, the strand still: the grace */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
+    ASSERT_TRUE(w.run[0]);
+    struct ace2k_feed_event e;
+    ASSERT_TRUE(!pop(&w, &e));
+    ASSERT_TRUE(w.feed.l[0].grace);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    ASSERT_TRUE(!w.feed.l[0].grace); /* what a mode carries ends with it */
+}
+
 TEST(the_forward_assist_bursts_on_taut_and_stops_at_rest_or_full)
 {
     struct world w;
@@ -1444,7 +1416,7 @@ TEST(the_forward_assist_bursts_on_taut_and_stops_at_rest_or_full)
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_ASSIST, 0, 1000, 212, w.now),
               ACE2K_FEED_REFUSED_BOUNDS);
     /* armed with the plunger at rest: nothing moves — the head has not pulled yet, and no timer
-     * starts a burst (decided at the bench) */
+     * starts a burst (chosen after tests on the unit) */
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_ASSIST, 0, 50000, 213, w.now),
               ACE2K_FEED_ACCEPTED);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ASSISTING);
@@ -1467,7 +1439,7 @@ TEST(the_forward_assist_bursts_on_taut_and_stops_at_rest_or_full)
     ASSERT_EQ(ace2k_feed_bursts(&w.feed, 0), 1);
     ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_MOVING);
     /* feeding taut, the strand moving: 20 ticks, 80 pulses, 20 counts — taut is the normal start
-     * of a burst, not a notice (observed at the bench: fourteen notices in a minute
+     * of a burst, not a notice (seen on the unit: fourteen notices in a minute
      * of ordinary pulling); a burst that ends at rest before its bound says nothing */
     steps(&w, 20, 4, 1);
     ASSERT_TRUE(!pop(&w, &e));
@@ -1489,8 +1461,8 @@ TEST(the_forward_assist_bursts_on_taut_and_stops_at_rest_or_full)
     step(&w, 0, 0);
     ASSERT_TRUE(w.run[0] && !w.reverse[0]);
     ASSERT_EQ(ace2k_feed_bursts(&w.feed, 0), 2);
-    ASSERT_EQ(w.feed.l[0].fg_still, w.lane.lane[0].fg_raw);
-    ASSERT_EQ(w.feed.l[0].fg_window, w.lane.lane[0].fg_raw);
+    ASSERT_EQ(w.feed.l[0].fg_still_pulses, w.lane.lane[0].fg_raw);
+    ASSERT_EQ(w.feed.l[0].fg_window_pulses, w.lane.lane[0].fg_raw);
     /* the full reading during a burst stops it, as a safety — this lane's plunger at its pulled
      * end, or any lane's: one input for the four */
     w.in.pushed = 0x00;
@@ -1530,7 +1502,7 @@ TEST(a_burst_reaching_its_bound_while_taut_chains_into_the_next)
      * plunger never comes back to rest — so the burst runs its 81 counts to its bound, the 81st
      * on the 324th tick (a count every four ticks, 1296 pulses of motor, inside its deadline:
      * 100 mm at 50 mm/s is 2.9 s expected, 5.4 s allowed), and the next burst starts on that
-     * tick: no event, no error — a bound reached is not a fault (decided at the bench) */
+     * tick: no event, no error — a bound reached is not a fault (chosen after tests on the unit) */
     w.in.rest = 0x0E;
     w.in.pushed = 0x01;
     step(&w, 0, 0);
@@ -1549,9 +1521,10 @@ TEST(a_burst_reaching_its_bound_while_taut_chains_into_the_next)
     ASSERT_EQ(w.lane.lane[0].move.target_counts,
               ace2k_lane_um_to_counts(&w.lane, 0, ACE2K_FEED_ASSIST_BURST_UM));
     ASSERT_EQ(w.lane.lane[0].move.enc_start, ace2k_lane_encoder_count(&w.lane, 0));
-    ASSERT_EQ(w.feed.l[0].fg_still, w.lane.lane[0].fg_raw); /* the bases afresh */
+    ASSERT_EQ(w.feed.l[0].fg_still_pulses, w.lane.lane[0].fg_raw); /* the bases afresh */
     /* the bound reached with the strand still taut is the head outrunning a whole burst: the
-     * behind notice, on the tick of the chain, with the mode's odometers (1296 pulses, 81 counts) */
+     * behind notice, on the tick of the chain, with the mode's odometers (1296 pulses, 81
+     * counts) */
     ASSERT_TRUE(pop(&w, &e));
     ASSERT_EQ(e.kind, ACE2K_FEED_BEHIND);
     ASSERT_EQ(e.mode, ACE2K_FEED_ASSISTING);
@@ -1593,6 +1566,95 @@ TEST(a_burst_reaching_its_bound_while_taut_chains_into_the_next)
     ASSERT_EQ(e.seq, 221);
     ASSERT_EQ(e.motor_um, ace2k_lane_fg_to_um(2592 + 1296));
     ASSERT_EQ(e.filament_um, 243 * 12342 / 10);
+}
+
+/* Every final event carries the mode's travel, not the last move's.  A forward assist: burst 1
+ * starts on its first taut tick and feeds 21 counts with 84 pulses, then the plunger back at rest
+ * ends it.  Burst 2 starts on the next taut tick and has fed 6 counts with 24 pulses when this
+ * returns.  The mode has moved 27 counts and 108 pulses; burst 2 alone, 6 and 24. */
+static void assist_two_bursts(struct world *w, uint32_t speed_um_s, uint8_t seq)
+{
+    struct ace2k_feed_event e;
+    ASSERT_EQ(ace2k_feed_start(&w->feed, 0, ACE2K_FEED_CMD_ASSIST, 0, speed_um_s, seq, w->now),
+              ACE2K_FEED_ACCEPTED);
+    w->in.rest = 0x0E;
+    w->in.pushed = 0x01;
+    step(w, 0, 0);
+    ASSERT_TRUE(w->run[0]);
+    steps(w, 21, 4, 1);
+    w->in.pushed = 0x00;
+    w->in.rest = 0x0F;
+    step(w, 0, 0);
+    ASSERT_TRUE(!w->run[0]);
+    w->in.rest = 0x0E;
+    w->in.pushed = 0x01;
+    step(w, 0, 0);
+    ASSERT_TRUE(w->run[0]);
+    ASSERT_EQ(ace2k_feed_bursts(&w->feed, 0), 2);
+    steps(w, 6, 4, 1);
+    ASSERT_EQ(ace2k_feed_mode(&w->feed, 0), ACE2K_FEED_ASSISTING);
+    ASSERT_TRUE(!pop(w, &e));
+}
+
+/* The one event lane 0 has left, with the mode it happened in and the travel it reports. */
+static void one_event(struct world *w, uint8_t kind, uint8_t mode, uint32_t pulses, int32_t counts)
+{
+    struct ace2k_feed_event e;
+    ASSERT_TRUE(pop(w, &e));
+    ASSERT_EQ(e.kind, kind);
+    ASSERT_EQ(e.mode, mode);
+    ASSERT_EQ(e.motor_um, ace2k_lane_fg_to_um(pulses));
+    ASSERT_EQ(e.filament_um, counts * 12342 / 10);
+    ASSERT_TRUE(!pop(w, &e));
+}
+
+TEST(a_link_lost_in_an_assists_second_burst_reports_both_bursts)
+{
+    struct world w;
+    world_init(&w);
+    assist_two_bursts(&w, 30000, 241);
+    w.in.link_ok = false;
+    step(&w, 0, 0); /* the lane core ends burst 2 with link_lost */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    one_event(&w, ACE2K_FEED_STOPPED_LINK, ACE2K_FEED_ASSISTING, 108, 27);
+}
+
+TEST(a_shutdown_in_an_assists_second_burst_reports_both_bursts)
+{
+    struct world w;
+    world_init(&w);
+    assist_two_bursts(&w, 30000, 242);
+    ace2k_lane_abort_all(&w.lane, ACE2K_LANE_SHUTDOWN, w.now);
+    step(&w, 0, 0); /* the feed reads the lane core's shutdown result on its tick */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    one_event(&w, ACE2K_FEED_STOPPED_SHUTDOWN, ACE2K_FEED_ASSISTING, 108, 27);
+}
+
+TEST(a_stall_in_an_assists_second_burst_reports_both_bursts)
+{
+    struct world w;
+    world_init(&w);
+    assist_two_bursts(&w, 30000, 243);
+    steps(&w, 99, 0, 0); /* the tach silent for 990 ms: not yet */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ASSISTING);
+    step(&w, 0, 0); /* 1000 ms: the lane core's stall */
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_MOTOR_STALLED);
+    one_event(&w, ACE2K_FEED_MOTOR_STALLED, ACE2K_FEED_ASSISTING, 108, 27);
+}
+
+TEST(a_timeout_in_an_assists_second_burst_reports_both_bursts)
+{
+    struct world w;
+    world_init(&w);
+    /* at 70 mm/s a 100 mm burst has 4594 ms: burst 2 began 6 ticks before this paced run, so
+     * its deadline passes on the run's 454th tick.  A pulse a tick and a count every twelve keep
+     * the comparator quiet: 37 more counts and 454 more pulses */
+    assist_two_bursts(&w, ACE2K_LANE_SPEED_MAX_UM_S, 244);
+    paced(&w, 453, 1, 12, 1);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ASSISTING);
+    step(&w, 1, 0);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_TIMEOUT);
+    one_event(&w, ACE2K_FEED_TIMEOUT, ACE2K_FEED_ASSISTING, 108 + 454, 27 + 37);
 }
 
 TEST(taut_and_still_under_command_in_an_assist_is_tangled_at_the_standstill_never_assist_stall)
@@ -1680,16 +1742,16 @@ TEST(runout_and_set_speed_during_an_assist)
               ACE2K_FEED_ACCEPTED);
     /* set_speed in the wait — armed at rest, no move running — arms the first burst */
     ASSERT_TRUE(!w.run[0]);
-    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 30000, w.now), 0);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 30000, w.now), ACE2K_FEED_ACCEPTED);
     ASSERT_EQ(w.feed.l[0].speed_um_s, 30000);
-    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 1000, w.now), -ACE2K_EINVAL);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 1000, w.now), ACE2K_FEED_REFUSED_BOUNDS);
     w.in.rest = 0x0E;
     w.in.pushed = 0x01;
     step(&w, 0, 0);
     ASSERT_TRUE(w.run[0]);
     ASSERT_EQ(w.lane.lane[0].move.speed_um_s, 30000);
     /* set_speed reaches the running burst */
-    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 40000, w.now), 0);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 40000, w.now), ACE2K_FEED_ACCEPTED);
     ASSERT_EQ(w.lane.lane[0].move.speed_um_s, 40000);
     ASSERT_EQ(w.feed.l[0].speed_um_s, 40000);
     ASSERT_EQ(ace2k_feed_bursts(&w.feed, 0), 1);
@@ -1719,7 +1781,7 @@ TEST(the_reverse_assist_takes_up_on_full_and_stops_at_rest_or_taut)
     w.in.insert = 0x01;
     step(&w, 0, 0);
     /* armed with the plunger at rest: nothing — and nothing while the strand is taut either; the
-     * buffer at rest is the target (decided at the bench) */
+     * buffer at rest is the target (chosen after tests on the unit) */
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_ASSIST_BACK, 0, 50000, 252, w.now),
               ACE2K_FEED_ACCEPTED);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ASSISTING_BACK);
@@ -1878,7 +1940,8 @@ TEST(the_load_settles_then_pulls_to_the_parking_point_and_a_stop_in_the_settle_c
     ASSERT_EQ(w.feed.l[0].length_um, 100000);
     ASSERT_EQ(w.feed.l[0].speed_um_s, 40000);
     steps(&w, 20, 0, 0);
-    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 60000, w.now), 0); /* no move yet: armed */
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 60000, w.now),
+              ACE2K_FEED_ACCEPTED); /* no move yet: armed */
     ASSERT_TRUE(!w.run[0]);
     steps(&w, 30, 0, 0);
     ASSERT_TRUE(w.run[0]);
@@ -1897,7 +1960,7 @@ TEST(the_load_settles_then_pulls_to_the_parking_point_and_a_stop_in_the_settle_c
     ASSERT_TRUE(!pop(&w, &e));
 }
 
-TEST(the_buffer_full_during_a_loads_pull_is_watched_and_in_its_settle_nothing)
+TEST(the_buffer_full_during_a_loads_pull_is_judged_by_the_strand_and_in_its_settle_nothing)
 {
     struct world w;
     world_init(&w);
@@ -1911,9 +1974,9 @@ TEST(the_buffer_full_during_a_loads_pull_is_watched_and_in_its_settle_nothing)
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
     ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SETTLE);
     ASSERT_TRUE(!pop(&w, &e));
-    /* the pull starts on the 50th tick with the buffer still full: as a feed started with the
-     * buffer full, the watch begins on that tick (base 0) — the watch, a strand that does not
-     * follow: stuck once it lags 5 mm, 64 pulses in — the head is not taking filament */
+    /* the pull starts on the 50th tick with the buffer still full: the free phase begins on that
+     * tick (base 0) — a strand that does not follow: blocked once it lags 5 mm, 64 pulses in —
+     * the head is not taking filament */
     step(&w, 0, 0);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
     steps(&w, 15, 4, 0);
@@ -1931,8 +1994,8 @@ TEST(the_buffer_full_during_a_loads_pull_is_watched_and_in_its_settle_nothing)
     w.in.pulled_any = false;
     w.in.rest = 0x0F;
     /* a healthy pull, then the buffer full 31 mm in — inside the comparator's grace, which does
-     * not cover this reading: the watch, a strand that does not follow: stuck once it lags 5 mm,
-     * 64 pulses past the full, with the odometers so far */
+     * not cover this reading: the free phase, a strand that does not follow: blocked once it lags
+     * 5 mm, 64 pulses past the full, with the odometers so far */
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_LOAD, 0, 0, 172, w.now),
               ACE2K_FEED_ACCEPTED);
     steps(&w, 50, 0, 0);
@@ -1972,8 +2035,8 @@ TEST(the_buffer_full_during_a_loads_pull_is_watched_and_in_its_settle_nothing)
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 1), ACE2K_FEED_LOADING);
     ASSERT_TRUE(w.run[1]);
     ASSERT_TRUE(!pop(&w, &e));
-    /* lane 2's own plunger leaves rest with the reading still up: its full — the watch begins
-     * on that tick.  The watch, a strand that does not follow: stuck once it lags 5 mm — lane 2's
+    /* lane 2's own plunger leaves rest with the reading still up: its full — the free phase
+     * begins on that tick, a strand that does not follow: blocked once it lags 5 mm — lane 2's
      * tach driven by hand (the fake's step() moves lane 1's counters), 4 pulses a tick with its
      * strand still: 64 pulses past the full, the 16th tick */
     w.in.rest = 0x0C;
@@ -2028,7 +2091,7 @@ TEST(the_automatic_load_starts_on_the_insert_edge_only_when_idle_armed_and_linke
     ASSERT_EQ(ace2k_feed_seq(&w.feed, 0), 0); /* no host start yet */
     /* a lane in another mode does not load, nor does a lane in error */
     struct ace2k_feed_load_cfg cfg = { .park_um = 250000, .speed_um_s = 20000, .auto_load = true };
-    ace2k_feed_load_set(&w.feed, &cfg);
+    ASSERT_EQ(ace2k_feed_load_set(&w.feed, &cfg), 0);
     w.in.insert = 0x00;
     step(&w, 0, 0);
     /* a rollback needs no strand: the piece parked past the sensor comes back to the mouth */
@@ -2054,9 +2117,9 @@ TEST(the_automatic_load_starts_on_the_insert_edge_only_when_idle_armed_and_linke
     steps(&w, 20, 0, 0); /* the strand in place: the error holds, no load */
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ERROR);
     ASSERT_TRUE(!pop(&w, &e));
-    /* the strand pulled out ends the error as a runout (decided at the bench), the lane idle; put back in, the edge loads with load_set's settings — 250 mm is 203
-     * counts — and the loaded event is the unit's own (seq 0) while the report keeps the last
-     * host start's seq */
+    /* the strand pulled out ends the error as a runout (chosen after tests on the unit), the lane
+     * idle; put back in, the edge loads with load_set's settings — 250 mm is 203 counts — and the
+     * loaded event is the unit's own (seq 0) while the report keeps the last host start's seq */
     w.in.insert = 0x00;
     step(&w, 0, 0);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
@@ -2134,7 +2197,8 @@ TEST(a_gripped_automatic_load_pulls_the_grip_alone_ends_loaded_and_clears_it)
     struct world w;
     world_init(&w);
     struct ace2k_feed_event e;
-    ace2k_feed_search_set(&w.feed, 600000); /* a search configured: the grip skips it */
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000),
+              0); /* a search configured: the grip skips it */
     w.feed.load.auto_load = true;
     ASSERT_EQ(ace2k_feed_grip_set(&w.feed, 0, 40000), 0);
     w.in.insert = 0x00;
@@ -2180,7 +2244,7 @@ TEST(a_gripped_automatic_load_pulls_the_grip_alone_ends_loaded_and_clears_it)
 /* An automatic load with a 40 mm grip, past its settle and 10 counts (12.3 mm) into the pull. */
 static void grip_pull_started(struct world *w)
 {
-    ace2k_feed_search_set(&w->feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w->feed, 600000), 0);
     w->feed.load.auto_load = true;
     ASSERT_EQ(ace2k_feed_grip_set(&w->feed, 0, 40000), 0);
     w->in.insert = 0x00;
@@ -2232,7 +2296,7 @@ TEST(an_obstacle_inside_the_grip_ends_the_gripped_load_blocked)
     world_init(&w);
     struct ace2k_feed_event e;
     grip_pull_started(&w);
-    /* this lane's buffer full and the strand still: the watch, blocked once it lags 5 mm */
+    /* this lane's buffer full and the strand still: the free phase, blocked once it lags 5 mm */
     w.in.pulled_any = true;
     w.in.rest = 0x0E;
     step(&w, 4, 0);
@@ -2257,6 +2321,188 @@ TEST(an_obstacle_inside_the_grip_ends_the_gripped_load_blocked)
     ASSERT_TRUE(!pop(&w, &e));
 }
 
+/* The park. */
+TEST(the_park_takes_any_lane_in_range_and_a_grip_of_zero_clears_it)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_park_set(&w.feed, 3), 0);
+    ASSERT_EQ(w.feed.grip_um[3], ACE2K_FEED_GRIP_PARK);
+    ASSERT_EQ(ace2k_feed_park_set(&w.feed, ACE2K_LANE_COUNT), -ACE2K_EINVAL);
+    ASSERT_EQ(ace2k_feed_grip_set(&w.feed, 3, 0), 0);
+    ASSERT_EQ(w.feed.grip_um[3], 0);
+    /* a grip length replaces the park, and the park a grip length: one slot */
+    ASSERT_EQ(ace2k_feed_park_set(&w.feed, 0), 0);
+    ASSERT_EQ(ace2k_feed_grip_set(&w.feed, 0, 40000), 0);
+    ASSERT_EQ(w.feed.grip_um[0], 40000);
+    ASSERT_EQ(ace2k_feed_park_set(&w.feed, 0), 0);
+    ASSERT_EQ(w.feed.grip_um[0], ACE2K_FEED_GRIP_PARK);
+}
+
+TEST(a_parked_automatic_load_pulls_to_the_parking_point_reads_on_the_way_and_never_searches)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000),
+              0); /* a search configured: the park skips it */
+    w.feed.load.auto_load = true;
+    ASSERT_EQ(ace2k_feed_park_set(&w.feed, 0), 0);
+    w.in.insert = 0x00;
+    step(&w, 0, 0);
+    w.in.insert = 0x01;
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
+    ASSERT_EQ(w.feed.l[0].seq, 0);
+    ASSERT_EQ(w.feed.l[0].length_um, ACE2K_FEED_LOAD_PARK_UM); /* the parking distance */
+    ASSERT_TRUE(w.feed.l[0].gripped);
+    ASSERT_EQ(w.feed.grip_um[0], 0); /* used up by this load */
+    steps(&w, 50, 0, 0);             /* the settle */
+    paced(&w, 400, 4, 4, 1);
+    /* a read session pauses the pull as in any load; released, the pull resumes */
+    w.in.tag_hold = 0x01;
+    step(&w, 0, 0);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_PAUSED);
+    w.in.tag_hold = 0;
+    step(&w, 0, 0);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_MOVING);
+    int n = 0;
+    while (ace2k_feed_mode(&w.feed, 0) == ACE2K_FEED_LOADING && n < 2000) {
+        ASSERT_TRUE(w.feed.l[0].sub != ACE2K_FEED_SUB_SEARCH);
+        step(&w, 4, ((n + 1) % 4 == 0) ? 1 : 0);
+        n++;
+    }
+    /* no tag read, no search past the parking point: idle there, the motor stopped */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_EQ(ace2k_feed_search_end(&w.feed, 0), ACE2K_FEED_SEARCH_NONE);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_LOADED);
+    ASSERT_EQ(e.seq, 0);
+    ASSERT_TRUE(e.filament_um >= (int32_t)ACE2K_FEED_LOAD_PARK_UM - 1235 &&
+                e.filament_um < (int32_t)ACE2K_FEED_LOAD_PARK_UM + 1235);
+    ASSERT_TRUE(!pop(&w, &e));
+    /* the next insert edge is a plain load: the park point and the search */
+    w.in.insert = 0x00;
+    step(&w, 0, 0);
+    w.in.insert = 0x01;
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
+    ASSERT_TRUE(!w.feed.l[0].gripped);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+TEST(a_host_start_clears_the_park)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ASSERT_EQ(ace2k_feed_park_set(&w.feed, 0), 0);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_LOAD, 0, 0, 193, w.now),
+              ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(w.feed.grip_um[0], 0);
+    ASSERT_TRUE(!w.feed.l[0].gripped); /* a host load searches as before */
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    ASSERT_TRUE(pop(&w, &e));
+}
+
+/* The wait. */
+TEST(the_wait_takes_any_lane_in_range_and_a_grip_of_zero_clears_it)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_wait_set(&w.feed, 2), 0);
+    ASSERT_EQ(w.feed.grip_um[2], ACE2K_FEED_GRIP_WAIT);
+    ASSERT_EQ(ace2k_feed_wait_set(&w.feed, ACE2K_LANE_COUNT), -ACE2K_EINVAL);
+    ASSERT_EQ(ace2k_feed_grip_set(&w.feed, 2, 0), 0);
+    ASSERT_EQ(w.feed.grip_um[2], 0);
+    /* one slot: a grip or a park set later replaces the wait */
+    ASSERT_EQ(ace2k_feed_wait_set(&w.feed, 0), 0);
+    ASSERT_EQ(ace2k_feed_park_set(&w.feed, 0), 0);
+    ASSERT_EQ(w.feed.grip_um[0], ACE2K_FEED_GRIP_PARK);
+    ASSERT_EQ(ace2k_feed_wait_set(&w.feed, 0), 0);
+    ASSERT_EQ(ace2k_feed_grip_set(&w.feed, 0, 40000), 0);
+    ASSERT_EQ(w.feed.grip_um[0], 40000);
+}
+
+TEST(a_waiting_lane_starts_no_automatic_load_and_keeps_the_wait_through_a_reinsertion)
+{
+    struct world w;
+    world_init(&w);
+    w.feed.load.auto_load = true;
+    ASSERT_EQ(ace2k_feed_wait_set(&w.feed, 0), 0);
+    for (int round = 0; round < 2; round++) {
+        w.in.insert = 0x00;
+        step(&w, 0, 0);
+        w.in.insert = 0x01;
+        steps(&w, 60, 0, 0); /* past the settle of a load that must not start */
+        ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+        ASSERT_TRUE(!w.run[0]);
+        ASSERT_EQ(w.feed.grip_um[0], ACE2K_FEED_GRIP_WAIT); /* not used up */
+    }
+    /* another lane still loads on its edge: the wait is per lane */
+    w.in.insert = 0x03;
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 1), ACE2K_FEED_LOADING);
+    ace2k_feed_stop(&w.feed, 1, w.now);
+}
+
+TEST(a_host_start_clears_the_wait_and_a_refused_one_leaves_it)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    /* refused: no filament at the bay */
+    w.in.insert = 0x00;
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_wait_set(&w.feed, 0), 0);
+    ASSERT_TRUE(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 100000, 30000, 190, w.now) !=
+                ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(w.feed.grip_um[0], ACE2K_FEED_GRIP_WAIT);
+    /* accepted: the host's load from the bay */
+    w.in.insert = 0x01;
+    step(&w, 0, 0); /* the edge: no automatic load, the wait holds */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_LOAD, 0, 0, 191, w.now),
+              ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(w.feed.grip_um[0], 0);
+    ASSERT_TRUE(!w.feed.l[0].gripped); /* a whole load, with its grace */
+    ASSERT_TRUE(w.feed.l[0].grace);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    ASSERT_TRUE(pop(&w, &e));
+}
+
+TEST(the_read_with_motion_clears_the_wait)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
+    w.in.insert = 0x01;
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_wait_set(&w.feed, 0), 0);
+    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, 7, w.now), ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(w.feed.grip_um[0], 0);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    ASSERT_TRUE(pop(&w, &e));
+}
+
+/* A defensive branch no public path reaches: the wait never gets to a load.  So this calls
+ * ace2k_feed_begin_load directly, and the coupling to the internal header is deliberate. */
+TEST(the_wait_is_never_taken_as_a_grip_length_by_a_load)
+{
+    struct world w;
+    world_init(&w);
+    w.in.insert = 0x01;
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_wait_set(&w.feed, 0), 0);
+    ace2k_feed_begin_load(&w.feed, 0, 123000, 30000, 0, w.now);
+    ASSERT_EQ(w.feed.l[0].length_um, 123000U); /* the parking distance, not the wait */
+    ASSERT_TRUE(!w.feed.l[0].gripped);
+    ASSERT_EQ(w.feed.grip_um[0], 0);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
 TEST(a_host_start_clears_the_grip)
 {
     struct world w;
@@ -2279,9 +2525,9 @@ TEST(a_host_start_clears_the_grip)
     ace2k_feed_stop(&w.feed, 0, w.now);
     ASSERT_TRUE(pop(&w, &e));
     /* a read with motion */
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     ASSERT_EQ(ace2k_feed_grip_set(&w.feed, 0, 40000), 0);
-    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, w.now), ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, 0, w.now), ACE2K_FEED_ACCEPTED);
     ASSERT_EQ(w.feed.grip_um[0], 0);
     ace2k_feed_stop(&w.feed, 0, w.now);
     while (pop(&w, &e)) {
@@ -2300,6 +2546,33 @@ TEST(a_host_start_clears_the_grip)
               ACE2K_FEED_ACCEPTED);
     ASSERT_EQ(w.feed.grip_um[0], 40000);
     ace2k_feed_stop(&w.feed, 1, w.now);
+}
+
+TEST(a_start_refused_for_its_bounds_leaves_the_grip)
+{
+    /* every refusal leaves the grip, the command's own bounds too: a length, a speed or a park
+     * out of them, an assist's speed, an unknown command */
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_grip_set(&w.feed, 0, 40000), 0);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 0, 30000, 195, w.now),
+              ACE2K_FEED_REFUSED_BOUNDS);
+    ASSERT_EQ(w.feed.grip_um[0], 40000);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_ASSIST, 0, 1, 196, w.now),
+              ACE2K_FEED_REFUSED_BOUNDS);
+    ASSERT_EQ(w.feed.grip_um[0], 40000);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_LOAD, ACE2K_LANE_MOVE_MAX_UM + 1U, 0, 197,
+                               w.now),
+              ACE2K_FEED_REFUSED_BOUNDS);
+    ASSERT_EQ(w.feed.grip_um[0], 40000);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, (enum ace2k_feed_cmd)99, 10000, 30000, 198, w.now),
+              ACE2K_FEED_REFUSED_BOUNDS);
+    ASSERT_EQ(w.feed.grip_um[0], 40000);
+    ASSERT_EQ(ace2k_feed_park_set(&w.feed, 0), 0);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 10000, 1, 199, w.now),
+              ACE2K_FEED_REFUSED_BOUNDS);
+    ASSERT_EQ(w.feed.grip_um[0], ACE2K_FEED_GRIP_PARK);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
 }
 
 TEST(a_retried_host_start_clears_the_grip_too)
@@ -2413,20 +2686,24 @@ TEST(a_reverse_standstill_at_rest_is_the_tail_past_the_drive_and_the_move_goes_o
 {
     struct world w;
     world_init(&w);
+    /* the fall ends the unload at once: the clear past it has its own tests
+     * (test_feed_unload.c) */
+    ASSERT_EQ(ace2k_feed_unload_set(&w.feed, 0), 0);
     struct ace2k_feed_event e;
     /* an unload whose strand follows for 41 counts (50.6 mm) and then stands still with the
-     * plunger at rest: the tail has left the drive (measured on the unit, on lane 2).  The standstill's base is the 40th count, tick 160, 640 pulses (the 41st
-     * is one count past it, under the 1500 µm floor); it trips 248 pulses later, 888, the 222nd
-     * tick — no error: the motor keeps turning for the spool to wind the tail out */
+     * plunger at rest: the tail has left the drive (measured on the unit, on lane 2).  The
+     * standstill's base is the 40th count, tick 160, 640 pulses (the 41st is one count past it,
+     * under the 1500 µm floor); it trips 248 pulses later, 888, the 222nd tick — no error: the
+     * motor keeps turning for the spool to wind the tail out */
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_UNLOAD, 0, 30000, 201, w.now),
               ACE2K_FEED_ACCEPTED);
     paced(&w, 164, 4, 4, -1);
-    ASSERT_EQ(w.feed.l[0].fg_still, 640);
+    ASSERT_EQ(w.feed.l[0].fg_still_pulses, 640);
     steps(&w, 57, 4, 0); /* 884 pulses: 244 since the base, not yet */
     ASSERT_TRUE(!w.feed.l[0].tail_out);
     step(&w, 4, 0);
     ASSERT_TRUE(w.feed.l[0].tail_out);
-    ASSERT_EQ(w.feed.l[0].fg_tail, 888);
+    ASSERT_EQ(w.feed.l[0].fg_tail_pulses, 888);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_UNLOADING);
     ASSERT_TRUE(w.run[0] && w.reverse[0]);
     ASSERT_TRUE(!pop(&w, &e));
@@ -2620,6 +2897,9 @@ TEST(a_reverse_deadline_with_the_plunger_at_rest_is_the_tail_too_and_the_mode_go
 {
     struct world w;
     world_init(&w);
+    /* the fall ends the unload at once: the clear past it has its own tests
+     * (test_feed_unload.c) */
+    ASSERT_EQ(ace2k_feed_unload_set(&w.feed, 0), 0);
     struct ace2k_feed_event e;
     /* an unload with a 30 mm budget at 30 mm/s: 20 mm at speed and the 10 mm landing at the floor
      * are 1777 ms expected, 3665 ms allowed — the 367th tick.  A pulse every two ticks is 183
@@ -2693,6 +2973,53 @@ TEST(a_reverse_deadline_with_the_plunger_at_rest_is_the_tail_too_and_the_mode_go
     ASSERT_TRUE(pop(&w, &e));
     ASSERT_EQ(e.kind, ACE2K_FEED_TIMEOUT);
     ASSERT_EQ(e.mode, ACE2K_FEED_UNLOADING);
+}
+
+/* A 30 mm unload or rollback whose strand comes back 10 counts in its first ten ticks, with no
+ * pulse, then stands still under a crawling motor: a pulse every two ticks, 178 pulses by the
+ * 366th tick.  The deadline on the 367th tick, with the plunger at rest, is the tail: a fresh
+ * move, of 100 mm (81 counts) for the unload, and of what the length still owes for the
+ * rollback (30 mm less the 10 counts and the 178 pulses turned since: 3 counts).  The strand
+ * then comes back all n counts at 3 pulses a tick, 12·n pulses, under either tail's budget, so
+ * the tail's move ends done.  The mode has moved 10 + n counts back and 178 + 12·n pulses.
+ * Returns n. */
+static int reverse_tail_runs_its_length(struct world *w, enum ace2k_feed_cmd cmd, uint8_t seq)
+{
+    ASSERT_EQ(ace2k_feed_start(&w->feed, 0, cmd, 30000, 30000, seq, w->now), ACE2K_FEED_ACCEPTED);
+    steps(w, 10, 0, -1);
+    crawl(w, 356, 2);
+    ASSERT_TRUE(!w->feed.l[0].tail_out);
+    step(w, 0, 0);
+    ASSERT_TRUE(w->feed.l[0].tail_out);
+    ASSERT_TRUE(w->run[0] && w->reverse[0]);
+    int n = (int)w->lane.lane[0].move.target_counts;
+    paced(w, (4 * (n - 1)) + 3, 3, 4, -1); /* all the tail's counts but the last */
+    ASSERT_TRUE(w->run[0]);
+    step(w, 3, -1);
+    ASSERT_TRUE(!w->run[0]);
+    return n;
+}
+
+TEST(a_rollbacks_tail_move_that_runs_its_length_reports_the_whole_rollback)
+{
+    struct world w;
+    world_init(&w);
+    int n = reverse_tail_runs_its_length(&w, ACE2K_FEED_CMD_ROLLBACK, 64);
+    /* 30 mm less the 10 counts and the 178 pulses turned unseen, not the unload's 100 mm */
+    ASSERT_EQ(n,
+              (int)ace2k_lane_um_to_counts(&w.lane, 0, 30000U - 12342U - ace2k_lane_fg_to_um(178)));
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    one_event(&w, ACE2K_FEED_DONE, ACE2K_FEED_ROLLING_BACK, 178U + (12U * (uint32_t)n), -(10 + n));
+}
+
+TEST(an_unloads_tail_move_that_runs_its_length_reports_the_whole_unload)
+{
+    struct world w;
+    world_init(&w);
+    int n = reverse_tail_runs_its_length(&w, ACE2K_FEED_CMD_UNLOAD, 65);
+    ASSERT_EQ(n, 81);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_UNLOAD_INCOMPLETE);
+    one_event(&w, ACE2K_FEED_UNLOAD_INCOMPLETE, ACE2K_FEED_UNLOADING, 1150, -91);
 }
 
 TEST(a_long_taut_wait_with_the_motor_off_is_no_fault_and_the_next_burst_is_judged_afresh)
@@ -3378,6 +3705,59 @@ TEST(the_tail_stop_link_and_shutdown_in_the_follow)
     nothing_moves_after_the_shutdown(&w, 50);
 }
 
+/* An armed follow with two bursts behind it: burst 1 of 21 counts and 84 pulses, rest, then
+ * burst 2 of 6 counts and 24 pulses, still running. */
+static void follow_two_bursts(struct world *w, uint32_t speed_um_s, uint8_t seq)
+{
+    struct ace2k_feed_event e;
+    follow_rest(w);
+    step(w, 0, 0);
+    ASSERT_EQ(ace2k_feed_start(&w->feed, 0, ACE2K_FEED_CMD_ASSIST_BOTH, 0, speed_um_s, seq, w->now),
+              ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_mode(&w->feed, 0), ACE2K_FEED_FOLLOWING);
+    follow_taut(w);
+    step(w, 0, 0);
+    assert_burst_running(w);
+    steps(w, 21, 4, 1);
+    follow_rest(w);
+    step(w, 0, 0);
+    ASSERT_TRUE(!w->run[0]);
+    follow_taut(w);
+    step(w, 0, 0);
+    assert_burst_running(w);
+    ASSERT_EQ(ace2k_feed_bursts(&w->feed, 0), 2);
+    steps(w, 6, 4, 1);
+    ASSERT_EQ(ace2k_feed_mode(&w->feed, 0), ACE2K_FEED_FOLLOWING);
+    ASSERT_TRUE(!pop(w, &e));
+}
+
+TEST(a_stall_in_the_follows_later_burst_reports_the_whole_follow)
+{
+    struct world w;
+    world_init(&w);
+    follow_two_bursts(&w, 50000, 71);
+    steps(&w, 99, 0, 0); /* the tach silent for 990 ms: not yet */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FOLLOWING);
+    step(&w, 0, 0); /* 1000 ms: the lane core's stall */
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_MOTOR_STALLED);
+    one_event(&w, ACE2K_FEED_MOTOR_STALLED, ACE2K_FEED_FOLLOWING, 108, 27);
+}
+
+TEST(a_timeout_in_the_follows_later_burst_reports_the_whole_follow)
+{
+    struct world w;
+    world_init(&w);
+    /* the same deadline as an assist's burst at 70 mm/s: burst 2 began 6 ticks before this paced
+     * run, so its deadline passes on the run's 454th tick, with 37 more counts and 454 more
+     * pulses */
+    follow_two_bursts(&w, ACE2K_LANE_SPEED_MAX_UM_S, 72);
+    paced(&w, 453, 1, 12, 1);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FOLLOWING);
+    step(&w, 1, 0);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_TIMEOUT);
+    one_event(&w, ACE2K_FEED_TIMEOUT, ACE2K_FEED_FOLLOWING, 108 + 454, 27 + 37);
+}
+
 TEST(arming_the_follow_reads_the_buffer_as_the_tick_does)
 {
     struct world w;
@@ -3427,24 +3807,25 @@ TEST(the_follow_is_an_assist_for_busy_and_the_leds)
     struct world w;
     world_init(&w);
     w.in.insert = 0x03;
-    ace2k_feed_search_set(&w.feed, ACE2K_FEED_SEARCH_DEFAULT_UM);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, ACE2K_FEED_SEARCH_DEFAULT_UM), 0);
     step(&w, 0, 0);
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_ASSIST_BOTH, 0, 50000, 111, w.now),
               ACE2K_FEED_ACCEPTED);
     /* waiting with no move running, the lane is still busy: every start, the read with motion on
-     * it or (the tag search's rule 4) on another lane, and the counters reset's veto read it */
+     * it, the load's own tag search on another lane (rule 4) and the counters reset's veto read
+     * it.  A read with motion on another lane does not: a follow at rest leaves it free (below,
+     * the_read_with_motion_is_taken_beside_a_follow_at_rest_and_refused_while_it_moves) */
     ASSERT_TRUE(ace2k_feed_lane_busy(&w.feed, 0));
     ASSERT_TRUE(ace2k_feed_lane_busy(&w.feed, ACE2K_LANE_ALL));
     ASSERT_TRUE(!ace2k_feed_lane_busy(&w.feed, 1));
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 10000, 30000, 112, w.now),
               ACE2K_FEED_REFUSED_BUSY);
-    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, w.now), ACE2K_FEED_REFUSED_BUSY);
-    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 1, w.now), ACE2K_FEED_REFUSED_OTHER_LANE);
-    /* a speed armed in the wait reaches the next move */
-    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 30000, w.now), 0);
+    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, 0, w.now), ACE2K_FEED_REFUSED_BUSY);
+    /* a speed set in the wait is refused: the next move runs at the follow's own speed */
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 30000, w.now), ACE2K_FEED_REFUSED_FOLLOWING);
     follow_taut(&w);
     step(&w, 0, 0);
-    ASSERT_EQ(w.lane.lane[0].move.speed_um_s, 30000);
+    ASSERT_EQ(w.lane.lane[0].move.speed_um_s, 50000);
     ace2k_feed_stop(&w.feed, 0, w.now);
     ASSERT_TRUE(!ace2k_feed_lane_busy(&w.feed, 0));
     /* the LEDs' pattern is the binding's (feed_cmds.c), not reachable from a host test: it maps
@@ -3587,6 +3968,33 @@ TEST(the_base_rate_accrues_a_capped_debt_with_its_remainder)
     ASSERT_TRUE(!pop(&w, &e));
 }
 
+/* The board's tick catches up after a stall: one call, its clock several periods on.  The base
+ * rate accrues for the time that passed, not for one period, and a clock that jumped far is
+ * capped (ACE2K_FEED_LEDGER_GAP_MAX_MS) so the product cannot overflow. */
+TEST(a_late_tick_accrues_the_base_rate_for_the_time_that_passed)
+{
+    struct world w;
+    world_init(&w);
+    ff_paused_at_rest(&w);
+    step(&w, 0, 0);
+    ff_arm(&w, 142);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 1000, false), 0); /* 1 mm/s: 1 µm a millisecond */
+    step(&w, 0, 0);
+    ASSERT_EQ(w.feed.l[0].debt_um, 10);
+    w.now += 40; /* a tick 40 ms late: the next call sees 50 ms */
+    step(&w, 0, 0);
+    ASSERT_EQ(w.feed.l[0].debt_um, 60);
+    w.now += 10U * ACE2K_FEED_LEDGER_GAP_MAX_MS; /* far on: capped */
+    step(&w, 0, 0);
+    ASSERT_EQ(w.feed.l[0].debt_um, 60 + (int32_t)ACE2K_FEED_LEDGER_GAP_MAX_MS);
+    /* a rate of 0 accrues nothing, and the time spent at it is not booked later */
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 0, false), 0);
+    steps(&w, 10, 0, 0);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 1000, false), 0);
+    step(&w, 0, 0);
+    ASSERT_EQ(w.feed.l[0].debt_um, 70 + (int32_t)ACE2K_FEED_LEDGER_GAP_MAX_MS);
+}
+
 TEST(a_debt_of_one_chunk_starts_a_dose_at_the_pulse_speed_even_at_rest)
 {
     struct world w;
@@ -3685,6 +4093,233 @@ TEST(a_rate_of_0_keeps_the_debt_and_a_dose_still_pays_it)
     ace2k_feed_stop(&w.feed, 0, w.now);
 }
 
+static void assert_back_dose_running(struct world *w, uint32_t chunk_um, uint32_t speed_um_s)
+{
+    ASSERT_TRUE(w->run[0] && w->reverse[0]);
+    ASSERT_EQ(w->feed.l[0].sub, ACE2K_FEED_SUB_MOVING);
+    ASSERT_TRUE(w->feed.l[0].dose);
+    ASSERT_EQ(w->lane.lane[0].move.target_counts, ace2k_lane_um_to_counts(&w->lane, 0, chunk_um));
+    ASSERT_EQ(w->lane.lane[0].move.speed_um_s, speed_um_s);
+}
+
+/* A negative base: strand owed back to the spool, metered in reverse doses as a positive one is
+ * metered forward — a long retraction taken back with the extruder. */
+TEST(a_negative_base_accrues_a_negative_debt_and_one_chunk_starts_a_reverse_dose)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ff_arm(&w, 170);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, -300, false), 0);
+    steps(&w, 999, 0, 0);
+    ASSERT_EQ(w.feed.l[0].debt_um, -2997);
+    ASSERT_TRUE(!w.run[0]);
+    /* the 1000th tick owes 3 mm back: a reverse dose at the pulse speed (0.3 mm/s is under it) */
+    step(&w, 0, 0);
+    assert_back_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, ACE2K_FEED_FF_PULSE_UM_S);
+    ASSERT_EQ(ace2k_feed_ff_counts(&w.feed, 0).back_doses, 1);
+    ASSERT_EQ(ace2k_feed_ff_counts(&w.feed, 0).doses, 0);
+    ASSERT_EQ(ace2k_feed_bursts(&w.feed, 0), 0);
+    int32_t enc0 = ace2k_lane_encoder_um(&w.lane, 0);
+    /* rest does not end it: the strand follows its two counts back */
+    step(&w, 4, 0);
+    step(&w, 4, -1);
+    assert_back_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, ACE2K_FEED_FF_PULSE_UM_S);
+    int32_t owed = w.feed.l[0].debt_um;
+    ASSERT_EQ(owed, -3006);
+    step(&w, 4, -1);
+    /* the chunk reached: the debt rises by the strand's travel back, then this tick's −3 µm */
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_TRUE(!w.feed.l[0].dose);
+    int32_t travel = ace2k_lane_encoder_um(&w.lane, 0) - enc0;
+    ASSERT_EQ(travel, -2 * 12342 / 10);
+    ASSERT_EQ(w.feed.l[0].debt_um, owed - travel - 3);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FOLLOWING);
+    ASSERT_TRUE(!pop(&w, &e));
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+/* The speed of the first reverse dose a constant base starts, from a fresh arm. */
+static uint32_t back_dose_speed_at(int32_t rate_um_s)
+{
+    struct world w;
+    world_init(&w);
+    ff_arm(&w, 171);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, rate_um_s, false), 0);
+    (void)until_running(&w, 2000);
+    ASSERT_TRUE(w.run[0] && w.reverse[0] && w.feed.l[0].dose);
+    return w.lane.lane[0].move.speed_um_s;
+}
+
+/* At 15 mm/s a reverse dose could not keep up with a 55 mm/s retraction: it runs at the
+ * retraction's own speed, never under the pulse nor over the lane's top. */
+TEST(a_reverse_dose_runs_at_the_rates_speed_clamped_to_the_pulse_and_the_top)
+{
+    ASSERT_EQ(back_dose_speed_at(-300), ACE2K_FEED_FF_PULSE_UM_S);
+    ASSERT_EQ(back_dose_speed_at(-55000), 55000);
+    ASSERT_EQ(back_dose_speed_at(-(int32_t)ACE2K_LANE_SPEED_MAX_UM_S), ACE2K_LANE_SPEED_MAX_UM_S);
+}
+
+/* A reverse dose keeps the duty of its commanded speed from its first write to its end: it is
+ * exempt from the lane's landing, which would run all of a 3 mm dose at the floor.  On the unit,
+ * a 35 mm retraction at 49.3 mm/s was taken back in doses of this kind. */
+TEST(a_reverse_dose_runs_whole_at_its_commanded_duty)
+{
+    struct world w;
+    world_init(&w);
+    ff_arm(&w, 175);
+    uint8_t ff = ace2k_lane_feed_forward_pct(49300);
+    ASSERT_EQ(ff, 56);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, -49300, false), 0);
+    (void)until_running(&w, 10);
+    assert_back_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, 49300);
+    ASSERT_EQ(w.duty[0], ff);
+    ASSERT_TRUE(!w.lane.lane[0].move.landing);
+    ASSERT_EQ(ace2k_lane_setpoint_um_s(&w.lane, 0), 49300);
+    /* the motor at 6 pulses a tick (≈ 49 mm/s), the strand a count every three ticks: the two
+     * counts on the 3rd and 6th ticks, before the first loop */
+    for (int i = 0; i < 5; i++) {
+        step(&w, 6, (i == 2) ? -1 : 0);
+        assert_back_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, 49300);
+        ASSERT_EQ(w.duty[0], ff);
+        ASSERT_TRUE(!w.lane.lane[0].move.landing);
+        ASSERT_EQ(ace2k_lane_setpoint_um_s(&w.lane, 0), 49300);
+    }
+    /* the second count ends it.  The retraction still runs, so a chunk is owed back again and the
+     * next dose starts on the same tick, at the same duty */
+    step(&w, 6, -1);
+    ASSERT_EQ(ace2k_feed_ff_counts(&w.feed, 0).back_doses, 2);
+    assert_back_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, 49300);
+    ASSERT_EQ(w.duty[0], ff);
+    ASSERT_TRUE(!w.lane.lane[0].move.landing);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+/* A forward dose is not exempt: no longer than the landing, it runs at the floor from its start,
+ * at the default pulse and at a faster one. */
+TEST(a_forward_dose_lands_from_its_start)
+{
+    struct world w;
+    world_init(&w);
+    ff_arm(&w, 176);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 300, false), 0);
+    (void)until_running(&w, 1000);
+    assert_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, ACE2K_FEED_FF_PULSE_UM_S);
+    ASSERT_TRUE(w.lane.lane[0].move.landing);
+    ASSERT_EQ(w.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
+    ASSERT_EQ(ace2k_lane_setpoint_um_s(&w.lane, 0), ACE2K_LANE_SPEED_MIN_UM_S);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+
+    world_init(&w);
+    const struct ace2k_feed_ff_cfg fast = {
+        .chunk_um = ACE2K_FEED_FF_CHUNK_UM,
+        .pulse_um_s = 30000,
+    };
+    ASSERT_EQ(ace2k_feed_ff_set(&w.feed, &fast), 0);
+    ff_arm(&w, 177);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 300, false), 0);
+    (void)until_running(&w, 1000);
+    assert_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, 30000);
+    ASSERT_TRUE(w.lane.lane[0].move.landing);
+    ASSERT_EQ(w.duty[0], ACE2K_LANE_DUTY_MIN_PCT); /* not the table's 35 % for 30 mm/s */
+    ASSERT_EQ(ace2k_lane_setpoint_um_s(&w.lane, 0), ACE2K_LANE_SPEED_MIN_UM_S);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+/* A short take-up of the follow is a plain reverse move, not a dose: it lands. */
+TEST(a_short_take_up_lands_from_its_start)
+{
+    struct world w;
+    world_init(&w);
+    const struct ace2k_feed_follow_cfg take = {
+        .flip_ms = w.feed.follow.flip_ms,
+        .take_um = 5000,
+        .tail_um = w.feed.follow.tail_um,
+    };
+    ASSERT_EQ(ace2k_feed_follow_set(&w.feed, &take), 0);
+    ff_arm(&w, 178);
+    follow_full(&w);
+    (void)until_running(&w, 10);
+    assert_take_up_running(&w, 5000);
+    ASSERT_TRUE(!w.feed.l[0].dose);
+    ASSERT_TRUE(w.lane.lane[0].move.landing);
+    ASSERT_EQ(w.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
+    ASSERT_EQ(ace2k_lane_setpoint_um_s(&w.lane, 0), ACE2K_LANE_SPEED_MIN_UM_S);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+TEST(taut_ends_a_reverse_dose_at_once_and_taut_or_full_zero_a_negative_debt)
+{
+    struct world w;
+    world_init(&w);
+    ff_arm(&w, 172);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, -55000, false), 0);
+    (void)until_running(&w, 10);
+    assert_back_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, 55000);
+    /* taut while pulling back: the lane would grind the strand against the head's gear */
+    follow_taut(&w);
+    step(&w, 4, -1);
+    ASSERT_TRUE(!w.run[0]); /* and no forward burst yet: the follow's rule 1 holds the flip */
+    ASSERT_TRUE(!w.feed.l[0].dose);
+    ASSERT_EQ(w.feed.l[0].debt_um, 0);
+    ASSERT_EQ(ace2k_feed_ff_counts(&w.feed, 0).back_doses, 1);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+
+    /* this lane's full: the follow's take-up corrects, the negative debt is dropped */
+    world_init(&w);
+    ff_arm(&w, 173);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, -300, false), 0);
+    steps(&w, 500, 0, 0);
+    ASSERT_EQ(w.feed.l[0].debt_um, -1500);
+    follow_full(&w);
+    step(&w, 0, 0);
+    ASSERT_EQ(w.feed.l[0].debt_um, 0);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+TEST(the_negative_debt_is_capped_and_the_base_bounds_hold_both_ways)
+{
+    struct world w;
+    world_init(&w);
+    ff_arm(&w, 174);
+    /* −70 mm/s: 700 µm a tick.  A reverse dose starts at −3000, but with the strand still it pays
+     * nothing until it ends, so the accrual meets the cap within 9 ticks */
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, -(int32_t)ACE2K_LANE_SPEED_MAX_UM_S, false), 0);
+    steps(&w, 20, 0, 0);
+    ASSERT_EQ(w.feed.l[0].debt_um, -(int32_t)(2U * ACE2K_FEED_FF_CHUNK_UM));
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, -(int32_t)ACE2K_LANE_SPEED_MAX_UM_S - 1, false),
+              -ACE2K_EINVAL);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, (int32_t)ACE2K_LANE_SPEED_MAX_UM_S + 1, false),
+              -ACE2K_EINVAL);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+/* In the tail the strand's end lies between the insert and the drive: pulling it back would
+ * take it out of the drive's reach, as the follow's take-up never does there. */
+TEST(no_reverse_dose_in_the_tail)
+{
+    struct world w;
+    world_init(&w);
+    ff_arm(&w, 175);
+    /* the tail as the follow enters it: the insert falls during a burst, which then ends at rest */
+    follow_taut(&w);
+    steps(&w, 5, 4, 1);
+    w.in.insert = 0x00;
+    step(&w, 4, 1);
+    ASSERT_TRUE(w.feed.l[0].tail);
+    follow_rest(&w);
+    step(&w, 4, 1);
+    ASSERT_TRUE(!w.run[0]);
+    struct ace2k_feed_event e;
+    while (pop(&w, &e)) {
+    } /* the tail notice */
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, -55000, false), 0);
+    steps(&w, 20, 0, 0);
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_EQ(ace2k_feed_ff_counts(&w.feed, 0).back_doses, 0);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
 /* A debt kept across a 0 is still cleared by every end of the follow, and by taut and this
  * lane's full — the follow's own move correcting the buffer. */
 TEST(a_debt_kept_at_rate_0_is_cleared_by_disarm_taut_and_full)
@@ -3700,24 +4335,24 @@ TEST(a_debt_kept_at_rate_0_is_cleared_by_disarm_taut_and_full)
     steps(&w, 150, 0, 0);
     ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 0, false), 0);
     ASSERT_EQ(w.feed.l[0].debt_um, 1851);
-    ASSERT_EQ(w.feed.l[0].debt_rem, 0);
+    ASSERT_EQ(w.feed.l[0].debt_rem_nm, 0);
     ace2k_feed_stop(&w.feed, 0, w.now);
     ASSERT_TRUE(pop(&w, &e));
     ASSERT_EQ(e.kind, ACE2K_FEED_STOPPED);
     ASSERT_EQ(w.feed.l[0].debt_um, 0);
-    ASSERT_EQ(w.feed.l[0].debt_rem, 0);
+    ASSERT_EQ(w.feed.l[0].debt_rem_nm, 0);
     /* the link lost */
     ff_arm(&w, 162);
     ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 1234, false), 0);
     steps(&w, 101, 0, 0);
     ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 0, false), 0);
     ASSERT_EQ(w.feed.l[0].debt_um, 1246);
-    ASSERT_EQ(w.feed.l[0].debt_rem, 340);
+    ASSERT_EQ(w.feed.l[0].debt_rem_nm, 340);
     w.in.link_ok = false;
     step(&w, 0, 0);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
     ASSERT_EQ(w.feed.l[0].debt_um, 0);
-    ASSERT_EQ(w.feed.l[0].debt_rem, 0);
+    ASSERT_EQ(w.feed.l[0].debt_rem_nm, 0);
     ASSERT_TRUE(pop(&w, &e));
     ASSERT_EQ(e.kind, ACE2K_FEED_STOPPED_LINK);
     w.in.link_ok = true;
@@ -3766,19 +4401,19 @@ TEST(the_clear_drops_the_debt_and_its_remainder_without_it_both_are_kept)
     ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 1234, false), 0);
     steps(&w, 101, 0, 0);
     ASSERT_EQ(w.feed.l[0].debt_um, 1246);
-    ASSERT_EQ(w.feed.l[0].debt_rem, 340);
+    ASSERT_EQ(w.feed.l[0].debt_rem_nm, 340);
     /* clear 0 at 0, and at a rate: both kept */
     ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 0, false), 0);
     ASSERT_EQ(w.feed.l[0].debt_um, 1246);
-    ASSERT_EQ(w.feed.l[0].debt_rem, 340);
+    ASSERT_EQ(w.feed.l[0].debt_rem_nm, 340);
     ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 1234, false), 0);
     ASSERT_EQ(w.feed.l[0].debt_um, 1246);
-    ASSERT_EQ(w.feed.l[0].debt_rem, 340);
+    ASSERT_EQ(w.feed.l[0].debt_rem_nm, 340);
     /* clear 1 at 0: the base 0, nothing owed, nothing accrues */
     ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 0, true), 0);
     ASSERT_EQ(w.feed.l[0].base_um_s, 0);
     ASSERT_EQ(w.feed.l[0].debt_um, 0);
-    ASSERT_EQ(w.feed.l[0].debt_rem, 0);
+    ASSERT_EQ(w.feed.l[0].debt_rem_nm, 0);
     steps(&w, 50, 0, 0);
     ASSERT_EQ(w.feed.l[0].debt_um, 0);
     /* clear 1 with a rate: the rate taken, accruing from nothing */
@@ -3984,8 +4619,8 @@ TEST(a_fix_is_counted_when_its_correction_starts)
     ASSERT_EQ(ace2k_feed_ff_counts(&w.feed, 0).taut_fixes, 1);
     steps(&w, 10, 4, 1);
     ASSERT_EQ(ace2k_feed_ff_counts(&w.feed, 0).taut_fixes, 1);
-    /* the mirror: this lane's full after the burst — held by the follow's rule 1 for the flip time, no fix
-     * until the take-up starts */
+    /* the mirror: this lane's full after the burst — held by the follow's rule 1 for the flip
+     * time, no fix until the take-up starts */
     follow_full(&w);
     step(&w, 4, 1);
     ASSERT_TRUE(!w.run[0]);
@@ -4266,7 +4901,7 @@ static void load_to_park(struct world *w, uint8_t seq)
     paced(w, 972, 4, 4, 1); /* 243 counts: the parking point */
 }
 
-TEST(a_load_with_no_search_configured_is_the_feed_briefs)
+TEST(a_load_with_no_search_configured_ends_loaded_at_the_parking_point)
 {
     struct world w;
     world_init(&w);
@@ -4282,7 +4917,7 @@ TEST(a_hold_pauses_the_pull_and_its_release_resumes_what_is_left)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_LOAD, 0, 0, 171, w.now),
               ACE2K_FEED_ACCEPTED);
     steps(&w, 50, 0, 0);
@@ -4314,7 +4949,7 @@ TEST(no_tag_by_the_parking_point_searches_and_a_read_returns_to_it)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     load_to_park(&w, 172);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
     ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
@@ -4342,15 +4977,14 @@ TEST(the_search_ends_on_the_lanes_own_full_returns_and_is_no_error)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     load_to_park(&w, 173);
     paced(&w, 80, 4, 4, 1);
     w.in.pulled_any = true; /* lane 1's plunger at its pulled end: the strand met something */
     w.in.rest = 0x0E;
-    /* the tip snag's watch: with the strand
-     * still, the lag's 5 mm of motor (64 pulses) past the base ends it — the obstacle, not
-     * stuck */
-    step(&w, 4, 0); /* the watch begins: the search keeps running */
+    /* the tip snag's free phase: with the strand still, the lag's 5 mm of motor (64 pulses)
+     * past the base ends it — the obstacle, not stuck */
+    step(&w, 4, 0); /* the free phase begins: the search keeps running */
     steps(&w, 15, 4, 0);
     ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
     ASSERT_TRUE(w.run[0] && !w.reverse[0]);
@@ -4373,7 +5007,7 @@ TEST(the_search_ends_on_its_length_and_returns)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     load_to_park(&w, 174);
     paced(&w, 972, 4, 4, 1); /* 243 counts more: 600 mm since the load began */
     ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_RETURN);
@@ -4386,7 +5020,7 @@ TEST(with_another_lane_busy_the_load_stops_at_the_parking_point)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     w.in.insert = 0x03;
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_LOAD, 0, 0, 175, w.now),
               ACE2K_FEED_ACCEPTED);
@@ -4405,7 +5039,7 @@ TEST(another_lanes_start_during_the_search_makes_it_yield_and_return)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     w.in.insert = 0x03;
     load_to_park(&w, 177);
     paced(&w, 40, 4, 4, 1);
@@ -4420,7 +5054,7 @@ TEST(a_stop_in_the_search_stops_there_and_does_not_return)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     load_to_park(&w, 179);
     paced(&w, 40, 4, 4, 1);
     ace2k_feed_stop(&w.feed, 0, w.now);
@@ -4438,7 +5072,7 @@ TEST(a_lost_tag_is_reacquired_once_backwards_at_the_floor_then_the_pull_resumes)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_LOAD, 0, 0, 180, w.now),
               ACE2K_FEED_ACCEPTED);
     steps(&w, 50, 0, 0);
@@ -4465,7 +5099,7 @@ TEST(a_return_that_grinds_is_stuck_not_the_unloads_tail)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     load_to_park(&w, 181);
     paced(&w, 200, 4, 4, 1);
     w.in.tag_hold = 0x01;
@@ -4479,26 +5113,50 @@ TEST(a_return_that_grinds_is_stuck_not_the_unloads_tail)
     ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_STUCK);
 }
 
+/* A load's pull (243 counts, 3888 pulses), its search (50 counts, 800 pulses) and 10 counts of
+ * its return (160 pulses), then the tach silent: the stall's event reports the whole load, 283
+ * counts and 4848 pulses, not the return's move alone. */
+TEST(a_stall_in_a_loads_return_reports_the_whole_load)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
+    load_to_park(&w, 184);
+    paced(&w, 200, 4, 4, 1);
+    w.in.tag_hold = 0x01;
+    step(&w, 0, 0);
+    w.in.tag_hold = 0;
+    w.in.tag_read = 0x01;
+    step(&w, 0, 0);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_RETURN);
+    paced(&w, 40, 4, 4, -1);
+    steps(&w, 99, 0, 0); /* the tach silent for 990 ms: not yet */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_MOTOR_STALLED);
+    one_event(&w, ACE2K_FEED_MOTOR_STALLED, ACE2K_FEED_LOADING, 3888 + 800 + 160, 243 + 50 - 10);
+}
+
 TEST(the_read_with_motion_searches_from_where_the_strand_is_and_comes_back)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     w.in.insert = 0x03;
     step(&w, 0, 0);
     ASSERT_EQ(ace2k_feed_start(&w.feed, 1, ACE2K_FEED_CMD_ASSIST, 0, 30000, 182, w.now),
               ACE2K_FEED_ACCEPTED);
-    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, w.now), ACE2K_FEED_REFUSED_OTHER_LANE);
+    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, 0, w.now), ACE2K_FEED_REFUSED_OTHER_LANE);
     ace2k_feed_stop(&w.feed, 1, w.now);
     w.in.insert = 0x02;
     step(&w, 0, 0);
-    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, w.now), ACE2K_FEED_REFUSED_NO_FILAMENT);
+    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, 0, w.now), ACE2K_FEED_REFUSED_NO_FILAMENT);
     w.in.insert = 0x01;
     step(&w, 0, 0);
-    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, w.now), ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, 0, w.now), ACE2K_FEED_ACCEPTED);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
     ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
-    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, w.now), ACE2K_FEED_REFUSED_BUSY);
+    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, 0, w.now), ACE2K_FEED_REFUSED_BUSY);
     paced(&w, 400, 4, 4, 1);
     w.in.tag_hold = 0x01;
     step(&w, 0, 0);
@@ -4520,7 +5178,7 @@ TEST(a_start_elsewhere_during_the_reacquire_returns_instead_of_searching_on)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     w.in.insert = 0x03;
     load_to_park(&w, 183);
     paced(&w, 600, 4, 4, 1); /* 150 counts past the parking point: more than a reacquire's 97 */
@@ -4553,6 +5211,168 @@ TEST(a_start_elsewhere_during_the_reacquire_returns_instead_of_searching_on)
     ASSERT_EQ(e.kind, ACE2K_FEED_LOADED);
 }
 
+/* The read with motion beside a follow (lane 1 following, lane 0 read).  Lane 1's plunger readings
+ * for these tests; lane 0 stays at rest. */
+static void other_rest(struct world *w)
+{
+    w->in.rest = 0x0F;
+    w->in.pushed = 0x00;
+    w->in.pulled_any = false;
+}
+
+static void other_taut(struct world *w)
+{
+    w->in.rest = 0x0D;
+    w->in.pushed = 0x02;
+    w->in.pulled_any = false;
+}
+
+static void other_full(struct world *w)
+{
+    w->in.rest = 0x0D;
+    w->in.pushed = 0x00;
+    w->in.pulled_any = true;
+}
+
+/* Lane 1 following at rest, then a read with motion on lane 0, 10 counts into its search. */
+static void read_beside_follow(struct world *w, uint8_t seq)
+{
+    ASSERT_EQ(ace2k_feed_search_set(&w->feed, 600000), 0);
+    w->in.insert = 0x03;
+    step(w, 0, 0);
+    ASSERT_EQ(ace2k_feed_start(&w->feed, 1, ACE2K_FEED_CMD_ASSIST_BOTH, 0, 50000, seq, w->now),
+              ACE2K_FEED_ACCEPTED);
+    step(w, 0, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w->feed, 1), ACE2K_FEED_FOLLOWING);
+    ASSERT_TRUE(!w->run[1]);
+    ASSERT_EQ(ace2k_feed_search_start(&w->feed, 0, 0, w->now), ACE2K_FEED_ACCEPTED);
+    paced(w, 40, 4, 4, 1);
+    ASSERT_EQ(w->feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
+    ASSERT_TRUE(w->run[0] && !w->run[1]);
+}
+
+/* The follow's move started on the tick it asked for, and the search, on the next tick at the
+ * latest, gave way: it goes back to where the read began, while the follow's move runs on. */
+static void assert_follow_ran_and_search_yields(struct world *w, bool reverse)
+{
+    ASSERT_TRUE(w->run[1]);
+    ASSERT_EQ(w->reverse[1], reverse);
+    if (w->feed.l[0].sub == ACE2K_FEED_SUB_SEARCH) {
+        step(w, 4, 0);
+    }
+    ASSERT_EQ(w->feed.l[0].sub, ACE2K_FEED_SUB_RETURN);
+    ASSERT_EQ(ace2k_feed_search_end(&w->feed, 0), ACE2K_FEED_SEARCH_YIELD);
+    ASSERT_TRUE(w->run[0] && w->reverse[0]);
+    ASSERT_TRUE(w->run[1]); /* never held */
+    for (int i = 0; i < 100 && ace2k_feed_mode(&w->feed, 0) != ACE2K_FEED_IDLE; i++) {
+        step(w, 4, ((i + 1) % 4 == 0) ? -1 : 0);
+    }
+    ASSERT_EQ(ace2k_feed_mode(&w->feed, 0), ACE2K_FEED_IDLE);
+    struct ace2k_feed_event e;
+    while (pop(w, &e) && e.lane != 0) {
+    }
+    ASSERT_EQ(e.lane, 0);
+    ASSERT_EQ(e.kind, ACE2K_FEED_LOADED);
+    ASSERT_EQ(e.filament_um, 0); /* back where the read began */
+    ace2k_feed_stop(&w->feed, ACE2K_LANE_ALL, w->now);
+}
+
+TEST(the_read_with_motion_is_taken_beside_a_follow_at_rest_and_refused_while_it_moves)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
+    w.in.insert = 0x03;
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 1, ACE2K_FEED_CMD_ASSIST_BOTH, 0, 50000, 186, w.now),
+              ACE2K_FEED_ACCEPTED);
+    other_taut(&w);
+    step(&w, 0, 0);
+    ASSERT_TRUE(w.run[1]); /* the follow's burst runs: another lane moving */
+    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, 0, w.now), ACE2K_FEED_REFUSED_OTHER_LANE);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    other_rest(&w);
+    step(&w, 0, 0);
+    ASSERT_TRUE(!w.run[1]);
+    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, 0, w.now), ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
+    ace2k_feed_stop(&w.feed, ACE2K_LANE_ALL, w.now);
+    /* any other mode is still busy, a forward assist waiting on its buffer included */
+    steps(&w, 2, 0, 0);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 1, ACE2K_FEED_CMD_ASSIST, 0, 30000, 187, w.now),
+              ACE2K_FEED_ACCEPTED);
+    step(&w, 0, 0);
+    ASSERT_TRUE(!w.run[1]);
+    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, 0, w.now), ACE2K_FEED_REFUSED_OTHER_LANE);
+    ace2k_feed_stop(&w.feed, ACE2K_LANE_ALL, w.now);
+}
+
+TEST(a_follows_burst_on_taut_during_the_read_makes_it_yield_and_runs_at_once)
+{
+    struct world w;
+    world_init(&w);
+    read_beside_follow(&w, 188);
+    other_taut(&w);
+    step(&w, 4, 1);
+    assert_follow_ran_and_search_yields(&w, false);
+}
+
+TEST(a_follows_take_up_on_full_during_the_read_makes_it_yield_and_runs_at_once)
+{
+    struct world w;
+    world_init(&w);
+    read_beside_follow(&w, 189);
+    other_full(&w);
+    step(&w, 4, 1);
+    assert_follow_ran_and_search_yields(&w, true);
+}
+
+TEST(a_follows_dose_during_the_read_makes_it_yield_and_runs_at_once)
+{
+    struct world w;
+    world_init(&w);
+    read_beside_follow(&w, 190);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 1, 50000, false), 0);
+    int n = 0;
+    while (!w.run[1] && n < 10) {
+        step(&w, 4, ((n + 1) % 4 == 0) ? 1 : 0);
+        n++;
+    }
+    ASSERT_TRUE(w.feed.l[1].dose);
+    assert_follow_ran_and_search_yields(&w, false);
+}
+
+TEST(a_follows_tail_burst_during_the_read_makes_it_yield_and_runs_at_once)
+{
+    struct world w;
+    world_init(&w);
+    read_beside_follow(&w, 191);
+    w.in.insert = 0x01; /* lane 1's insert falls: its tail, nothing moves yet */
+    step(&w, 4, 1);
+    ASSERT_TRUE(w.feed.l[1].tail);
+    ASSERT_TRUE(!w.run[1]);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
+    other_taut(&w);
+    step(&w, 4, 1);
+    assert_follow_ran_and_search_yields(&w, false);
+}
+
+TEST(the_loads_own_search_still_waits_for_every_other_lane_idle_a_follow_at_rest_included)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
+    w.in.insert = 0x03;
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 1, ACE2K_FEED_CMD_ASSIST_BOTH, 0, 50000, 192, w.now),
+              ACE2K_FEED_ACCEPTED);
+    load_to_park(&w, 193);
+    ASSERT_TRUE(!w.run[1]);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_EQ(ace2k_feed_search_end(&w.feed, 0), ACE2K_FEED_SEARCH_NONE);
+    ace2k_feed_stop(&w.feed, ACE2K_LANE_ALL, w.now);
+}
+
 /* The lane's encoder in counts from the world's, signed: where the strand is. */
 static int32_t enc_counts(const struct world *w)
 {
@@ -4563,7 +5383,7 @@ TEST(a_tag_lost_early_in_the_pull_reverses_no_further_than_the_loads_start)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_LOAD, 0, 0, 185, w.now),
               ACE2K_FEED_ACCEPTED);
     steps(&w, 50, 0, 0);
@@ -4597,7 +5417,7 @@ TEST(a_tag_lost_at_the_loads_very_start_reverses_nothing)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_LOAD, 0, 0, 186, w.now),
               ACE2K_FEED_ACCEPTED);
     steps(&w, 50, 0, 0);
@@ -4616,7 +5436,7 @@ TEST(a_search_that_yields_after_a_reacquire_ends_at_the_parking_point_not_below)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     w.in.insert = 0x03;
     load_to_park(&w, 187);
     int32_t park = enc_counts(&w);
@@ -4646,11 +5466,11 @@ TEST(a_read_with_motion_that_yields_after_a_reacquire_ends_where_it_started)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     w.in.insert = 0x03;
     step(&w, 0, 0);
     int32_t start = enc_counts(&w);
-    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, w.now), ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, 0, w.now), ACE2K_FEED_ACCEPTED);
     paced(&w, 80, 4, 4, 1); /* 20 counts out */
     w.in.tag_hold = 0x01;
     step(&w, 0, 0);
@@ -4680,7 +5500,7 @@ TEST(a_strand_short_of_its_return_point_goes_forward_to_it)
 {
     struct world w;
     world_init(&w);
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     load_to_park(&w, 190);
     int32_t park = enc_counts(&w);
     paced(&w, 40, 4, 4, 1); /* 10 counts past the parking point */
@@ -4773,7 +5593,8 @@ static void lane_taut(struct world *w)
 /* A 300 mm feed (or the load's pull, already running) whose tip catches at 37 mm: 30 counts and
  * 480 pulses healthy; the full on the next tick begins the watch (base 484 pulses, 30 counts);
  * the strand follows — 15 counts in 63 ticks — until 248 pulses (20.08 mm) past the base, the
- * tolerance: the touch starts in reverse on the 63rd tick. */
+ * tolerance: the touch starts in reverse on the 63rd tick.  In a load, which has a free tip, the
+ * same tick passes the free phase's first window instead: the notice, the move goes on. */
 static void catch_and_follow(struct world *w)
 {
     paced(w, 120, 4, 4, 1);
@@ -4788,6 +5609,617 @@ static void touch_and_rest(struct world *w)
     paced(w, 8, 4, 4, -1);
     lane_rest(w);
     paced(w, 8, 4, 4, -1);
+}
+
+TEST(free_tip_is_stored_for_a_feed_and_a_rollback_and_set_by_a_load_from_the_bay_alone)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_FEED, 100000, 30000, 240, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    ASSERT_TRUE(w.feed.l[0].free_tip);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    ASSERT_TRUE(!w.feed.l[0].free_tip); /* the mode's end clears it */
+    step(&w, 0, 0);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_ROLLBACK, 100000, 30000, 241, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    ASSERT_TRUE(w.feed.l[0].free_tip); /* a rollback stores it: every catch past free_um forgiven */
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 100000, 30000, 242, w.now),
+              ACE2K_FEED_ACCEPTED);
+    ASSERT_TRUE(!w.feed.l[0].free_tip); /* the plain start: held */
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    step(&w, 0, 0);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_UNLOAD, 100000, 30000, 244, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    ASSERT_TRUE(!w.feed.l[0].free_tip); /* an unload ignores it */
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_ASSIST, 0, 30000, 245, true, w.now),
+              ACE2K_FEED_ACCEPTED);
+    ASSERT_TRUE(!w.feed.l[0].free_tip); /* an assist ignores it */
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_LOAD, 0, 0, 246, false, w.now),
+              ACE2K_FEED_ACCEPTED);
+    ASSERT_TRUE(w.feed.l[0].free_tip); /* a load sets its own: the strand from the bay is free */
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    ASSERT_TRUE(!w.feed.l[0].free_tip);
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
+    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, 0, w.now), ACE2K_FEED_ACCEPTED);
+    ASSERT_TRUE(!w.feed.l[0].free_tip); /* the read with motion: its strand may be in an extruder */
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    step(&w, 0, 0);
+    w.feed.load.auto_load = true; /* the automatic load: a load from the bay too */
+    w.in.insert = 0x00;
+    step(&w, 0, 0);
+    w.in.insert = 0x01;
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
+    ASSERT_TRUE(w.feed.l[0].free_tip);
+}
+
+TEST(a_start_that_changes_free_tip_is_not_a_retry)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_FEED, 100000, 30000, 243, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    step(&w, 4, 0);
+    /* the same five fields: the transport's retry, answered accepted */
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_FEED, 100000, 30000, 243, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    /* free_tip changed: another start — the lane is busy with the first */
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_FEED, 100000, 30000, 243, false, w.now),
+        ACE2K_FEED_REFUSED_BUSY);
+    ASSERT_TRUE(w.feed.l[0].free_tip);
+}
+
+TEST(a_rollback_that_changes_free_tip_is_not_a_retry)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_ROLLBACK, 100000, 30000, 244, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    step(&w, 4, 0);
+    /* the same five fields: the transport's retry */
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_ROLLBACK, 100000, 30000, 244, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    /* a rollback reads the flag: with it false, another start — the lane is busy with the first */
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_ROLLBACK, 100000, 30000, 244, false, w.now),
+        ACE2K_FEED_REFUSED_BUSY);
+    ASSERT_TRUE(w.feed.l[0].free_tip);
+}
+
+TEST(an_unload_retry_is_recognised_whatever_the_free_tip_flag)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_UNLOAD, 100000, 30000, 247, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    step(&w, 4, 0);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_UNLOAD, 100000, 30000, 247, false, w.now),
+        ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_UNLOADING);
+}
+
+TEST(an_assist_retry_is_recognised_whatever_the_free_tip_flag)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_ASSIST, 0, 30000, 248, true, w.now),
+              ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ASSISTING);
+    step(&w, 4, 0);
+    ASSERT_EQ(ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_ASSIST, 0, 30000, 248, false, w.now),
+              ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ASSISTING);
+}
+
+TEST(an_assist_back_retry_is_recognised_whatever_the_free_tip_flag)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_ASSIST_BACK, 0, 30000, 250, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ASSISTING_BACK);
+    step(&w, 4, 0);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_ASSIST_BACK, 0, 30000, 250, false, w.now),
+        ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ASSISTING_BACK);
+}
+
+TEST(a_follow_retry_is_recognised_whatever_the_free_tip_flag)
+{
+    struct world w;
+    world_init(&w);
+    w.in.insert = 0x01;
+    step(&w, 0, 0);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_ASSIST_BOTH, 0, 50000, 246, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FOLLOWING);
+    step(&w, 4, 0);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_ASSIST_BOTH, 0, 50000, 246, false, w.now),
+        ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FOLLOWING);
+}
+
+TEST(a_load_retry_is_recognised_whatever_the_free_tip_flag)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_LOAD, 0, 0, 249, false, w.now),
+              ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
+    step(&w, 4, 0);
+    /* the load's command value is ignored: the flag flipped is still its retry */
+    ASSERT_EQ(ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_LOAD, 0, 0, 249, true, w.now),
+              ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
+    ASSERT_TRUE(w.feed.l[0].free_tip); /* the load's own tip, untouched */
+}
+
+/* --- the free tip: the full judged by the strand, in windows ------- */
+
+/* The free feed paced on until it is no longer feeding, at most `bound` four-tick strides. */
+static int feed_until_idle(struct world *w, int bound)
+{
+    int n = 0;
+    while (n < bound && ace2k_feed_mode(&w->feed, 0) == ACE2K_FEED_FEEDING) {
+        paced(w, 4, 4, 4, 1);
+        n++;
+    }
+    return n;
+}
+
+TEST(free_a_feed_through_resistance_runs_to_done_with_one_notice_after_a_window)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_FEED, 300000, 30000, 244, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    paced(&w, 120, 4, 4, 1);
+    lane_full(&w);
+    paced(&w, 60, 4, 4, 1); /* the base on the first of these ticks: 484 pulses; 236 past it */
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_FREE_TIP);
+    ASSERT_TRUE(w.run[0] && !w.reverse[0]);
+    ASSERT_TRUE(!pop(&w, &e)); /* no window passed yet */
+    paced(&w, 4, 4, 4, 1);     /* 248 past the base: 20.08 mm, the first window */
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_SNAG);
+    ASSERT_EQ(e.mode, ACE2K_FEED_FEEDING);
+    ASSERT_EQ(e.seq, 244);
+    ASSERT_EQ(e.motor_um, ace2k_lane_fg_to_um(484)); /* where the plunger first read full */
+    ASSERT_EQ(e.filament_um, 30 * 12342 / 10);
+    /* the plunger pressed to the end: a single base would have tripped past ≈ 100 mm of slip */
+    ASSERT_TRUE(feed_until_idle(&w, 400) < 400);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_DONE);
+    ASSERT_EQ(e.filament_um, 243 * 12342 / 10); /* the whole mode's strand */
+    ASSERT_TRUE(!pop(&w, &e));
+}
+
+TEST(free_a_feed_whose_strand_stops_while_full_is_blocked_within_the_lag_and_no_notice)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_FEED, 300000, 30000, 245, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    paced(&w, 120, 4, 4, 1);
+    lane_full(&w);
+    step(&w, 4, 0); /* the free phase begins: base 484 */
+    steps(&w, 15, 4, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING); /* 60 pulses: 4.86 mm */
+    step(&w, 4, 0);                                             /* 64: 5.18 mm behind */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_BLOCKED);
+    ASSERT_EQ(e.motor_um, ace2k_lane_fg_to_um(484 + 64));
+    ASSERT_EQ(e.filament_um, 30 * 12342 / 10);
+    ASSERT_TRUE(!pop(&w, &e)); /* no snag notice: the resistance never proved itself */
+}
+
+TEST(free_fulls_and_rests_in_one_feed_are_no_limit_and_one_notice)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_FEED, 300000, 30000, 246, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    paced(&w, 120, 4, 4, 1);
+    lane_full(&w);
+    paced(&w, 20, 4, 4, 1);
+    lane_rest(&w);
+    paced(&w, 4, 4, 4, 1); /* back at rest on its own: the notice, the phase over */
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_NONE);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_SNAG);
+    paced(&w, 40, 4, 4, 1);
+    lane_full(&w);
+    paced(&w, 20, 4, 4, 1); /* a second full: the free phase again, not blocked */
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_FREE_TIP);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING);
+    lane_rest(&w);
+    ASSERT_TRUE(feed_until_idle(&w, 400) < 400);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_DONE);
+    ASSERT_TRUE(!pop(&w, &e)); /* one notice for the mode */
+}
+
+TEST(free_a_feed_without_free_tip_keeps_the_watch)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_FEED, 300000, 30000, 247, false, w.now),
+        ACE2K_FEED_ACCEPTED);
+    paced(&w, 120, 4, 4, 1);
+    lane_full(&w);
+    step(&w, 4, 0);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_WATCH);
+}
+
+TEST(free_a_stop_and_a_link_loss_in_the_free_phase_end_the_mode_as_any)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_FEED, 300000, 30000, 248, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    paced(&w, 120, 4, 4, 1);
+    lane_full(&w);
+    paced(&w, 20, 4, 4, 1);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_NONE);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_STOPPED);
+    ASSERT_TRUE(!pop(&w, &e));
+    lane_rest(&w);
+    step(&w, 0, 0);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_FEED, 300000, 30000, 249, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    paced(&w, 120, 4, 4, 1);
+    lane_full(&w);
+    paced(&w, 20, 4, 4, 1);
+    w.in.link_ok = false;
+    step(&w, 4, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_STOPPED_LINK);
+    ASSERT_TRUE(!pop(&w, &e));
+}
+
+TEST(free_a_shutdown_in_the_free_phase_ends_the_mode_stopped_shutdown)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_FEED, 300000, 30000, 250, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    paced(&w, 120, 4, 4, 1);
+    lane_full(&w);
+    paced(&w, 20, 4, 4, 1); /* in the free phase, no window passed: no notice */
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_FREE_TIP);
+    ace2k_lane_abort_all(&w.lane, ACE2K_LANE_SHUTDOWN, w.now);
+    ace2k_feed_shutdown(&w.feed, w.now);
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_NONE);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
+    one_stopped_shutdown(&w, ACE2K_FEED_FEEDING, 250); /* and no snag notice */
+    nothing_moves_after_the_shutdown(&w, 10);          /* the plunger still full: nothing */
+}
+
+TEST(free_a_runout_in_the_free_phase_is_the_runout)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_FEED, 300000, 30000, 251, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    paced(&w, 120, 4, 4, 1);
+    lane_full(&w);
+    paced(&w, 20, 4, 4, 1); /* in the free phase, no window passed: no notice */
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_FREE_TIP);
+    w.in.insert = 0x00; /* the strand's end leaves the sensor */
+    step(&w, 4, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_NONE);
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_RUNOUT);
+    ASSERT_EQ(e.mode, ACE2K_FEED_FEEDING);
+    ASSERT_EQ(e.seq, 251);
+    ASSERT_EQ(e.motor_um, ace2k_lane_fg_to_um(480 + 80 + 4)); /* healthy, free phase, this tick */
+    ASSERT_EQ(e.filament_um, 35 * 12342 / 10);
+    ASSERT_TRUE(!pop(&w, &e)); /* no snag notice */
+}
+
+/* The comparator still judges every tick of the free phase.  With lag_um at its widest (20 mm,
+ * fwd_um 50 mm) the strand stops at the full: the standstill — 20 mm of motor since the strand
+ * last moved 1.5 mm, its base at the 28th count (448 pulses), 28 pulses before the full — ends
+ * the feed blocked seven ticks before the window's lag could (724 pulses). */
+TEST(free_the_standstill_in_the_free_phase_ends_a_feed_blocked_before_the_windows_lag)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    struct ace2k_feed_snag_cfg cfg = w.feed.snag;
+    cfg.fwd_um = ACE2K_FEED_SNAG_FWD_MAX_UM;
+    cfg.lag_um = ACE2K_FEED_SNAG_LAG_MAX_UM;
+    ASSERT_EQ(ace2k_feed_snag_set(&w.feed, &cfg), 0);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_FEED, 300000, 30000, 253, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    paced(&w, 118, 4, 4, 1); /* 29 counts, 472 pulses */
+    lane_full(&w);
+    step(&w, 4, 0); /* the free phase begins: base 476, the strand stopped */
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_FREE_TIP);
+    steps(&w, 54, 4, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING); /* 692: 244 past 448, 19.76 mm */
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_FREE_TIP);
+    step(&w, 4, 0); /* 696: 248 past 448, 20.08 mm; 220 past the window's base, 17.81 mm */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_NONE);
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_BLOCKED);
+    ASSERT_EQ(e.mode, ACE2K_FEED_FEEDING);
+    ASSERT_EQ(e.seq, 253);
+    ASSERT_EQ(e.motor_um, ace2k_lane_fg_to_um(696));
+    ASSERT_EQ(e.filament_um, 29 * 12342 / 10);
+    ASSERT_TRUE(!pop(&w, &e)); /* no window passed: no snag notice */
+}
+
+/* The windows move on: a free feed whose strand follows through the first window (the notice on
+ * its 63rd tick, a new base at 732 pulses and 45 counts) and stops one count later is blocked
+ * lag_um past that new base — 80 pulses (6.48 mm) against one count (1.23 mm) — not past the
+ * first, which it left 328 pulses behind. */
+TEST(free_a_strand_that_stops_in_a_later_window_is_blocked_lag_um_past_that_windows_base)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_FEED, 300000, 30000, 254, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    paced(&w, 120, 4, 4, 1);
+    lane_full(&w);
+    paced(&w, 64, 4, 4, 1); /* the first window on the 63rd tick; 736 pulses, 46 counts */
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_SNAG);
+    ASSERT_EQ(e.motor_um, ace2k_lane_fg_to_um(484)); /* the mode's first full */
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_FREE_TIP);
+    ASSERT_EQ(w.feed.l[0].fg_snag_pulses - w.feed.l[0].fg_start_pulses, 732U); /* the rebase */
+    steps(&w, 18, 4, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING); /* 76 past the base: 6.15 mm */
+    step(&w, 4, 0);                                             /* 80: 6.48 mm */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_BLOCKED);
+    ASSERT_EQ(e.seq, 254);
+    ASSERT_EQ(e.motor_um, ace2k_lane_fg_to_um(812));
+    ASSERT_EQ(e.filament_um, 46 * 12342 / 10);
+    ASSERT_TRUE(!pop(&w, &e)); /* the mode's one notice is out already */
+}
+
+/* The window and the lag are the tip snag's settable values: at fwd_um 10 mm and lag_um 2 mm
+ * the first window passes 124 pulses past the base (10.04 mm), and a strand that stops then is
+ * blocked 28 pulses (2.27 mm) past the new base — where the defaults would run on to 64. */
+TEST(free_the_window_and_the_lag_follow_ace2k_feed_snag_set)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    struct ace2k_feed_snag_cfg cfg = w.feed.snag;
+    cfg.fwd_um = 10000;
+    cfg.lag_um = 2000;
+    ASSERT_EQ(ace2k_feed_snag_set(&w.feed, &cfg), 0);
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_FEED, 300000, 30000, 255, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    paced(&w, 120, 4, 4, 1);
+    lane_full(&w);
+    paced(&w, 31, 4, 4, 1); /* base 484; 604 is 120 past it, 9.72 mm */
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_FREE_TIP);
+    ASSERT_TRUE(!pop(&w, &e));
+    step(&w, 4, 1); /* 608: 124 past it — the window: the notice, base 608 and 38 counts */
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_SNAG);
+    ASSERT_EQ(e.motor_um, ace2k_lane_fg_to_um(484));
+    ASSERT_EQ(e.filament_um, 30 * 12342 / 10);
+    ASSERT_EQ(w.feed.l[0].fg_snag_pulses - w.feed.l[0].fg_start_pulses, 608U);
+    steps(&w, 6, 4, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING); /* 24 past it: 1.94 mm */
+    step(&w, 4, 0);                                             /* 28: 2.27 mm */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_BLOCKED);
+    ASSERT_EQ(e.seq, 255);
+    ASSERT_EQ(e.motor_um, ace2k_lane_fg_to_um(636));
+    ASSERT_EQ(e.filament_um, 38 * 12342 / 10);
+    ASSERT_TRUE(!pop(&w, &e));
+}
+
+/* The least lag at the widest scale.  A count is then 1481 µm (14810, +20 %), and the strand
+ * follows the motor: 3 pulses a tick and a count every 6 ticks, so 18 pulses (1457 µm) of motor
+ * for each 1481 µm of strand.  The run ends on a count, and the full is read on the tick of the
+ * next count.  So the base is taken just as a count lands.  The strand then reads nothing for 5
+ * ticks while the motor runs 15 pulses (1214 µm).  A lag under one count trips there, though the
+ * strand never fell behind.  Returns with the full just read, on the tick of a count. */
+static void widest_scale_feed_to_full(struct world *w, bool free_tip, uint8_t seq)
+{
+    struct ace2k_feed_snag_cfg cfg = w->feed.snag;
+    cfg.lag_um = ACE2K_FEED_SNAG_LAG_MIN_UM;
+    ASSERT_EQ(ace2k_feed_snag_set(&w->feed, &cfg), 0);
+    ASSERT_EQ(ace2k_lane_scale_set(&w->lane, 0, ACE2K_LANE_SCALE_MAX_X10), 0);
+    ASSERT_EQ(ace2k_feed_start_tip(&w->feed, 0, ACE2K_FEED_CMD_FEED, 300000, 30000, seq, free_tip,
+                                   w->now),
+              ACE2K_FEED_ACCEPTED);
+    paced(w, 114, 3, 6, 1); /* 19 counts, the last on the 114th tick */
+    steps(w, 5, 3, 0);
+    lane_full(w);
+    step(w, 3, 1); /* the 20th count and the full on the same tick: the base */
+}
+
+TEST(free_a_strand_that_follows_at_the_widest_scale_passes_the_least_lag)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    widest_scale_feed_to_full(&w, true, 81);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_FREE_TIP);
+    /* three windows of 20 mm, each with a new base at its own phase of the count */
+    paced(&w, 250, 3, 6, 1);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_FREE_TIP);
+    ASSERT_TRUE(w.run[0] && !w.reverse[0]);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_SNAG); /* a window passed with the strand following */
+    ASSERT_TRUE(!pop(&w, &e));          /* no blocked */
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+TEST(snag_a_strand_that_follows_at_the_widest_scale_reaches_the_touch_at_the_least_lag)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    widest_scale_feed_to_full(&w, false, 82);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_WATCH);
+    int n = 0;
+    while (n < 100 && !w.reverse[0] && ace2k_feed_mode(&w.feed, 0) == ACE2K_FEED_FEEDING) {
+        step(&w, 3, ((n + 1) % 6 == 0) ? 1 : 0);
+        n++;
+    }
+    /* the watch ran its 20 mm of motor (83 ticks, 249 pulses) with no lag: the touch */
+    ASSERT_EQ(n, 83);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_BACK);
+    ASSERT_TRUE(w.run[0] && w.reverse[0]);
+    ASSERT_TRUE(!pop(&w, &e));
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+/* A new speed reaches only the command's own moves.  The moves the mode makes for itself keep
+ * the speed they were started at: a load's reacquire (backwards at the floor speed), a snag's
+ * touch, and the follow's dose (the follow refuses a speed outright).  The speed is still kept
+ * for the mode's next command move, and the answer is accepted: the mode took it.  Up to v0.12.0
+ * a speed re-sped whichever move was running. */
+TEST(a_new_speed_reaches_a_command_move_at_once)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_ROLLBACK, 100000, 30000, 76, w.now),
+              ACE2K_FEED_ACCEPTED);
+    step(&w, 3, -1);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 45000, w.now), ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(w.lane.lane[0].move.speed_um_s, 45000);
+    ASSERT_EQ(w.feed.l[0].speed_um_s, 45000);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+TEST(a_new_speed_leaves_a_loads_reacquire_at_its_own_speed)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
+    w.in.insert = 0x03;
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_search_start(&w.feed, 0, 0, w.now), ACE2K_FEED_ACCEPTED);
+    paced(&w, 80, 4, 4, 1); /* 20 counts out */
+    w.in.tag_hold = 0x01;
+    step(&w, 0, 0);
+    w.in.tag_hold = 0;
+    w.in.tag_lost = 0x01;
+    step(&w, 0, 0);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_REACQUIRE);
+    uint32_t own_um_s = w.lane.lane[0].move.speed_um_s;
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 60000, w.now), ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(w.lane.lane[0].move.speed_um_s, own_um_s);
+    ASSERT_EQ(w.feed.l[0].speed_um_s, 60000); /* kept for the load's next move */
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+TEST(a_new_speed_leaves_a_snags_touch_at_its_own_speed)
+{
+    struct world w;
+    world_init(&w);
+    widest_scale_feed_to_full(&w, false, 83);
+    int n = 0;
+    while (n < 100 && !w.reverse[0] && ace2k_feed_mode(&w.feed, 0) == ACE2K_FEED_FEEDING) {
+        step(&w, 3, ((n + 1) % 6 == 0) ? 1 : 0);
+        n++;
+    }
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_BACK);
+    uint32_t own_um_s = w.lane.lane[0].move.speed_um_s;
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 60000, w.now), ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(w.lane.lane[0].move.speed_um_s, own_um_s);
+    ASSERT_EQ(w.feed.l[0].speed_um_s, 60000); /* kept for the feed's resumed move */
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+TEST(a_new_speed_leaves_a_follows_dose_at_its_own_speed)
+{
+    struct world w;
+    world_init(&w);
+    ff_arm(&w, 84);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 300, false), 0);
+    steps(&w, 1000, 0, 0);
+    assert_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, ACE2K_FEED_FF_PULSE_UM_S);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 60000, w.now), ACE2K_FEED_REFUSED_FOLLOWING);
+    ASSERT_EQ(w.lane.lane[0].move.speed_um_s, ACE2K_FEED_FF_PULSE_UM_S);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+/* The least lag is more than one count at the widest scale, so the tests above can pass. */
+TEST(snag_the_least_lag_is_more_than_one_count_at_the_widest_scale)
+{
+    struct world w;
+    world_init(&w);
+    /* An independent check of the headers' arithmetic, on purpose as a literal: the widest count
+     * is 12342 × 1.2 / 10 = 1481 µm, the count the pacing of widest_scale_feed_to_full is worked
+     * out for.  If the lane's tolerance changes, this fails and that pacing must be redone. */
+    ASSERT_EQ(ACE2K_FEED_COUNT_MAX_UM, 1481U);
+    struct ace2k_feed_snag_cfg cfg = w.feed.snag;
+    cfg.lag_um = 1499U; /* under the standstill's 1500 µm: refused */
+    ASSERT_EQ(ace2k_feed_snag_set(&w.feed, &cfg), -ACE2K_EINVAL);
+    cfg.lag_um = 1500U;
+    ASSERT_EQ(ace2k_feed_snag_set(&w.feed, &cfg), 0);
 }
 
 TEST(snag_a_feed_whose_tip_drags_the_buffer_full_goes_on_after_a_touch)
@@ -4822,6 +6254,32 @@ TEST(snag_a_feed_whose_tip_drags_the_buffer_full_goes_on_after_a_touch)
     ASSERT_EQ(e.kind, ACE2K_FEED_DONE);
     ASSERT_EQ(e.filament_um, 243 * 12342 / 10); /* the whole mode's strand */
     ASSERT_EQ(e.motor_um, ace2k_lane_fg_to_um(484 + 248 + 64 + 3232));
+}
+
+/* The same feed resumed after the touch (41 counts net, 796 pulses), 10 more counts with 160
+ * pulses, then the tach silent: the stall's event reports the whole feed, not the resumed move. */
+TEST(snag_a_stall_after_the_resume_reports_the_whole_feed)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 300000, 30000, 212, w.now),
+              ACE2K_FEED_ACCEPTED);
+    paced(&w, 120, 4, 4, 1);
+    lane_full(&w);
+    paced(&w, 62, 4, 4, 1);
+    step(&w, 4, 0);
+    ASSERT_TRUE(w.run[0] && w.reverse[0]); /* the touch */
+    touch_and_rest(&w);
+    ASSERT_TRUE(w.run[0] && !w.reverse[0]); /* resumed */
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_SNAG);
+    paced(&w, 40, 4, 4, 1);
+    steps(&w, 99, 0, 0); /* the tach silent for 990 ms: not yet */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING);
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_MOTOR_STALLED);
+    one_event(&w, ACE2K_FEED_MOTOR_STALLED, ACE2K_FEED_FEEDING, 484 + 248 + 64 + 160, 41 + 10);
 }
 
 TEST(snag_a_strand_that_stops_while_the_buffer_reads_full_is_blocked_within_the_lag)
@@ -4916,7 +6374,7 @@ TEST(snag_a_plunger_back_at_rest_on_its_own_is_a_notice_and_no_touch)
     ASSERT_EQ(e.kind, ACE2K_FEED_STOPPED);
 }
 
-TEST(snag_a_loads_pull_goes_on_after_a_touch_and_ends_loaded)
+TEST(free_a_loads_pull_through_resistance_goes_on_and_ends_loaded)
 {
     struct world w;
     world_init(&w);
@@ -4925,18 +6383,22 @@ TEST(snag_a_loads_pull_goes_on_after_a_touch_and_ends_loaded)
               ACE2K_FEED_ACCEPTED);
     steps(&w, 50, 0, 0); /* the settle; the pull starts on the 50th tick */
     ASSERT_TRUE(w.run[0] && !w.reverse[0]);
-    catch_and_follow(&w);
-    ASSERT_TRUE(w.run[0] && w.reverse[0]);
-    touch_and_rest(&w);
-    ASSERT_TRUE(w.run[0] && !w.reverse[0]);
+    catch_and_follow(&w); /* full for 63 ticks, the strand following: one window passed */
+    ASSERT_TRUE(w.run[0] && !w.reverse[0]); /* no touch: the pull goes on */
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_FREE_TIP);
     ASSERT_TRUE(pop(&w, &e));
     ASSERT_EQ(e.kind, ACE2K_FEED_SNAG);
     ASSERT_EQ(e.mode, ACE2K_FEED_LOADING);
-    paced(&w, 808, 4, 4, 1);
-    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    int n = 0;
+    while (n < 400 && ace2k_feed_mode(&w.feed, 0) == ACE2K_FEED_LOADING) {
+        paced(&w, 4, 4, 4, 1);
+        n++;
+    }
+    ASSERT_TRUE(n < 400);
     ASSERT_TRUE(pop(&w, &e));
     ASSERT_EQ(e.kind, ACE2K_FEED_LOADED);
     ASSERT_EQ(e.filament_um, 243 * 12342 / 10);
+    ASSERT_TRUE(!pop(&w, &e));
 }
 
 /* The load's tag search: the search
@@ -4962,21 +6424,16 @@ static int return_until_idle(struct world *w, int bound)
     return n;
 }
 
-TEST(snag_the_search_takes_the_tolerance_resumes_and_ends_on_its_length)
+TEST(free_the_search_through_resistance_goes_on_and_ends_on_its_length)
 {
     struct world w;
     world_init(&w);
     struct ace2k_feed_event e;
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     load_to_park(&w, 231);
     ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
-    catch_and_follow(&w); /* the tip catches 37 mm into the search: the watch, then the touch */
-    ASSERT_TRUE(w.run[0] && w.reverse[0]);
-    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
-    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
-    ASSERT_TRUE(!pop(&w, &e));
-    touch_and_rest(&w);
-    ASSERT_TRUE(w.run[0] && !w.reverse[0]); /* the search goes on */
+    catch_and_follow(&w);
+    ASSERT_TRUE(w.run[0] && !w.reverse[0]); /* the search goes on, no touch */
     ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
     ASSERT_TRUE(pop(&w, &e));
     ASSERT_EQ(e.kind, ACE2K_FEED_SNAG);
@@ -4985,10 +6442,10 @@ TEST(snag_the_search_takes_the_tolerance_resumes_and_ends_on_its_length)
     ASSERT_EQ(e.motor_um, ace2k_lane_fg_to_um(3888 + 484)); /* the pull's, then the search's */
     ASSERT_EQ(e.filament_um, (243 + 30) * 12342 / 10);
     ASSERT_TRUE(!pop(&w, &e));
-    /* 284 counts net of the 486 the search reaches: ≈ 202 more */
     ASSERT_TRUE(search_until_return(&w, 1000) < 1000);
     ASSERT_EQ(ace2k_feed_search_end(&w.feed, 0), ACE2K_FEED_SEARCH_LENGTH);
     ASSERT_TRUE(w.run[0] && w.reverse[0]);
+    lane_rest(&w);
     ASSERT_TRUE(return_until_idle(&w, 1200) < 1200);
     ASSERT_TRUE(pop(&w, &e));
     ASSERT_EQ(e.kind, ACE2K_FEED_LOADED);
@@ -4996,20 +6453,19 @@ TEST(snag_the_search_takes_the_tolerance_resumes_and_ends_on_its_length)
     ASSERT_TRUE(!pop(&w, &e));
 }
 
-TEST(snag_a_plunger_not_back_after_the_touch_in_the_search_is_the_obstacle_return)
+TEST(free_a_strand_that_stops_in_the_searchs_free_phase_is_the_obstacle_return)
 {
     struct world w;
     world_init(&w);
     struct ace2k_feed_event e;
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     load_to_park(&w, 232);
-    catch_and_follow(&w);
-    paced(&w, 16, 4, 4, -1); /* the touch ends; the plunger still at its pulled end */
-    ASSERT_TRUE(!w.run[0]);
-    steps(&w, 49, 0, 0);
-    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
+    paced(&w, 120, 4, 4, 1);
+    lane_full(&w);
+    step(&w, 4, 0); /* the free phase begins */
+    steps(&w, 15, 4, 0);
     ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
-    step(&w, 0, 0); /* 500 ms: in a feed, stuck; in the search, the obstacle */
+    step(&w, 4, 0); /* 5.18 mm behind: in a feed, blocked; in the search, the obstacle */
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
     ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_RETURN);
     ASSERT_TRUE(w.run[0] && w.reverse[0]);
@@ -5021,69 +6477,83 @@ TEST(snag_a_plunger_not_back_after_the_touch_in_the_search_is_the_obstacle_retur
     ASSERT_TRUE(!pop(&w, &e));
 }
 
-TEST(snag_a_tolerance_spent_in_the_pull_makes_a_full_in_the_search_the_obstacle_at_once)
+TEST(free_resistance_in_the_pull_and_again_in_the_search_both_go_on_with_one_notice)
 {
     struct world w;
     world_init(&w);
     struct ace2k_feed_event e;
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_LOAD, 0, 0, 233, w.now),
               ACE2K_FEED_ACCEPTED);
     steps(&w, 50, 0, 0);
     catch_and_follow(&w);
-    touch_and_rest(&w);
-    paced(&w, 808, 4, 4, 1); /* the pull reaches the parking point: the search starts */
-    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
+    lane_rest(&w);
+    int n = 0;
+    while (n < 400 && w.feed.l[0].sub != ACE2K_FEED_SUB_SEARCH) {
+        paced(&w, 4, 4, 4, 1);
+        n++;
+    }
+    ASSERT_TRUE(n < 400); /* the pull reached the parking point: the search */
     ASSERT_TRUE(pop(&w, &e));
     ASSERT_EQ(e.kind, ACE2K_FEED_SNAG);
     paced(&w, 40, 4, 4, 1);
     lane_full(&w);
-    step(&w, 4, 0); /* the load's one tolerance is spent: the obstacle at once */
-    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
-    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_RETURN);
-    ASSERT_EQ(ace2k_feed_search_end(&w.feed, 0), ACE2K_FEED_SEARCH_OBSTACLE);
+    paced(&w, 40, 4, 4, 1); /* a full in the search: the free phase, not the obstacle */
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_FREE_TIP);
+    ASSERT_TRUE(w.run[0] && !w.reverse[0]);
+    ASSERT_TRUE(!pop(&w, &e)); /* the mode's one notice is out already */
+    /* the search runs on to its reach, full all the way: window after window, no second notice */
+    ASSERT_TRUE(search_until_return(&w, 1000) < 1000);
+    ASSERT_EQ(ace2k_feed_search_end(&w.feed, 0), ACE2K_FEED_SEARCH_LENGTH);
     lane_rest(&w);
-    ASSERT_TRUE(return_until_idle(&w, 400) < 400);
+    ASSERT_TRUE(return_until_idle(&w, 1200) < 1200);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
     ASSERT_TRUE(pop(&w, &e));
     ASSERT_EQ(e.kind, ACE2K_FEED_LOADED);
+    ASSERT_EQ(e.seq, 233);
     ASSERT_TRUE(!pop(&w, &e));
 }
 
-TEST(snag_a_tag_read_during_the_searchs_tolerance_returns_found_after_the_rest)
+TEST(free_a_read_session_in_the_searchs_free_phase_pauses_and_its_read_returns_found)
 {
     struct world w;
     world_init(&w);
     struct ace2k_feed_event e;
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     load_to_park(&w, 234);
     paced(&w, 120, 4, 4, 1);
     lane_full(&w);
-    paced(&w, 20, 4, 4, 1); /* the watch */
-    w.in.tag_read = 0x01;   /* the reader's session completes meanwhile */
-    paced(&w, 43, 4, 4, 1); /* the 63rd tick of the watch: the touch */
-    ASSERT_TRUE(w.run[0] && w.reverse[0]);
-    touch_and_rest(&w);
-    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_RETURN); /* back, not forward */
+    paced(&w, 20, 4, 4, 1); /* the free phase: it judges, it does not hold the load's tick */
+    w.in.tag_hold = 0x01;   /* a read session begins */
+    step(&w, 0, 0);
+    step(&w, 0, 0);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_PAUSED);
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_NONE); /* the push stopped: the phase with it */
+    w.in.tag_hold = 0x00;
+    w.in.tag_read = 0x01;
+    lane_rest(&w);
+    step(&w, 0, 0);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_RETURN);
     ASSERT_TRUE(w.run[0] && w.reverse[0]);
     ASSERT_EQ(ace2k_feed_search_end(&w.feed, 0), ACE2K_FEED_SEARCH_FOUND);
-    ASSERT_TRUE(pop(&w, &e));
-    ASSERT_EQ(e.kind, ACE2K_FEED_SNAG);
     ASSERT_TRUE(return_until_idle(&w, 400) < 400);
     ASSERT_TRUE(pop(&w, &e));
-    ASSERT_EQ(e.kind, ACE2K_FEED_LOADED);
+    ASSERT_EQ(e.kind, ACE2K_FEED_LOADED); /* no window passed, no rest in the phase: no notice */
     ASSERT_TRUE(!pop(&w, &e));
 }
 
-TEST(snag_a_tag_read_in_the_searchs_watch_then_a_lag_returns_found_not_obstacle)
+TEST(snag_a_tag_read_in_the_searchs_free_phase_then_a_lag_returns_found_not_obstacle)
 {
     struct world w;
     world_init(&w);
     struct ace2k_feed_event e;
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     load_to_park(&w, 237);
     paced(&w, 120, 4, 4, 1);
     lane_full(&w);
-    step(&w, 4, 0);       /* the watch begins */
+    step(&w, 4, 0);       /* the free phase begins */
     w.in.tag_read = 0x01; /* the reader's session completes meanwhile */
     steps(&w, 15, 4, 0);  /* the strand still */
     ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
@@ -5098,16 +6568,16 @@ TEST(snag_a_tag_read_in_the_searchs_watch_then_a_lag_returns_found_not_obstacle)
     ASSERT_TRUE(!pop(&w, &e));
 }
 
-TEST(snag_a_tag_read_in_the_searchs_watch_then_rest_on_its_own_returns_found)
+TEST(snag_a_tag_read_in_the_searchs_free_phase_then_rest_on_its_own_returns_found)
 {
     struct world w;
     world_init(&w);
     struct ace2k_feed_event e;
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     load_to_park(&w, 238);
     paced(&w, 120, 4, 4, 1);
     lane_full(&w);
-    paced(&w, 20, 4, 4, 1); /* the watch */
+    paced(&w, 20, 4, 4, 1); /* the free phase */
     w.in.tag_read = 0x01;   /* the reader's session completes meanwhile */
     paced(&w, 4, 4, 4, 1);
     lane_rest(&w);
@@ -5123,18 +6593,18 @@ TEST(snag_a_tag_read_in_the_searchs_watch_then_rest_on_its_own_returns_found)
     ASSERT_TRUE(!pop(&w, &e));
 }
 
-TEST(snag_a_stall_in_the_searchs_watch_is_the_obstacle_return_not_an_error)
+TEST(snag_a_stall_in_the_searchs_free_phase_is_the_obstacle_return_not_an_error)
 {
     struct world w;
     world_init(&w);
     struct ace2k_feed_event e;
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     load_to_park(&w, 239);
     paced(&w, 120, 4, 4, 1);
     lane_full(&w);
-    step(&w, 4, 0); /* the watch begins */
+    step(&w, 4, 0); /* the free phase begins */
     /* the strand held and the tach silent: no motor travel, so the lag cannot trip; the lane
-     * core's stall, ACE2K_LANE_STALL_MS later, ends the watch */
+     * core's stall, ACE2K_LANE_STALL_MS later, ends the free phase */
     int n = 0;
     while (n < 150 && w.feed.l[0].sub == ACE2K_FEED_SUB_SEARCH) {
         step(&w, 0, 0);
@@ -5152,12 +6622,51 @@ TEST(snag_a_stall_in_the_searchs_watch_is_the_obstacle_return_not_an_error)
     ASSERT_TRUE(!pop(&w, &e));
 }
 
+/* The search's move past its deadline in the free phase: a reach of 400 mm leaves the search
+ * 100 mm past the parking point, at 30 mm/s a deadline of (3000 + 1111) × 3 / 2 + 1000 ms from
+ * its start.  The motor creeps (1 pulse a tick) with the strand a little ahead (a count every 12
+ * ticks): the lag never trips, the tach is never silent, the comparator has nothing to say — only
+ * the deadline ends the move, in the search the obstacle return, never a timeout error. */
+TEST(free_a_deadline_in_the_searchs_free_phase_is_the_obstacle_return_not_an_error)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 400000), 0);
+    load_to_park(&w, 252);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
+    lane_full(&w);
+    int n = 0;
+    while (n < 2000 && w.feed.l[0].sub == ACE2K_FEED_SUB_SEARCH) {
+        step(&w, 1, ((n + 1) % 12 == 0) ? 1 : 0);
+        n++;
+        if (n == 1) {
+            ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_FREE_TIP);
+        }
+    }
+    ASSERT_EQ(n, 718); /* ≈ 7.17 s after the search's start */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_RETURN);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_NONE);
+    ASSERT_TRUE(w.run[0] && w.reverse[0]);
+    ASSERT_EQ(ace2k_feed_search_end(&w.feed, 0), ACE2K_FEED_SEARCH_OBSTACLE);
+    ASSERT_TRUE(pop(&w, &e)); /* the first window passed with the strand following */
+    ASSERT_EQ(e.kind, ACE2K_FEED_SNAG);
+    lane_rest(&w);
+    ASSERT_TRUE(return_until_idle(&w, 1000) < 1000);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_LOADED); /* no error */
+    ASSERT_EQ(e.seq, 252);
+    ASSERT_TRUE(!pop(&w, &e));
+}
+
 TEST(a_standstill_in_a_loads_pull_is_blocked_and_the_strand_stays_where_it_stopped)
 {
     struct world w;
     world_init(&w);
     struct ace2k_feed_event e;
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_LOAD, 0, 0, 176, w.now),
               ACE2K_FEED_ACCEPTED);
     steps(&w, 50, 0, 0);     /* the settle, then the pull */
@@ -5189,7 +6698,7 @@ TEST(a_standstill_in_the_search_is_the_obstacle_return_and_ends_loaded)
     struct world w;
     world_init(&w);
     struct ace2k_feed_event e;
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     load_to_park(&w, 177);
     ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
     paced(&w, 80, 4, 4, 1); /* 20 counts past the parking point */
@@ -5213,18 +6722,18 @@ TEST(a_standstill_in_the_search_is_the_obstacle_return_and_ends_loaded)
     ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
 }
 
-TEST(snag_another_lanes_start_during_the_searchs_watch_yields_at_once)
+TEST(free_another_lanes_start_during_the_searchs_free_phase_yields_at_once)
 {
     struct world w;
     world_init(&w);
     struct ace2k_feed_event e;
-    ace2k_feed_search_set(&w.feed, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
     w.in.insert = 0x03;
     load_to_park(&w, 235);
     paced(&w, 120, 4, 4, 1);
     lane_full(&w);
-    paced(&w, 20, 4, 4, 1); /* the watch */
-    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_WATCH);
+    paced(&w, 20, 4, 4, 1); /* the free phase */
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_FREE_TIP);
     ASSERT_EQ(ace2k_feed_start(&w.feed, 1, ACE2K_FEED_CMD_ASSIST, 0, 30000, 236, w.now),
               ACE2K_FEED_ACCEPTED);
     step(&w, 4, 0); /* the yield on this tick: no forward travel after it */
@@ -5238,6 +6747,203 @@ TEST(snag_another_lanes_start_during_the_searchs_watch_yields_at_once)
     ASSERT_EQ(e.kind, ACE2K_FEED_LOADED); /* no snag notice, no error */
     ASSERT_EQ(e.seq, 235);
     ASSERT_TRUE(!pop(&w, &e));
+}
+
+/* --- the read with motion keeps the watch -------------------------- */
+
+/* A read with motion on lane 1 from where the strand is: its tag search at once, with no free
+ * tip — the strand may sit in an extruder. */
+static void read_with_motion(struct world *w)
+{
+    ASSERT_EQ(ace2k_feed_search_set(&w->feed, 600000), 0);
+    ASSERT_EQ(ace2k_feed_search_start(&w->feed, 0, 0, w->now), ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(w->feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
+    ASSERT_TRUE(!w->feed.l[0].free_tip);
+}
+
+TEST(snag_the_read_with_motion_takes_the_watch_and_searches_on_after_the_touch_and_rest)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    read_with_motion(&w);
+    catch_and_follow(&w); /* the tip catches 37 mm in: the watch, then the touch */
+    ASSERT_TRUE(w.run[0] && w.reverse[0]);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_BACK);
+    ASSERT_TRUE(!pop(&w, &e)); /* the notice waits for the rest */
+    touch_and_rest(&w);
+    ASSERT_TRUE(w.run[0] && !w.reverse[0]); /* the search goes on */
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_NONE);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_SNAG);
+    ASSERT_EQ(e.mode, ACE2K_FEED_LOADING);
+    ASSERT_EQ(e.seq, 0); /* the unit's own motion */
+    ASSERT_EQ(e.motor_um, ace2k_lane_fg_to_um(484));
+    ASSERT_EQ(e.filament_um, 30 * 12342 / 10);
+    ASSERT_TRUE(!pop(&w, &e));
+    /* a second full in the same read: its one tolerance spent, the obstacle at once */
+    paced(&w, 40, 4, 4, 1);
+    lane_full(&w);
+    step(&w, 4, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_RETURN);
+    ASSERT_TRUE(w.run[0] && w.reverse[0]);
+    ASSERT_EQ(ace2k_feed_search_end(&w.feed, 0), ACE2K_FEED_SEARCH_OBSTACLE);
+    lane_rest(&w);
+    ASSERT_TRUE(return_until_idle(&w, 400) < 400);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_LOADED);
+    ASSERT_EQ(e.seq, 0);
+    ASSERT_TRUE(!pop(&w, &e));
+}
+
+TEST(snag_the_read_with_motion_whose_plunger_is_not_back_after_the_touch_is_the_obstacle)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    read_with_motion(&w);
+    catch_and_follow(&w);
+    paced(&w, 16, 4, 4, -1); /* the touch ends; the plunger still at its pulled end */
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_REST);
+    steps(&w, 49, 0, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
+    step(&w, 0, 0); /* 500 ms: in a feed, blocked; in the read's search, the obstacle */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_RETURN);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_NONE);
+    ASSERT_TRUE(w.run[0] && w.reverse[0]);
+    ASSERT_EQ(ace2k_feed_search_end(&w.feed, 0), ACE2K_FEED_SEARCH_OBSTACLE);
+    lane_rest(&w);
+    ASSERT_TRUE(return_until_idle(&w, 400) < 400);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_LOADED); /* no error, no snag notice */
+    ASSERT_TRUE(!pop(&w, &e));
+}
+
+TEST(snag_a_stall_in_the_read_with_motions_watch_is_the_obstacle_return_not_an_error)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    read_with_motion(&w);
+    paced(&w, 120, 4, 4, 1);
+    lane_full(&w);
+    step(&w, 4, 0); /* the watch begins */
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_WATCH);
+    /* the strand held and the tach silent: no motor travel, so the lag cannot trip; the lane
+     * core's stall, ACE2K_LANE_STALL_MS later, ends the watch */
+    int n = 0;
+    while (n < 150 && w.feed.l[0].sub == ACE2K_FEED_SUB_SEARCH) {
+        step(&w, 0, 0);
+        n++;
+    }
+    ASSERT_TRUE(n >= (int)(ACE2K_LANE_STALL_MS / 10) - 1 && n < 150);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_LOADING);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_RETURN);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_NONE);
+    ASSERT_TRUE(w.run[0] && w.reverse[0]);
+    ASSERT_EQ(ace2k_feed_search_end(&w.feed, 0), ACE2K_FEED_SEARCH_OBSTACLE);
+    lane_rest(&w);
+    ASSERT_TRUE(return_until_idle(&w, 400) < 400);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_LOADED); /* no error, no snag notice */
+    ASSERT_TRUE(!pop(&w, &e));
+}
+
+TEST(snag_another_lanes_start_during_the_read_with_motions_watch_yields_at_once)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    w.in.insert = 0x03;
+    step(&w, 0, 0);
+    read_with_motion(&w);
+    paced(&w, 120, 4, 4, 1);
+    lane_full(&w);
+    paced(&w, 20, 4, 4, 1); /* the watch: it holds the load's tick */
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_WATCH);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 1, ACE2K_FEED_CMD_ASSIST, 0, 30000, 228, w.now),
+              ACE2K_FEED_ACCEPTED);
+    uint32_t forward_before = w.forward_starts[0];
+    step(&w, 4, 0); /* the yield on this tick: no forward travel after it */
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_NONE);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_RETURN);
+    ASSERT_TRUE(w.run[0] && w.reverse[0]);
+    ASSERT_EQ(ace2k_feed_search_end(&w.feed, 0), ACE2K_FEED_SEARCH_YIELD);
+    lane_rest(&w);
+    ASSERT_TRUE(return_until_idle(&w, 400) < 400);
+    ASSERT_EQ(w.forward_starts[0], forward_before);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.lane, 0);
+    ASSERT_EQ(e.kind, ACE2K_FEED_LOADED); /* no snag notice, no error */
+    ASSERT_EQ(e.seq, 0);
+    ASSERT_TRUE(!pop(&w, &e));
+}
+
+TEST(snag_a_tag_read_in_the_read_with_motions_watch_then_rest_on_its_own_returns_found)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    read_with_motion(&w);
+    paced(&w, 120, 4, 4, 1);
+    lane_full(&w);
+    paced(&w, 20, 4, 4, 1); /* the watch */
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_WATCH);
+    w.in.tag_read = 0x01; /* the reader's session completes meanwhile */
+    paced(&w, 4, 4, 4, 1);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH); /* the watch holds the load's tick */
+    ASSERT_TRUE(w.run[0] && !w.reverse[0]);
+    lane_rest(&w);
+    step(&w, 4, 0); /* rest on its own: the notice, and the search is over — back, found */
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_RETURN);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_NONE);
+    ASSERT_TRUE(w.run[0] && w.reverse[0]);
+    ASSERT_EQ(ace2k_feed_search_end(&w.feed, 0), ACE2K_FEED_SEARCH_FOUND);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_SNAG);
+    ASSERT_TRUE(return_until_idle(&w, 400) < 400);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_LOADED);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
+    ASSERT_TRUE(!pop(&w, &e));
+}
+
+/* The one discriminating case: the same full on the same counts — the tip catching 37 mm into
+ * the search, the strand following — runs on under the free rule in a load from the bay's
+ * search, and ends in the watch's touch in the read with motion. */
+TEST(snag_the_same_full_runs_on_in_a_bay_loads_search_and_touches_in_the_read_with_motion)
+{
+    struct world w;
+    struct ace2k_feed_event e;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
+    load_to_park(&w, 229);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
+    ASSERT_TRUE(w.feed.l[0].free_tip);
+    catch_and_follow(&w);
+    ASSERT_TRUE(w.run[0] && !w.reverse[0]); /* the free rule: no touch, the search runs on */
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_FREE_TIP);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_SNAG); /* a window passed with the strand following */
+
+    world_init(&w);
+    read_with_motion(&w);
+    catch_and_follow(&w);
+    ASSERT_TRUE(w.run[0] && w.reverse[0]); /* the watch spent its fwd_um: the touch */
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SEARCH);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_BACK);
+    ASSERT_TRUE(!pop(&w, &e)); /* the notice waits for the rest */
 }
 
 TEST(snag_a_link_loss_in_the_touch_and_a_stop_in_the_wait_end_the_mode_as_any)
@@ -5384,6 +7090,9 @@ TEST(snag_an_unload_whose_tip_catches_is_forgiven_and_ends_unloaded)
 {
     struct world w;
     world_init(&w);
+    /* the fall ends the unload at once: the clear past it has its own tests
+     * (test_feed_unload.c) */
+    ASSERT_EQ(ace2k_feed_unload_set(&w.feed, 0), 0);
     struct ace2k_feed_event e;
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_UNLOAD, 0, 30000, 223, w.now),
               ACE2K_FEED_ACCEPTED);
@@ -5427,6 +7136,106 @@ TEST(snag_a_second_taut_trip_in_the_same_rollback_is_stuck)
     ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_STUCK);
     ASSERT_TRUE(pop(&w, &e));
     ASSERT_EQ(e.kind, ACE2K_FEED_STUCK);
+}
+
+/* A rollback with a free tip, 300 mm, whose tip catches 45 counts back (55.5 mm): the trip, the
+ * touch forward (4 counts), the plunger at rest half way, and the rollback resumed. */
+static void free_rollback_first_catch(struct world *w, uint8_t seq)
+{
+    ASSERT_EQ(ace2k_feed_start_tip(&w->feed, 0, ACE2K_FEED_CMD_ROLLBACK, 300000, 30000, seq, true,
+                                   w->now),
+              ACE2K_FEED_ACCEPTED);
+    paced(w, 180, 4, 4, -1);
+    lane_taut(w);
+    ASSERT_TRUE(until_forward_or_error(w, 100) < 100);
+    ASSERT_TRUE(w->run[0] && !w->reverse[0]); /* the touch, forward */
+    paced(w, 8, 4, 4, 1);
+    lane_rest(w);
+    paced(w, 8, 4, 4, 1);
+    ASSERT_TRUE(w->run[0] && w->reverse[0]); /* resumed */
+}
+
+TEST(snag_a_free_rollback_forgives_every_catch_past_free_um_with_one_notice)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    free_rollback_first_catch(&w, 232);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_SNAG);
+    /* the second catch: 45 counts back from the touch's end, 41 (50.6 mm) past the first catch */
+    paced(&w, 180, 4, 4, -1);
+    lane_taut(&w);
+    ASSERT_TRUE(until_forward_or_error(&w, 100) < 100);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ROLLING_BACK);
+    ASSERT_TRUE(w.run[0] && !w.reverse[0]); /* forgiven again: the touch */
+    paced(&w, 8, 4, 4, 1);
+    lane_rest(&w);
+    paced(&w, 8, 4, 4, 1);
+    ASSERT_TRUE(w.run[0] && w.reverse[0]);
+    ASSERT_TRUE(!pop(&w, &e)); /* the notice went out once */
+    /* the rest of the 300 mm on the encoder (243 counts): done, the mode's odometers */
+    paced(&w, 4 * 243, 4, 4, -1);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_DONE);
+}
+
+TEST(snag_a_free_rollback_catch_short_of_free_um_past_the_last_is_stuck)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    free_rollback_first_catch(&w, 233);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_SNAG);
+    /* 44 counts back from the touch's end: 40 (49.4 mm) past the first catch, under free_um */
+    paced(&w, 176, 4, 4, -1);
+    lane_taut(&w);
+    (void)until_forward_or_error(&w, 100);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_STUCK);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_STUCK);
+}
+
+TEST(snag_a_free_rollback_held_from_its_start_is_stuck_at_once)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    /* a tip the head holds: the strand comes back only the buffer's travel, then stands taut */
+    ASSERT_EQ(
+        ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_ROLLBACK, 300000, 30000, 234, true, w.now),
+        ACE2K_FEED_ACCEPTED);
+    paced(&w, 40, 4, 4, -1);
+    lane_taut(&w);
+    (void)until_forward_or_error(&w, 100);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_STUCK);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_STUCK);
+    ASSERT_TRUE(!pop(&w, &e));
+}
+
+TEST(snag_an_unload_with_free_tip_keeps_its_one_tolerance)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ASSERT_EQ(ace2k_feed_start_tip(&w.feed, 0, ACE2K_FEED_CMD_UNLOAD, 0, 30000, 235, true, w.now),
+              ACE2K_FEED_ACCEPTED);
+    paced(&w, 180, 4, 4, -1);
+    lane_taut(&w);
+    ASSERT_TRUE(until_forward_or_error(&w, 100) < 100);
+    paced(&w, 8, 4, 4, 1);
+    lane_rest(&w);
+    paced(&w, 8, 4, 4, 1);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_SNAG);
+    /* a second catch far past the first: an unload's flag is ignored, the tolerance spent */
+    paced(&w, 180, 4, 4, -1);
+    lane_taut(&w);
+    (void)until_forward_or_error(&w, 100);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_STUCK);
 }
 
 /* A rollback whose strand comes back `counts` counts, the last on the final paced tick, then
@@ -5508,9 +7317,14 @@ TEST(snag_the_lane_setpoint_is_the_speed_then_the_floor_in_the_landing)
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 20000, 30000, 231, w.now),
               ACE2K_FEED_ACCEPTED);
     ASSERT_EQ(ace2k_lane_setpoint_um_s(&w.lane, 0), 30000);
-    paced(&w, 32, 4, 4, 1); /* 8 of 16 counts: 9.87 mm left, the landing begins on tick 32 */
-    ASSERT_EQ(ace2k_lane_setpoint_um_s(&w.lane, 0), 30000); /* the duty still the cruise's */
-    paced(&w, 8, 4, 4, 1); /* 10 counts: the loop of tick 40 is the first in the landing */
+    paced(&w, 31, 4, 4, 1); /* 7 of 16 counts: 11.1 mm left */
+    ASSERT_EQ(ace2k_lane_setpoint_um_s(&w.lane, 0), 30000);
+    /* the 8th count on tick 32: 9.87 mm left, the landing begins and its duty is written on this
+     * tick, eight ticks before the loop of tick 40 */
+    paced(&w, 1, 4, 1, 1);
+    ASSERT_EQ(ace2k_lane_setpoint_um_s(&w.lane, 0), ACE2K_LANE_SPEED_MIN_UM_S);
+    ASSERT_EQ(ace2k_lane_duty_pct(&w.lane, 0), ACE2K_LANE_DUTY_MIN_PCT);
+    paced(&w, 8, 4, 4, 1); /* 10 counts: the loop of tick 40 keeps the floor setpoint */
     ASSERT_EQ(ace2k_lane_setpoint_um_s(&w.lane, 0), ACE2K_LANE_SPEED_MIN_UM_S);
     ace2k_feed_stop(&w.feed, 0, w.now);
     ASSERT_EQ(ace2k_lane_setpoint_um_s(&w.lane, 0), 0);
@@ -5628,7 +7442,7 @@ TEST(snag_a_lowered_tolerance_touches_sooner)
     world_init(&w);
     struct ace2k_feed_snag_cfg cfg = w.feed.snag;
     cfg.fwd_um = ACE2K_FEED_SNAG_FWD_MIN_UM;
-    cfg.lag_um = ACE2K_FEED_SNAG_LAG_MIN_UM * 4U;
+    cfg.lag_um = 4000U; /* under the forward travel, and far from the strand's lag here */
     ASSERT_EQ(ace2k_feed_snag_set(&w.feed, &cfg), 0);
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 300000, 30000, 234, w.now),
               ACE2K_FEED_ACCEPTED);
@@ -5645,8 +7459,8 @@ TEST(snag_a_lowered_tolerance_touches_sooner)
 
 /* The guard compares the duty with the setpoint it was computed for: a healthy feed that crosses
  * into its landing during the watch is not stuck.  20 mm is 16 counts; the full after 5, the
- * landing on the 8th count (tick 32, 9.87 mm left) — two ticks before the loop of tick 40 lowers
- * the duty to the floor's. */
+ * landing on the 8th count (tick 32, 9.87 mm left), where the duty and its setpoint drop to the
+ * floor's together, eight ticks before the loop of tick 40. */
 TEST(snag_the_duty_guard_holds_across_the_landing)
 {
     struct world w;
@@ -5802,6 +7616,103 @@ TEST(the_tail_takes_up_nothing)
     ace2k_feed_stop(&w.feed, 0, w.now);
 }
 
+/* A speed set on a following lane is refused as following and changes nothing: the follow runs
+ * at the speed it was armed with.  It is refused while the follow waits, during a burst, during
+ * a feed-forward dose and in the tail.  The bounds are still judged first. */
+TEST(a_speed_set_on_a_following_lane_is_refused_and_changes_nothing)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    const uint32_t follow_um_s = 50000U;
+    ASSERT_EQ(ACE2K_FEED_REFUSED_FOLLOWING, 8);
+    ff_arm(&w, 211);
+    /* waiting at rest, no move running */
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 30000, w.now), ACE2K_FEED_REFUSED_FOLLOWING);
+    ASSERT_EQ(w.feed.l[0].speed_um_s, follow_um_s);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 1000, w.now), ACE2K_FEED_REFUSED_BOUNDS);
+    /* the next burst runs at the armed speed */
+    follow_taut(&w);
+    step(&w, 0, 0);
+    assert_burst_running(&w);
+    ASSERT_EQ(w.lane.lane[0].move.speed_um_s, follow_um_s);
+    /* during the burst: refused, and the running burst keeps its speed */
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 30000, w.now), ACE2K_FEED_REFUSED_FOLLOWING);
+    ASSERT_EQ(w.lane.lane[0].move.speed_um_s, follow_um_s);
+    ASSERT_EQ(w.feed.l[0].speed_um_s, follow_um_s);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FOLLOWING);
+    steps(&w, 5, 4, 1);
+    follow_rest(&w);
+    step(&w, 4, 1);
+    ASSERT_TRUE(!w.run[0]);
+    /* during a take-up on this lane's full: refused, and the take-up keeps its speed */
+    follow_full(&w);
+    step(&w, 0, 0);
+    assert_take_up_running(&w, ACE2K_FEED_FOLLOW_TAKE_UM);
+    ASSERT_EQ(w.lane.lane[0].move.speed_um_s, follow_um_s);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 30000, w.now), ACE2K_FEED_REFUSED_FOLLOWING);
+    ASSERT_EQ(w.lane.lane[0].move.speed_um_s, follow_um_s);
+    ASSERT_EQ(w.feed.l[0].speed_um_s, follow_um_s);
+    steps(&w, 5, 1, -1);
+    follow_rest(&w);
+    step(&w, 1, -1);
+    ASSERT_TRUE(!w.run[0]);
+    /* during a feed-forward dose: refused, and the dose keeps its pulse speed */
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 50000, false), 0);
+    ASSERT_TRUE(until_running(&w, 10) <= 7);
+    assert_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, ACE2K_FEED_FF_PULSE_UM_S);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 30000, w.now), ACE2K_FEED_REFUSED_FOLLOWING);
+    assert_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, ACE2K_FEED_FF_PULSE_UM_S);
+    ASSERT_EQ(w.feed.l[0].speed_um_s, follow_um_s);
+    ASSERT_TRUE(!pop(&w, &e));
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_STOPPED);
+    ASSERT_TRUE(!pop(&w, &e));
+    /* in the tail the lane is still following: refused the same */
+    tail_reset(&w);
+    tail_enter(&w, 212);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 30000, w.now), ACE2K_FEED_REFUSED_FOLLOWING);
+    ASSERT_EQ(w.feed.l[0].speed_um_s, follow_um_s);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_TRUE(!pop(&w, &e));
+    /* once the follow is stopped the lane is idle: no move, as before */
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 30000, w.now), ACE2K_FEED_REFUSED_NO_MOVE);
+}
+
+/* The modes that take a new speed: a feed, a rollback, an unload, a load and the one-way
+ * assists.  Only the follow refuses one. */
+TEST(every_mode_but_the_follow_takes_a_new_speed)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    const uint8_t cmds[] = {
+        ACE2K_FEED_CMD_FEED,   ACE2K_FEED_CMD_ROLLBACK,    ACE2K_FEED_CMD_UNLOAD,
+        ACE2K_FEED_CMD_ASSIST, ACE2K_FEED_CMD_ASSIST_BACK, ACE2K_FEED_CMD_LOAD,
+    };
+    uint8_t seq = 221;
+    for (size_t i = 0; i < ACE2K_ARRAY_SIZE(cmds); i++) {
+        ASSERT_EQ(ace2k_feed_start(&w.feed, 0, cmds[i], 100000, 30000, seq, w.now),
+                  ACE2K_FEED_ACCEPTED);
+        ASSERT_TRUE(ace2k_feed_mode(&w.feed, 0) != ACE2K_FEED_FOLLOWING);
+        ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 40000, w.now), ACE2K_FEED_ACCEPTED);
+        ASSERT_EQ(w.feed.l[0].speed_um_s, 40000);
+        ace2k_feed_stop(&w.feed, 0, w.now);
+        ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+        while (pop(&w, &e)) {
+        }
+        step(&w, 0, 0);
+        seq++;
+    }
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_ASSIST_BOTH, 0, 30000, seq, w.now),
+              ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_set_speed(&w.feed, 0, 40000, w.now), ACE2K_FEED_REFUSED_FOLLOWING);
+    ASSERT_EQ(w.feed.l[0].speed_um_s, 30000);
+}
+
 TEST(the_standstill_in_the_tail_is_tail_out_not_an_error)
 {
     struct world w;
@@ -5846,6 +7757,201 @@ TEST(the_standstill_in_the_tail_is_tail_out_not_an_error)
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ERROR);
     ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_TANGLED);
     ASSERT_TRUE(ace2k_feed_clear(&w.feed, 0));
+}
+
+/* The deadline in the tail.  Lane 0 in its tail (seq), the head pulling: a burst whose strand
+ * follows for `counts` counts, which then ends at rest.  At 1234.2 µm a count, 16 counts are
+ * 19.75 mm (short of ACE2K_FEED_TAIL_ENC_UM), 17 are 20.98 mm (past it). */
+static void tail_travel(struct world *w, uint8_t seq, int counts)
+{
+    tail_enter(w, seq);
+    follow_taut(w);
+    step(w, 0, 0);
+    assert_burst_running(w);
+    steps(w, counts, 4, 1);
+    assert_burst_running(w);
+    follow_rest(w);
+    step(w, 4, 0);
+    ASSERT_TRUE(!w->run[0]);
+    ASSERT_EQ(ace2k_feed_mode(&w->feed, 0), ACE2K_FEED_FOLLOWING);
+    ASSERT_EQ(ace2k_lane_encoder_count(&w->lane, 0) - w->feed.l[0].tail_enc_start_counts, counts);
+}
+
+/* The motor crawling, the strand still, until the follow ends (at most `bound` ticks): the ticks
+ * taken.  A tach pulse every three ticks keeps the lane's stall away, and the standstill's 20 mm
+ * stays beyond a move's deadline. */
+static int crawl_out_of_follow(struct world *w, int bound)
+{
+    int n = 0;
+    while (ace2k_feed_mode(&w->feed, 0) == ACE2K_FEED_FOLLOWING && n < bound) {
+        step(w, ((n + 1) % 3 == 0) ? 1U : 0U, 0);
+        n++;
+    }
+    return n;
+}
+
+/* A dose metered at once (the base at 50 mm/s), then the strand still to its deadline: the ticks
+ * the deadline took. */
+static int dose_to_deadline(struct world *w)
+{
+    ASSERT_EQ(ace2k_feed_base_set(&w->feed, 0, 50000, false), 0);
+    ASSERT_TRUE(until_running(w, 10) < 10);
+    assert_dose_running(w, ACE2K_FEED_FF_CHUNK_UM, ACE2K_FEED_FF_PULSE_UM_S);
+    return crawl_out_of_follow(w, 400);
+}
+
+static void assert_tail_out(struct world *w, uint8_t seq)
+{
+    struct ace2k_feed_event e;
+    ASSERT_EQ(ace2k_feed_mode(&w->feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_EQ(ace2k_feed_error(&w->feed, 0), 0);
+    ASSERT_TRUE(!w->run[0]);
+    ASSERT_TRUE(!w->feed.l[0].tail);
+    uint8_t last = 0xFF;
+    while (pop(w, &e)) {
+        ASSERT_TRUE(e.kind == ACE2K_FEED_BEHIND || e.kind == ACE2K_FEED_TAIL_OUT);
+        last = e.kind;
+        if (e.kind == ACE2K_FEED_TAIL_OUT) {
+            ASSERT_EQ(e.mode, ACE2K_FEED_FOLLOWING);
+            ASSERT_EQ(e.seq, seq);
+        }
+    }
+    ASSERT_EQ(last, ACE2K_FEED_TAIL_OUT);
+}
+
+static void assert_timeout(struct world *w, uint8_t seq)
+{
+    struct ace2k_feed_event e;
+    ASSERT_EQ(ace2k_feed_mode(&w->feed, 0), ACE2K_FEED_ERROR);
+    ASSERT_EQ(ace2k_feed_error(&w->feed, 0), ACE2K_FEED_TIMEOUT);
+    ASSERT_TRUE(!w->run[0]);
+    uint8_t last = 0xFF;
+    while (pop(w, &e)) {
+        last = e.kind;
+        if (e.kind == ACE2K_FEED_TIMEOUT) {
+            ASSERT_EQ(e.seq, seq);
+        }
+    }
+    ASSERT_EQ(last, ACE2K_FEED_TIMEOUT);
+    ASSERT_TRUE(ace2k_feed_clear(&w->feed, 0));
+}
+
+/* A forward dose in the tail past ACE2K_FEED_TAIL_ENC_UM: the end leaves the encoder, the dose
+ * never counts its 3 mm and the lane's deadline passes, the motor crawling too slowly for the
+ * standstill.  That is the end leaving the drive, tail_out, never the timeout (observed on the
+ * unit, 2026-11-01).  One count short of the distance it is still the timeout. */
+TEST(a_dose_deadline_in_the_tail_is_tail_out_from_20_mm_and_a_timeout_under_it)
+{
+    struct world w;
+    world_init(&w);
+    tail_travel(&w, 211, 17); /* 20.98 mm */
+    int n = dose_to_deadline(&w);
+    ASSERT_TRUE(n > 100 && n < 400); /* the deadline, not the first ticks */
+    assert_tail_out(&w, 211);
+    tail_reset(&w);
+    tail_travel(&w, 212, 16); /* 19.75 mm */
+    n = dose_to_deadline(&w);
+    ASSERT_TRUE(n > 100 && n < 400);
+    assert_timeout(&w, 212);
+}
+
+/* The guard at the tail's start, the end still upstream of the encoder: a strand that does not
+ * count there is a slip or a lost encoder, the timeout.  And before the tail, as always. */
+TEST(a_dose_deadline_at_the_start_of_the_tail_or_before_it_is_a_timeout)
+{
+    struct world w;
+    world_init(&w);
+    tail_enter(&w, 213);
+    int n = dose_to_deadline(&w);
+    ASSERT_TRUE(n > 100 && n < 400);
+    assert_timeout(&w, 213);
+    tail_reset(&w);
+    ff_arm(&w, 214);
+    n = dose_to_deadline(&w);
+    ASSERT_TRUE(n > 100 && n < 400);
+    assert_timeout(&w, 214);
+}
+
+/* A forward burst in the tail, the plunger taut all along.
+ * - Past 20 mm, a burst whose strand stood still through it: tail_out, whatever the buffer reads.
+ * - Past 20 mm, the strand still counting during the burst (26 counts) before it stopped: not the
+ *   end leaving, the timeout.
+ * - Short of 20 mm, the strand still from the burst's start: the timeout. */
+TEST(a_burst_deadline_in_the_tail_is_tail_out_only_past_20_mm_with_the_strand_still_through_it)
+{
+    struct world w;
+    world_init(&w);
+    tail_travel(&w, 215, 26);
+    follow_taut(&w);
+    step(&w, 0, 0);
+    assert_burst_running(&w);
+    int n = crawl_out_of_follow(&w, 800);
+    ASSERT_TRUE(n > 300 && n < 800);
+    assert_tail_out(&w, 215);
+    tail_reset(&w);
+    tail_enter(&w, 216);
+    follow_taut(&w);
+    step(&w, 0, 0);
+    assert_burst_running(&w);
+    steps(&w, 26, 4, 1); /* 32.1 mm in this burst */
+    n = crawl_out_of_follow(&w, 800);
+    ASSERT_TRUE(n > 300 && n < 800);
+    assert_timeout(&w, 216);
+    tail_reset(&w);
+    tail_enter(&w, 217);
+    follow_taut(&w);
+    step(&w, 0, 0);
+    assert_burst_running(&w);
+    n = crawl_out_of_follow(&w, 800);
+    ASSERT_TRUE(n > 300 && n < 800);
+    assert_timeout(&w, 217);
+}
+
+/* A dose in the tail past 20 mm, and this lane's full while it runs.  The full is the safety stop
+ * of every forward move, so no deadline can come under it: the dose stops, the tail waits, nothing
+ * is raised.  Back at rest, the next dose's deadline is the tail-out. */
+TEST(a_full_in_the_tail_stops_the_dose_before_any_deadline_and_the_next_deadline_is_tail_out)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    tail_travel(&w, 218, 26);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 50000, false), 0);
+    ASSERT_TRUE(until_running(&w, 10) < 10);
+    assert_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, ACE2K_FEED_FF_PULSE_UM_S);
+    follow_full(&w);
+    step(&w, 0, 0);
+    ASSERT_TRUE(!w.run[0]);
+    crawl(&w, 300, 3);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FOLLOWING);
+    ASSERT_TRUE(w.feed.l[0].tail);
+    ASSERT_TRUE(!w.run[0]);
+    while (pop(&w, &e)) {
+        ASSERT_EQ(e.kind, ACE2K_FEED_BEHIND);
+    }
+    follow_rest(&w);
+    ASSERT_TRUE(until_running(&w, 10) < 10);
+    assert_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, ACE2K_FEED_FF_PULSE_UM_S);
+    int n = crawl_out_of_follow(&w, 400);
+    ASSERT_TRUE(n > 100 && n < 400);
+    assert_tail_out(&w, 218);
+}
+
+/* A snag watch left open when the tail began.  None arms in the follow today (feed_snag.c), but
+ * a watch hands a deadline back to the mode, so the tail still rules it: tail_out past 20 mm, at
+ * the burst's deadline and not before. */
+TEST(a_deadline_in_the_tail_with_a_snag_watch_open_is_still_ruled_by_the_tail)
+{
+    struct world w;
+    world_init(&w);
+    tail_travel(&w, 219, 26);
+    follow_taut(&w);
+    step(&w, 0, 0);
+    assert_burst_running(&w);
+    w.feed.l[0].snag = ACE2K_FEED_SNAG_WATCH;
+    int n = crawl_out_of_follow(&w, 800);
+    ASSERT_TRUE(n > 300 && n < 800); /* the deadline, not the watch */
+    assert_tail_out(&w, 219);
 }
 
 TEST(tail_max_ends_the_tail_as_tail_out)
@@ -5894,7 +8000,7 @@ TEST(the_tail_ignores_a_strand_put_in_at_the_bay_and_loads_nothing_at_its_end)
     struct ace2k_feed_event e;
     w.feed.load.auto_load = true;
     tail_enter(&w, 208);
-    uint32_t base = w.feed.l[0].tail_fg_start;
+    uint32_t base = w.feed.l[0].tail_fg_start_pulses;
     follow_full(&w);
     steps(&w, 20, 0, 0);
     ASSERT_TRUE(!w.run[0]);
@@ -5914,7 +8020,7 @@ TEST(the_tail_ignores_a_strand_put_in_at_the_bay_and_loads_nothing_at_its_end)
     w.in.insert = 0x01;
     step(&w, 0, 0);
     ASSERT_TRUE(w.feed.l[0].tail);
-    ASSERT_EQ(w.feed.l[0].tail_fg_start, base);
+    ASSERT_EQ(w.feed.l[0].tail_fg_start_pulses, base);
     ASSERT_TRUE(!pop(&w, &e));
     /* the head pulls: a burst; the old end leaves the drive and the new strand behind it is not
      * gripped — the standstill is the tail-out, never tangled, with the insert set */
@@ -6217,6 +8323,669 @@ TEST(a_standstill_during_a_dose_in_the_tail_is_tail_out)
     ASSERT_EQ(e.motor_um, ace2k_lane_fg_to_um(w.fg[0]));
     ASSERT_EQ(e.filament_um, 0);
     ASSERT_TRUE(!pop(&w, &e));
+}
+
+/* A dose against the debt's sign: a forward dose started during an extrusion still running when
+ * a long retraction starts would hold the first reverse dose back.  It is stopped once a chunk is
+ * owed the other way, settled as any stopped dose, and the reverse dose follows once the
+ * follow's rule 1 allows the flip — at once here, the lane at rest. */
+TEST(a_forward_dose_against_a_debt_owed_back_is_stopped_and_a_reverse_dose_follows)
+{
+    struct world w;
+    world_init(&w);
+    ff_arm(&w, 176);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, (int32_t)ACE2K_FEED_FF_PULSE_UM_S, false), 0);
+    (void)until_running(&w, 30);
+    assert_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, ACE2K_FEED_FF_PULSE_UM_S);
+    step(&w, 4, 1); /* the dose moves the strand one count forward before it is cut */
+    int32_t travel = ace2k_lane_encoder_um(&w.lane, 0) - w.feed.l[0].dose_enc_um;
+    ASSERT_EQ(travel, 12342 / 10);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, -55000, false), 0);
+    int32_t cap = (int32_t)(2U * ACE2K_FEED_FF_CHUNK_UM);
+    int32_t before = 0;
+    int n = 0;
+    while (w.feed.l[0].dose && w.run[0] && !w.reverse[0] && n < 20) {
+        before = w.feed.l[0].debt_um;
+        step(&w, 0, 0);
+        n++;
+    }
+    ASSERT_TRUE(n < 20);
+    /* the cut dose's forward travel is booked against the debt owed back, then this tick's
+     * −550 µm: the lane takes back what the head pulled back and what the dose fed */
+    int32_t settled = before - travel < -cap ? -cap : before - travel;
+    ASSERT_EQ(w.feed.l[0].debt_um, settled - 550 < -cap ? -cap : settled - 550);
+    ASSERT_TRUE(w.feed.l[0].debt_um <= -(int32_t)ACE2K_FEED_FF_CHUNK_UM);
+    if (!w.run[0]) {
+        step(&w, 0, 0); /* the stop's tick starts nothing; rest read, the flip is open */
+    }
+    assert_back_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, 55000);
+    ASSERT_EQ(ace2k_feed_ff_counts(&w.feed, 0).doses, 1);
+    ASSERT_EQ(ace2k_feed_ff_counts(&w.feed, 0).back_doses, 1);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+/* Only a dose cut by the rule above books travel against the debt's sign: a forward dose stopped
+ * on the shared full whose encoder reads a count back leaves the debt as it was — the floor at 0,
+ * not a debt raised by a strand the head moved the other way. */
+TEST(a_forward_dose_stopped_on_the_shared_full_books_no_travel_against_the_debt)
+{
+    struct world w;
+    world_init(&w);
+    ff_arm(&w, 180);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, (int32_t)ACE2K_FEED_FF_PULSE_UM_S, false), 0);
+    (void)until_running(&w, 30);
+    assert_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, ACE2K_FEED_FF_PULSE_UM_S);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 0, false), 0); /* no accrual on the stop's tick */
+    int32_t before = w.feed.l[0].debt_um;
+    ff_paused_at_rest(&w); /* another lane's full: the safety stop, lane 0 still at rest */
+    step(&w, 4, -1);
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_TRUE(!w.feed.l[0].dose);
+    ASSERT_EQ(ace2k_lane_encoder_um(&w.lane, 0) - w.feed.l[0].dose_enc_um, -(12342 / 10));
+    ASSERT_EQ(w.feed.l[0].debt_um, before);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+/* The mirror: a reverse dose against a debt owed forward is stopped; off rest, the forward dose
+ * waits for the follow's flip_ms after the stop. */
+TEST(a_reverse_dose_against_a_debt_owed_forward_is_stopped_and_a_forward_dose_follows)
+{
+    struct world w;
+    world_init(&w);
+    ff_arm(&w, 177);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, -55000, false), 0);
+    (void)until_running(&w, 10);
+    assert_back_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, 55000);
+    step(&w, 4, -1); /* the dose takes the strand one count back before it is cut */
+    int32_t travel = ace2k_lane_encoder_um(&w.lane, 0) - w.feed.l[0].dose_enc_um;
+    ASSERT_EQ(travel, -(12342 / 10));
+    w.in.rest = 0x0E; /* off rest, neither taut nor full */
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 55000, false), 0);
+    int32_t cap = (int32_t)(2U * ACE2K_FEED_FF_CHUNK_UM);
+    int32_t before = 0;
+    int n = 0;
+    while (w.run[0] && n < 40) {
+        before = w.feed.l[0].debt_um;
+        step(&w, 0, 0);
+        n++;
+    }
+    ASSERT_TRUE(!w.run[0]);
+    /* the cut dose's travel back is booked against the debt owed forward, then this tick's
+     * +550 µm */
+    int32_t settled = before - travel > cap ? cap : before - travel;
+    ASSERT_EQ(w.feed.l[0].debt_um, settled + 550 > cap ? cap : settled + 550);
+    ASSERT_TRUE(!w.feed.l[0].dose);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_WAITING);
+    ASSERT_TRUE(w.feed.l[0].debt_um >= (int32_t)ACE2K_FEED_FF_CHUNK_UM);
+    uint32_t stopped = w.now;
+    (void)until_running(&w, 40);
+    assert_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, ACE2K_FEED_FF_PULSE_UM_S);
+    ASSERT_TRUE(w.now - stopped >= ACE2K_FEED_FOLLOW_FLIP_MS);
+    ASSERT_EQ(ace2k_feed_ff_counts(&w.feed, 0).back_doses, 1);
+    ASSERT_EQ(ace2k_feed_ff_counts(&w.feed, 0).doses, 1);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+/* A reverse dose meets a strand the head holds: the strand stops on the encoder while the motor
+ * turns, and the plunger leaves rest and reaches taut within the standstill's 20 mm of motor.
+ * The follow's step reads taut before the comparator judges the tick, so the dose ends on taut —
+ * no trip, no error, no event — exactly as the follow's take-up does under the same strand. */
+static void held_until_taut(struct world *w)
+{
+    w->in.rest = 0x0E; /* off rest, neither taut nor full */
+    w->in.pushed = 0x00;
+    w->in.pulled_any = false;
+    steps(w, 50, 4, 0); /* 200 pulses ≈ 16 mm of motor, the strand still */
+    ASSERT_TRUE(w->run[0] && w->reverse[0]);
+    follow_taut(w);
+    step(w, 4, 0);
+}
+
+TEST(a_reverse_dose_held_by_the_head_ends_on_taut_as_the_take_up_does)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ff_arm(&w, 181);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, -55000, false), 0);
+    (void)until_running(&w, 10);
+    assert_back_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, 55000);
+    held_until_taut(&w);
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_TRUE(!w.feed.l[0].dose);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FOLLOWING);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
+    ASSERT_EQ(w.feed.l[0].debt_um, 0);
+    ASSERT_TRUE(!pop(&w, &e));
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    /* the follow's take-up under the same strand: the same end */
+    world_init(&w);
+    ff_arm(&w, 182);
+    follow_full(&w);
+    step(&w, 0, 0);
+    assert_take_up_running(&w, ACE2K_FEED_FOLLOW_TAKE_UM);
+    held_until_taut(&w);
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FOLLOWING);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
+    ASSERT_TRUE(!pop(&w, &e));
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+/* The tail begins under a reverse dose: it is stopped as a take-up is, no other starts while the
+ * tail lasts, and what is owed back stays owed. */
+TEST(a_reverse_dose_running_when_the_tail_begins_is_stopped_and_the_debt_stays_owed)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    ff_arm(&w, 178);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, -55000, false), 0);
+    (void)until_running(&w, 10);
+    assert_back_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, 55000);
+    w.in.insert = 0x00;
+    step(&w, 0, 0);
+    ASSERT_TRUE(w.feed.l[0].tail);
+    ASSERT_TRUE(!w.run[0]);
+    while (pop(&w, &e)) {
+    } /* the tail notice */
+    steps(&w, 30, 0, 0);
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_TRUE(!w.feed.l[0].dose);
+    ASSERT_EQ(ace2k_feed_ff_counts(&w.feed, 0).back_doses, 1);
+    ASSERT_TRUE(w.feed.l[0].debt_um <= -(int32_t)ACE2K_FEED_FF_CHUNK_UM);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+/* A base of 0 stops the accrual only: a negative debt left by a long retraction is still paid
+ * back, in a reverse dose at the pulse speed. */
+TEST(a_negative_debt_at_base_0_is_still_paid_in_a_reverse_dose_at_the_pulse)
+{
+    struct world w;
+    world_init(&w);
+    ff_arm(&w, 179);
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, -55000, false), 0);
+    (void)until_running(&w, 10);
+    assert_back_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, 55000);
+    steps(&w, 12, 0, 0); /* the strand still: the debt meets its cap */
+    ASSERT_EQ(w.feed.l[0].debt_um, -(int32_t)(2U * ACE2K_FEED_FF_CHUNK_UM));
+    ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, 0, false), 0);
+    step(&w, 4, 0);
+    step(&w, 4, -1);
+    step(&w, 4, -1); /* the chunk: the strand's two counts back pay 2468 µm, the lane free */
+    ASSERT_EQ(w.feed.l[0].debt_um, -(int32_t)(2U * ACE2K_FEED_FF_CHUNK_UM) + ((2 * 12342) / 10));
+    /* still a chunk owed back at base 0: the next reverse dose, at the pulse */
+    assert_back_dose_running(&w, ACE2K_FEED_FF_CHUNK_UM, ACE2K_FEED_FF_PULSE_UM_S);
+    ASSERT_EQ(ace2k_feed_ff_counts(&w.feed, 0).back_doses, 2);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+/* The comparator's thresholds are the core's to judge: every rule refused with nothing taken. */
+static void assert_thresholds_kept(const struct world *w, const struct ace2k_feed_thresholds *old)
+{
+    ASSERT_EQ(w->feed.th.slip_check_um, old->slip_check_um);
+    ASSERT_EQ(w->feed.th.slip_allow_um, old->slip_allow_um);
+    ASSERT_EQ(w->feed.th.stall_check_um, old->stall_check_um);
+}
+
+TEST(thresholds_set_takes_a_set_inside_every_rule)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_thresholds th = {
+        .slip_check_um = ACE2K_FEED_ASSIST_BURST_UM - 1U,
+        .slip_allow_um = ACE2K_FEED_ASSIST_BURST_UM - 2U,
+        .stall_check_um = ACE2K_FEED_ASSIST_BURST_UM - 1U,
+    };
+    ASSERT_EQ(ace2k_feed_thresholds_check(&th), ACE2K_FEED_THRESHOLDS_OK);
+    ASSERT_EQ(ace2k_feed_thresholds_set(&w.feed, &th), 0);
+    assert_thresholds_kept(&w, &th);
+}
+
+TEST(thresholds_set_refuses_a_zero_window_and_keeps_the_old)
+{
+    struct world w;
+    world_init(&w);
+    const struct ace2k_feed_thresholds old = w.feed.th;
+    struct ace2k_feed_thresholds th = old;
+    th.slip_check_um = 0;
+    ASSERT_EQ(ace2k_feed_thresholds_check(&th), ACE2K_FEED_THRESHOLDS_ZERO);
+    ASSERT_EQ(ace2k_feed_thresholds_set(&w.feed, &th), -ACE2K_EINVAL);
+    th = old;
+    th.slip_allow_um = 0;
+    ASSERT_EQ(ace2k_feed_thresholds_check(&th), ACE2K_FEED_THRESHOLDS_ZERO);
+    ASSERT_EQ(ace2k_feed_thresholds_set(&w.feed, &th), -ACE2K_EINVAL);
+    th = old;
+    th.stall_check_um = 0;
+    ASSERT_EQ(ace2k_feed_thresholds_check(&th), ACE2K_FEED_THRESHOLDS_ZERO);
+    ASSERT_EQ(ace2k_feed_thresholds_set(&w.feed, &th), -ACE2K_EINVAL);
+    assert_thresholds_kept(&w, &old);
+}
+
+TEST(thresholds_set_refuses_allow_not_under_check_and_keeps_the_old)
+{
+    struct world w;
+    world_init(&w);
+    const struct ace2k_feed_thresholds old = w.feed.th;
+    struct ace2k_feed_thresholds th = old;
+    th.slip_allow_um = th.slip_check_um; /* the strand could never be short by more */
+    ASSERT_EQ(ace2k_feed_thresholds_check(&th), ACE2K_FEED_THRESHOLDS_ALLOW_NOT_UNDER_CHECK);
+    ASSERT_EQ(ace2k_feed_thresholds_set(&w.feed, &th), -ACE2K_EINVAL);
+    th.slip_allow_um = th.slip_check_um + 1U;
+    ASSERT_EQ(ace2k_feed_thresholds_set(&w.feed, &th), -ACE2K_EINVAL);
+    assert_thresholds_kept(&w, &old);
+    ASSERT_TRUE(w.feed.th.slip_allow_um < w.feed.th.slip_check_um);
+}
+
+TEST(thresholds_set_refuses_a_window_an_assist_burst_never_closes_and_keeps_the_old)
+{
+    struct world w;
+    world_init(&w);
+    const struct ace2k_feed_thresholds old = w.feed.th;
+    struct ace2k_feed_thresholds th = old;
+    th.stall_check_um = ACE2K_FEED_ASSIST_BURST_UM;
+    ASSERT_EQ(ace2k_feed_thresholds_check(&th), ACE2K_FEED_THRESHOLDS_NOT_UNDER_BURST);
+    ASSERT_EQ(ace2k_feed_thresholds_set(&w.feed, &th), -ACE2K_EINVAL);
+    th = old;
+    th.slip_check_um = ACE2K_FEED_ASSIST_BURST_UM;
+    ASSERT_EQ(ace2k_feed_thresholds_check(&th), ACE2K_FEED_THRESHOLDS_NOT_UNDER_BURST);
+    ASSERT_EQ(ace2k_feed_thresholds_set(&w.feed, &th), -ACE2K_EINVAL);
+    th.slip_check_um = UINT32_MAX;
+    ASSERT_EQ(ace2k_feed_thresholds_set(&w.feed, &th), -ACE2K_EINVAL);
+    assert_thresholds_kept(&w, &old);
+}
+
+/* The rules are judged in the binding's order: a zero first, then the allowance, then the burst. */
+TEST(thresholds_check_names_the_first_rule_broken)
+{
+    struct ace2k_feed_thresholds th = {
+        .slip_check_um = ACE2K_FEED_ASSIST_BURST_UM,
+        .slip_allow_um = ACE2K_FEED_ASSIST_BURST_UM,
+        .stall_check_um = 0,
+    };
+    ASSERT_EQ(ace2k_feed_thresholds_check(&th), ACE2K_FEED_THRESHOLDS_ZERO);
+    th.stall_check_um = ACE2K_FEED_ASSIST_BURST_UM;
+    ASSERT_EQ(ace2k_feed_thresholds_check(&th), ACE2K_FEED_THRESHOLDS_ALLOW_NOT_UNDER_CHECK);
+}
+
+static void assert_load_kept(const struct world *w, const struct ace2k_feed_load_cfg *old)
+{
+    ASSERT_EQ(w->feed.load.park_um, old->park_um);
+    ASSERT_EQ(w->feed.load.speed_um_s, old->speed_um_s);
+    ASSERT_EQ(w->feed.load.auto_load, old->auto_load);
+}
+
+TEST(load_set_takes_the_bounds_themselves)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_load_cfg cfg = {
+        .park_um = ACE2K_LANE_MOVE_MAX_UM,
+        .speed_um_s = ACE2K_LANE_SPEED_MIN_UM_S,
+        .auto_load = true,
+    };
+    ASSERT_EQ(ace2k_feed_load_set(&w.feed, &cfg), 0);
+    assert_load_kept(&w, &cfg);
+    cfg.park_um = 1;
+    cfg.speed_um_s = ACE2K_LANE_SPEED_MAX_UM_S;
+    ASSERT_EQ(ace2k_feed_load_set(&w.feed, &cfg), 0);
+    assert_load_kept(&w, &cfg);
+}
+
+TEST(load_set_refuses_a_park_or_a_speed_out_of_bounds_and_keeps_the_old)
+{
+    struct world w;
+    world_init(&w);
+    const struct ace2k_feed_load_cfg old = w.feed.load;
+    struct ace2k_feed_load_cfg cfg = old;
+    cfg.auto_load = (bool)!old.auto_load; /* refused whole: not even the flag is taken */
+    cfg.park_um = 0;
+    ASSERT_EQ(ace2k_feed_load_set(&w.feed, &cfg), -ACE2K_EINVAL);
+    cfg.park_um = ACE2K_LANE_MOVE_MAX_UM + 1U;
+    ASSERT_EQ(ace2k_feed_load_set(&w.feed, &cfg), -ACE2K_EINVAL);
+    cfg.park_um = old.park_um;
+    cfg.speed_um_s = ACE2K_LANE_SPEED_MIN_UM_S - 1U;
+    ASSERT_EQ(ace2k_feed_load_set(&w.feed, &cfg), -ACE2K_EINVAL);
+    cfg.speed_um_s = ACE2K_LANE_SPEED_MAX_UM_S + 1U;
+    ASSERT_EQ(ace2k_feed_load_set(&w.feed, &cfg), -ACE2K_EINVAL);
+    assert_load_kept(&w, &old);
+}
+
+TEST(search_set_refuses_past_the_ceiling_and_keeps_the_old)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 600000), 0);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, ACE2K_FEED_SEARCH_MAX_UM + 1U), -ACE2K_EINVAL);
+    ASSERT_EQ(w.feed.search_um, 600000);
+    /* a reach that would turn negative as a signed travel is refused as well, never taken */
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, UINT32_MAX), -ACE2K_EINVAL);
+    ASSERT_EQ(w.feed.search_um, 600000);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, ACE2K_FEED_SEARCH_MAX_UM), 0);
+    ASSERT_EQ(w.feed.search_um, ACE2K_FEED_SEARCH_MAX_UM);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, 0), 0); /* 0 turns the search off */
+    ASSERT_EQ(w.feed.search_um, 0);
+}
+
+/* The feed is the lane core's only mover; a lane result it did not start (a move the lane core
+ * ran for anyone else) is not a mode's outcome: an idle lane stays idle, with no event. */
+TEST(a_lane_result_the_feed_did_not_start_leaves_an_idle_lane_idle_and_silent)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_lane_move(&w.lane, 0, ACE2K_LANE_FORWARD, 100000, 30000, w.now), 0);
+    step(&w, 4, 0);
+    w.in.link_ok = false; /* the lane core ends the move with link_lost */
+    step(&w, 0, 0);
+    struct ace2k_feed_event e;
+    ASSERT_TRUE(!pop(&w, &e));
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    w.in.link_ok = true;
+    step(&w, 0, 0);
+    ASSERT_EQ(ace2k_lane_move(&w.lane, 0, ACE2K_LANE_FORWARD, 100000, 30000, w.now), 0);
+    crawl(&w, 120, 200); /* the tach silent for a second: the lane core's stall */
+    ASSERT_TRUE(!pop(&w, &e));
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), 0);
+}
+
+/* The clock's wrap: every elapsed-time rule of the feed counts across 2^32 ms. */
+TEST(wrap_the_retry_window_counts_across_the_clocks_wrap)
+{
+    struct world w;
+    world_init_at(&w, UINT32_MAX - 400U);
+    struct ace2k_feed_event e;
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 10000, 30000, 9, w.now),
+              ACE2K_FEED_ACCEPTED);
+    paced(&w, 32, 4, 4, 1); /* 10 mm is 8 counts: done on the 32nd tick, before the wrap */
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_DONE);
+    uint32_t t_end = w.now;
+    ASSERT_TRUE(t_end > UINT32_MAX - 100U);
+    steps(&w, 50, 0, 0); /* 500 ms later, past the wrap: still the retry */
+    ASSERT_TRUE(w.now < 1000U);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 10000, 30000, 9, w.now),
+              ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_TRUE(!w.run[0]);
+    steps(&w, 51, 0, 0); /* 1010 ms after the done: the window is over, a new command */
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 10000, 30000, 9, w.now),
+              ACE2K_FEED_ACCEPTED);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+TEST(wrap_the_loads_settle_counts_across_the_clocks_wrap)
+{
+    struct world w;
+    world_init_at(&w, UINT32_MAX - 200U);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_LOAD, 0, 0, 164, w.now),
+              ACE2K_FEED_ACCEPTED);
+    steps(&w, 49, 0, 0); /* 490 ms, the wrap among them: the settle, no motion */
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_SETTLE);
+    step(&w, 0, 0); /* 500 ms: the pull */
+    ASSERT_TRUE(w.run[0] && !w.reverse[0]);
+    ASSERT_EQ(w.feed.l[0].sub, ACE2K_FEED_SUB_MOVING);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+TEST(wrap_the_follows_flip_time_counts_across_the_clocks_wrap)
+{
+    struct world w;
+    world_init_at(&w, UINT32_MAX - 150U);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_ASSIST_BOTH, 0, 50000, 51, w.now),
+              ACE2K_FEED_ACCEPTED);
+    follow_taut(&w);
+    steps(&w, 5, 4, 1);
+    assert_burst_running(&w);
+    follow_full(&w);
+    step(&w, 4, 1); /* the burst ends on the full, 90 ms before the wrap */
+    ASSERT_TRUE(!w.run[0]);
+    for (int i = 0; i < 19; i++) {
+        step(&w, 0, 0);
+        ASSERT_TRUE(!w.run[0]);
+    }
+    step(&w, 0, 0); /* 200 ms after the burst ended, past the wrap: the take-up */
+    assert_take_up_running(&w, ACE2K_FEED_FOLLOW_TAKE_UM);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+}
+
+TEST(wrap_the_snags_wait_for_rest_counts_across_the_clocks_wrap)
+{
+    /* catch_and_follow and the touch take 199 ticks: the wait begins 1990 ms after the start,
+     * here 250 ms before the wrap */
+    struct world w;
+    world_init_at(&w, UINT32_MAX - 1990U - 250U);
+    struct ace2k_feed_event e;
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 300000, 30000, 214, w.now),
+              ACE2K_FEED_ACCEPTED);
+    catch_and_follow(&w);
+    paced(&w, 16, 4, 4, -1); /* the touch ends; the plunger still at its pulled end */
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_EQ(w.feed.l[0].snag, ACE2K_FEED_SNAG_REST);
+    ASSERT_TRUE(w.feed.l[0].t_snag_ms > UINT32_MAX - 300U);
+    steps(&w, 49, 0, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING);
+    step(&w, 0, 0); /* 500 ms, past the wrap */
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_BLOCKED);
+}
+
+/* A rollback or an unload past its deadline with the plunger at rest goes on as the tail, on a
+ * fresh move (a_reverse_deadline_with_the_plunger_at_rest_…): ACE2K_FEED_UNLOAD_TAIL_UM for an
+ * unload, what its length still owes for a rollback.  If
+ * the strand then moves again and that move runs its length, it ends the mode as a move that ran
+ * its length does: a rollback done, an unload unload_incomplete (the strand still at the mouth).
+ * The kinds only: what the event's odometers cover is the mode's contract, tested apart. */
+static void run_reverse_tail_to_its_length(struct world *w, enum ace2k_feed_cmd cmd, uint8_t seq)
+{
+    ASSERT_EQ(ace2k_feed_start(&w->feed, 0, cmd, 30000, 30000, seq, w->now), ACE2K_FEED_ACCEPTED);
+    crawl(w, 367, 2); /* the deadline, the strand still: the tail's own move */
+    ASSERT_TRUE(w->feed.l[0].tail_out);
+    /* a rollback's tail: the 30 mm less the motor the crawl turned unseen (183 pulses); an
+     * unload's: its 100 mm */
+    uint32_t tail_um = cmd == ACE2K_FEED_CMD_ROLLBACK ? 30000U - ace2k_lane_fg_to_um(183)
+                                                      : ACE2K_FEED_UNLOAD_TAIL_UM;
+    ASSERT_EQ(w->lane.lane[0].move.target_counts, ace2k_lane_um_to_counts(&w->lane, 0, tail_um));
+    for (int i = 0; i < 200 && ace2k_feed_lane_busy(&w->feed, 0); i++) {
+        step(w, 4, -1); /* the strand comes back a count a tick */
+    }
+}
+
+TEST(a_rollbacks_tail_move_that_runs_its_length_ends_the_rollback_done)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    run_reverse_tail_to_its_length(&w, ACE2K_FEED_CMD_ROLLBACK, 65);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_DONE);
+    ASSERT_EQ(e.mode, ACE2K_FEED_ROLLING_BACK);
+    ASSERT_EQ(e.seq, 65);
+    ASSERT_TRUE(!pop(&w, &e));
+}
+
+TEST(an_unloads_tail_move_that_runs_its_length_is_unload_incomplete)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    run_reverse_tail_to_its_length(&w, ACE2K_FEED_CMD_UNLOAD, 66);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ERROR);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_UNLOAD_INCOMPLETE);
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_UNLOAD_INCOMPLETE);
+    ASSERT_EQ(e.mode, ACE2K_FEED_UNLOADING);
+    ASSERT_EQ(e.seq, 66);
+    ASSERT_TRUE(!pop(&w, &e));
+}
+
+/* A rollback's tail owes the length less the travel already done: the strand's on the encoder,
+ * and the motor's since the strand last moved (travel the encoder did not see — a strand past the
+ * drive wound by the spool, or an encoder lost).  So a rollback never pulls more than its length,
+ * with one exception: when the encoder stops counting, the motor still turns up to the
+ * standstill's 20 mm before the comparator ends the move, as in a feed.  An unload's tail keeps
+ * its ACE2K_FEED_UNLOAD_TAIL_UM.  Up to v0.12.0 a 10 mm rollback could turn the motor 120 mm. */
+static uint32_t run_out_the_tail(struct world *w, uint32_t pulses)
+{
+    uint32_t mark = w->feed.l[0].fg_tail_pulses; /* the mode's end clears it */
+    for (int i = 0; i < 2000 && ace2k_feed_lane_busy(&w->feed, 0); i++) {
+        step(w, w->run[0] ? pulses : 0U, 0); /* the encoder lost: the motor turns, no count */
+    }
+    ASSERT_TRUE(!ace2k_feed_lane_busy(&w->feed, 0));
+    ASSERT_TRUE(!w->run[0]);
+    ASSERT_EQ(w->feed.l[0].tail_budget_um, 0); /* what a mode carries ends with it */
+    return ace2k_lane_fg_to_um(w->fg[0] - mark);
+}
+
+/* A rollback of length_um whose encoder is lost from the start, the motor at `pulses` a tick:
+ * the motor's whole travel, from the start to the end of the mode. */
+static uint32_t rollback_motor_with_the_encoder_lost(uint32_t length_um, uint32_t pulses)
+{
+    struct world w;
+    world_init(&w);
+    uint32_t fg0 = w.fg[0];
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_ROLLBACK, length_um, 30000, 74, w.now),
+              ACE2K_FEED_ACCEPTED);
+    for (int i = 0; i < 20000 && ace2k_feed_lane_busy(&w.feed, 0); i++) {
+        step(&w, w.run[0] ? pulses : 0U, 0);
+    }
+    ASSERT_TRUE(!ace2k_feed_lane_busy(&w.feed, 0));
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_UNLOAD_INCOMPLETE);
+    return ace2k_lane_fg_to_um(w.fg[0] - fg0);
+}
+
+/* 10, 30 and 100 mm with the encoder lost, at 16 and 24 mm/s of motor: the motor turns the
+ * length, or the standstill's 20 mm when the length is shorter, and at most two ticks more. */
+TEST(a_rollback_with_its_encoder_lost_turns_its_length_or_the_standstills_20_mm)
+{
+    static const uint32_t lengths_um[] = { 10000U, 30000U, 100000U };
+    for (uint32_t p = 2U; p <= 3U; p++) {
+        for (size_t i = 0; i < sizeof lengths_um / sizeof lengths_um[0]; i++) {
+            uint32_t bound_um = lengths_um[i] > ACE2K_FEED_STALL_CHECK_UM
+                                    ? lengths_um[i]
+                                    : ACE2K_FEED_STALL_CHECK_UM;
+            uint32_t motor_um = rollback_motor_with_the_encoder_lost(lengths_um[i], p);
+            ASSERT_TRUE(motor_um >= bound_um);
+            ASSERT_TRUE(motor_um <= bound_um + ace2k_lane_fg_to_um(2U * p));
+        }
+    }
+}
+
+/* The deadline's route: the encoder lost from the start under a motor that crawls (a pulse every
+ * second tick), too slow for the standstill to come before the deadline.  At the deadline the
+ * motor has turned more than the 10 mm, so the tail owes nothing: no fresh move, the error. */
+TEST(a_rollback_whose_motor_ran_its_length_unseen_starts_no_tail_move)
+{
+    struct world w;
+    world_init(&w);
+    uint32_t fg0 = w.fg[0];
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_ROLLBACK, 10000, 30000, 70, w.now),
+              ACE2K_FEED_ACCEPTED);
+    for (int i = 0; i < 1000 && ace2k_feed_lane_busy(&w.feed, 0); i++) {
+        crawl(&w, 2, 2);
+    }
+    ASSERT_TRUE(!ace2k_feed_lane_busy(&w.feed, 0));
+    ASSERT_TRUE(!w.run[0]);
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_UNLOAD_INCOMPLETE);
+    uint32_t motor_um = ace2k_lane_fg_to_um(w.fg[0] - fg0);
+    ASSERT_TRUE(motor_um > 10000U);                    /* the deadline came after 10 mm */
+    ASSERT_TRUE(motor_um < ACE2K_FEED_STALL_CHECK_UM); /* and nothing after it */
+}
+
+/* The standstill's route: the strand comes back 4 counts, then the encoder is lost under a
+ * turning motor.  The standstill comes 20 mm of motor after the last count, which with the 4.9 mm
+ * counted is past the 10 mm: the tail owes nothing and the mode ends on the next tick. */
+TEST(a_rollbacks_tail_after_a_standstill_owes_the_length_less_what_was_done)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_ROLLBACK, 10000, 30000, 71, w.now),
+              ACE2K_FEED_ACCEPTED);
+    paced(&w, 16, 3, 4, -1); /* 4 counts back, ≈ 4.9 mm */
+    uint32_t fg_last_count = w.fg[0];
+    for (int i = 0; i < 200 && !w.feed.l[0].tail_out; i++) {
+        step(&w, 3, 0);
+    }
+    ASSERT_TRUE(w.feed.l[0].tail_out);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ROLLING_BACK);
+    uint32_t tail_um = run_out_the_tail(&w, 3);
+    ASSERT_TRUE(tail_um <= ace2k_lane_fg_to_um(3)); /* one tick at most */
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_UNLOAD_INCOMPLETE);
+    ASSERT_TRUE(ace2k_lane_fg_to_um(w.fg[0] - fg_last_count) <=
+                ACE2K_FEED_STALL_CHECK_UM + ace2k_lane_fg_to_um(6));
+}
+
+/* A long rollback: 50 counts back (≈ 61.7 mm), then the strand stands still under the motor —
+ * its end past the drive.  The tail runs what the 100 mm still owes after the counted travel and
+ * the standstill's 20 mm unseen. */
+TEST(a_long_rollbacks_tail_runs_what_the_length_still_owes)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_ROLLBACK, 100000, 30000, 75, w.now),
+              ACE2K_FEED_ACCEPTED);
+    paced(&w, 200, 3, 4, -1); /* 50 counts back */
+    uint32_t fg_last_count = w.fg[0];
+    for (int i = 0; i < 200 && !w.feed.l[0].tail_out; i++) {
+        step(&w, 3, 0);
+    }
+    ASSERT_TRUE(w.feed.l[0].tail_out);
+    int32_t along_um = w.feed.l[0].enc_um_start - ace2k_lane_encoder_um(&w.lane, 0);
+    uint32_t unseen_um = ace2k_lane_fg_to_um(w.fg[0] - fg_last_count);
+    ASSERT_TRUE(unseen_um >= ACE2K_FEED_STALL_CHECK_UM);
+    uint32_t owed_um = 100000U - (uint32_t)along_um - unseen_um;
+    uint32_t tail_um = run_out_the_tail(&w, 3);
+    ASSERT_TRUE(tail_um >= owed_um);
+    ASSERT_TRUE(tail_um <= owed_um + ace2k_lane_fg_to_um(6));
+    ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_UNLOAD_INCOMPLETE);
+}
+
+/* An unload's tail is not the rollback's: still ACE2K_FEED_UNLOAD_TAIL_UM from its start. */
+TEST(an_unloads_tail_keeps_its_own_budget)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_UNLOAD, 10000, 30000, 72, w.now),
+              ACE2K_FEED_ACCEPTED);
+    for (int i = 0; i < 1000 && !w.feed.l[0].tail_out; i++) {
+        crawl(&w, 2, 2); /* a pulse every second tick */
+    }
+    ASSERT_TRUE(w.feed.l[0].tail_out);
+    ASSERT_EQ(w.lane.lane[0].move.target_counts,
+              ace2k_lane_um_to_counts(&w.lane, 0, ACE2K_FEED_UNLOAD_TAIL_UM));
+    uint32_t tail_um = run_out_the_tail(&w, 3);
+    ASSERT_TRUE(tail_um >= ACE2K_FEED_UNLOAD_TAIL_UM);
+    ASSERT_TRUE(tail_um <= ACE2K_FEED_UNLOAD_TAIL_UM + ace2k_lane_fg_to_um(3));
+}
+
+/* Every mode maps to one LED pattern; only an idle lane looks at the insert sensor. */
+TEST(each_mode_maps_to_its_led_pattern)
+{
+    static const struct {
+        uint8_t mode;
+        enum ace2k_led_lane_pattern without, with;
+    } cases[] = {
+        { ACE2K_FEED_IDLE, ACE2K_LED_LANE_OFF, ACE2K_LED_LANE_LOADED },
+        { ACE2K_FEED_FEEDING, ACE2K_LED_LANE_MOVING, ACE2K_LED_LANE_MOVING },
+        { ACE2K_FEED_ROLLING_BACK, ACE2K_LED_LANE_MOVING, ACE2K_LED_LANE_MOVING },
+        { ACE2K_FEED_UNLOADING, ACE2K_LED_LANE_MOVING, ACE2K_LED_LANE_MOVING },
+        { ACE2K_FEED_LOADING, ACE2K_LED_LANE_MOVING, ACE2K_LED_LANE_MOVING },
+        { ACE2K_FEED_ASSISTING, ACE2K_LED_LANE_LOADED, ACE2K_LED_LANE_LOADED },
+        { ACE2K_FEED_ASSISTING_BACK, ACE2K_LED_LANE_LOADED, ACE2K_LED_LANE_LOADED },
+        { ACE2K_FEED_ERROR, ACE2K_LED_LANE_ERROR, ACE2K_LED_LANE_ERROR },
+        { ACE2K_FEED_FOLLOWING, ACE2K_LED_LANE_LOADED, ACE2K_LED_LANE_LOADED },
+        { 200U, ACE2K_LED_LANE_OFF, ACE2K_LED_LANE_LOADED }, /* unknown: read as idle */
+    };
+    for (size_t i = 0; i < ACE2K_ARRAY_SIZE(cases); i++) {
+        ASSERT_EQ(ace2k_feed_led_pattern(cases[i].mode, false), cases[i].without);
+        ASSERT_EQ(ace2k_feed_led_pattern(cases[i].mode, true), cases[i].with);
+    }
 }
 
 // NOLINTNEXTLINE(readability-identifier-naming)

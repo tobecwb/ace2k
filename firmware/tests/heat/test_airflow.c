@@ -74,7 +74,7 @@ static void fake_flap_write(void *ctx, enum ace2k_flap flap, bool open_coil, boo
     }
 }
 
-static const struct ace2k_airflow_ops ace2k_fake_ops = {
+static const struct ace2k_airflow_ops fake_ops = {
     .fan_write = fake_fan_write,
     .fan_read = fake_fan_read,
     .flap_write = fake_flap_write,
@@ -98,7 +98,7 @@ static bool flaps_idle(const struct ace2k_airflow *a)
 static void setup(struct ace2k_airflow *a, struct ace2k_fake_airflow_io *f)
 {
     *f = (struct ace2k_fake_airflow_io){ 0 };
-    ace2k_airflow_init(a, &ace2k_fake_ops, f);
+    ace2k_airflow_init(a, &fake_ops, f);
 }
 
 /* One tick at f->now_ms with both NTCs at the given values, both valid. */
@@ -325,19 +325,36 @@ TEST(a_manual_run_is_bounded_and_ends_by_itself)
     ASSERT_EQ(a.owner, ACE2K_AIRFLOW_OWNER_NONE);
 }
 
+/* The setter only stores the hold: the fans follow at the next tick, and the hold's end lets
+ * them go at the tick after it. */
+TEST(the_heat_hold_reaches_the_fans_at_the_next_tick)
+{
+    struct ace2k_airflow a;
+    struct ace2k_fake_airflow_io f;
+    setup(&a, &f);
+    ace2k_airflow_set_heat_holds(&a, true);
+    ASSERT_TRUE(!f.fan_on);
+    run_cool(&a, &f, 10U);
+    ASSERT_TRUE(f.fan_on);
+    ace2k_airflow_set_heat_holds(&a, false);
+    ASSERT_TRUE(f.fan_on);
+    run_cool(&a, &f, 10U);
+    ASSERT_TRUE(!f.fan_on);
+}
+
 TEST(heat_holds_refuses_every_way_of_switching_the_fans_off)
 {
     struct ace2k_airflow a;
     struct ace2k_fake_airflow_io f;
     setup(&a, &f);
     ASSERT_EQ(ace2k_airflow_fans(&a, ACE2K_AIRFLOW_OWNER_MANUAL, true, 1U, f.now_ms), 0);
-    a.heat_holds = true;
+    ace2k_airflow_set_heat_holds(&a, true);
     ASSERT_EQ(ace2k_airflow_fans(&a, ACE2K_AIRFLOW_OWNER_MANUAL, false, 0U, f.now_ms),
               -ACE2K_EBUSY);
     run_cool(&a, &f, 3000U); /* past the 1 s run: the expiry waits for the lease to end */
     ASSERT_TRUE(f.fan_on);
     ASSERT_EQ(a.owner, ACE2K_AIRFLOW_OWNER_MANUAL);
-    a.heat_holds = false;
+    ace2k_airflow_set_heat_holds(&a, false);
     run_cool(&a, &f, 10U);
     ASSERT_TRUE(!f.fan_on);
 }
@@ -350,14 +367,14 @@ TEST(a_release_under_heat_holds_drops_the_owner_and_keeps_the_fans_on)
     struct ace2k_fake_airflow_io f;
     setup(&a, &f);
     ASSERT_EQ(ace2k_airflow_fans(&a, ACE2K_AIRFLOW_OWNER_DRYER, true, 0U, f.now_ms), 0);
-    a.heat_holds = true;
+    ace2k_airflow_set_heat_holds(&a, true);
     ace2k_airflow_release(&a, ACE2K_AIRFLOW_OWNER_DRYER);
     ASSERT_EQ(a.owner, ACE2K_AIRFLOW_OWNER_NONE);
     run_cool(&a, &f, 1000U);
     ASSERT_TRUE(f.fan_on);
     ASSERT_EQ(ace2k_airflow_fans(&a, ACE2K_AIRFLOW_OWNER_MANUAL, false, 0U, f.now_ms),
               -ACE2K_EBUSY); /* an explicit off is still refused while heat holds */
-    a.heat_holds = false;
+    ace2k_airflow_set_heat_holds(&a, false);
     run_cool(&a, &f, 10U);
     ASSERT_TRUE(!f.fan_on);
     ASSERT_EQ(a.owner, ACE2K_AIRFLOW_OWNER_NONE);
@@ -374,12 +391,12 @@ TEST(heat_holds_keeps_the_fans_on_when_rule7_lets_go)
     tick(&a, &f, HOT_MC, HOT_MC);
     ASSERT_TRUE(f.fan_on);
     ASSERT_EQ(a.owner, ACE2K_AIRFLOW_OWNER_NONE);
-    a.heat_holds = true;
+    ace2k_airflow_set_heat_holds(&a, true);
     run_cool(&a, &f, 1000U);
     ASSERT_TRUE(!a.thermal_on);
     ASSERT_TRUE(f.fan_on);
     ASSERT_TRUE(ace2k_airflow_fans_commanded(&a));
-    a.heat_holds = false;
+    ace2k_airflow_set_heat_holds(&a, false);
     run_cool(&a, &f, 10U);
     ASSERT_TRUE(!f.fan_on);
 }
@@ -677,7 +694,7 @@ TEST(a_shutdown_keeps_heat_holds_and_the_fans_on_with_cool_ntcs)
     struct ace2k_fake_airflow_io f;
     setup(&a, &f);
     ASSERT_EQ(ace2k_airflow_fans(&a, ACE2K_AIRFLOW_OWNER_DRYER, true, 0U, f.now_ms), 0);
-    a.heat_holds = true;
+    ace2k_airflow_set_heat_holds(&a, true);
     f.now_ms += 10U;
     tick(&a, &f, COOL_MC, COOL_MC);
     ASSERT_TRUE(f.fan_on);
@@ -688,7 +705,7 @@ TEST(a_shutdown_keeps_heat_holds_and_the_fans_on_with_cool_ntcs)
     ASSERT_TRUE(ace2k_airflow_fans_commanded(&a));
     run_cool(&a, &f, 1000U);
     ASSERT_TRUE(f.fan_on);
-    a.heat_holds = false; /* heat's binding: the gate reads low again */
+    ace2k_airflow_set_heat_holds(&a, false); /* heat's binding: the gate reads low again */
     run_cool(&a, &f, 10U);
     ASSERT_TRUE(!f.fan_on);
 }
@@ -708,9 +725,9 @@ TEST(the_fans_are_required_while_the_dryer_heat_or_a_measured_rule_7_holds_them)
     ASSERT_TRUE(ace2k_airflow_fans_required(&a)); /* the dryer's cycle, any temperature */
     ace2k_airflow_release(&a, ACE2K_AIRFLOW_OWNER_DRYER);
     ASSERT_TRUE(!ace2k_airflow_fans_required(&a));
-    a.heat_holds = true;
+    ace2k_airflow_set_heat_holds(&a, true);
     ASSERT_TRUE(ace2k_airflow_fans_required(&a)); /* heat active */
-    a.heat_holds = false;
+    ace2k_airflow_set_heat_holds(&a, false);
     ace2k_airflow_tick(&a, HOT_MC, COOL_MC, true, true, f.now_ms);
     ASSERT_TRUE(ace2k_airflow_fans_required(&a)); /* above 45 °C */
     ace2k_airflow_tick(&a, 43000, COOL_MC, true, true, f.now_ms);

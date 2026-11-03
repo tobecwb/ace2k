@@ -78,7 +78,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
       - run: make -C firmware flag-check
-      - run: cd firmware/build && sha256sum ace2k-*.bin ace2k-*.dict > SHA256SUMS
+      - run: make -C firmware host-bundle
+      - run: cd firmware/build && sha256sum ace2k-*.bin ace2k-*.dict ace2k-host-*.tar.gz > SHA256SUMS
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           draft: true
@@ -86,4 +87,5 @@ jobs:
           files: |
             firmware/build/ace2k-*.bin
             firmware/build/ace2k-*.dict
+            firmware/build/ace2k-host-*.tar.gz
             firmware/build/SHA256SUMS

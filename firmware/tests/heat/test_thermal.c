@@ -1,7 +1,8 @@
-/* The thermal simulator reproduces the heater runs measured on the unit (the heater-2026-09-13 data set): each run replayed from its first sample with its own duty column, the
- * model's outlet NTCs and chamber compared at every sample.  The tolerances are the fit's
- * achieved error (tools/thermal_fit.py prints it) with a margin; a re-fit that makes them fail
- * has made the model worse. */
+/* The thermal simulator reproduces the heater runs measured on the unit (the heater-2026-09-13
+ * data set): each run replayed from its first sample with its own duty column, the model's
+ * outlet NTCs and chamber compared at every sample.  The tolerances are the fit's achieved
+ * error (tools/thermal_fit.py prints it) with a margin; a re-fit that makes them fail has made
+ * the model worse. */
 #include "fake_thermal.h"
 #include "test.h"
 #include "thermal_runs.h"
@@ -96,7 +97,7 @@ TEST(the_ntc_lags_the_heater_and_overshoots_after_the_gate_stops)
         }
     }
     printf("  50 %% for 40 s: right NTC %d at the stop, peak %d mdegC\n", (int)at_stop, (int)peak);
-    ASSERT_TRUE(peak - at_stop >= 1000); /* the bench: +3.8 degC at 50 % */
+    ASSERT_TRUE(peak - at_stop >= 1000); /* measured on the unit: +3.8 degC at 50 % */
 }
 
 TEST(a_stopped_fan_in_the_synthetic_variant_heats_its_side_faster)

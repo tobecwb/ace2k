@@ -1,16 +1,16 @@
-/* What: the one way this board code registers an interrupt handler with Klipper's
- * armcm_enable_irq().
+/* What: the one way this board code registers an interrupt handler with armcm_enable_irq() of
+ * Klipper.
  * How: ACE2K_ARMCM_ENABLE_IRQ(func, num, prio) is armcm_enable_irq(func, num, prio) inside a
- * diagnostic push / pop that silences -Wunterminated-string-initialization for that one
- * statement: Klipper's DECL_CTR_INT, behind armcm_enable_irq, sizes its request string without
- * the terminating NUL on purpose (the values follow the text), and GCC 15 warns about that under
- * -Wextra -Werror.  -Wpragmas is silenced first, for compilers that do not know the option.
- * Depends on: nothing here — the including file brings board/armcm_boot.h itself (this header
- * is checked standalone, with the standard headers only). */
+ * diagnostic push / pop. It silences -Wunterminated-string-initialization for that one statement.
+ * Klipper's DECL_CTR_INT, behind armcm_enable_irq, sizes its request string without the
+ * terminating NUL on purpose, because the values follow the text. GCC 15 warns about that under
+ * -Wextra -Werror. -Wpragmas is silenced first, for compilers that do not know the option.
+ * Depends on: nothing here. The including file brings board/armcm_boot.h itself. This header is
+ * checked standalone, with the standard headers only. */
 #ifndef ACE2K_BOARD_ARMCM_IRQ_H
 #define ACE2K_BOARD_ARMCM_IRQ_H
 
-/* one pragma per line, as the push / ignore / call / pop it is */
+/* One pragma per line, to show the push / ignore / call / pop that it is. */
 /* clang-format off */
 #define ACE2K_ARMCM_ENABLE_IRQ(func, num, prio)                                  \
     _Pragma("GCC diagnostic push")                                               \

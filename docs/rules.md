@@ -109,39 +109,54 @@ The tip snag is the tip of the filament catching at the entrance of the plunger'
 are cited by name ("the tip snag's rule N"). Rule 6 amends the feed's statement that the unit
 never retries a move on its own: a tolerance is a bounded, announced resume.
 
-1. The forward tolerance is bounded. Once this lane's buffer reads full in a feed or in a load's
-   pull, the motor turns at most `ACE2K_FEED_SNAG_FWD_UM` (initially 20 mm) more before a verdict.
-   If the filament falls `ACE2K_FEED_SNAG_LAG_UM` (initially 5 mm) behind the motor in that
-   stretch, the move ends `stuck` on that tick.
-2. The duty guard, once set, ends the tolerance at once. During the tolerance, a duty more than
-   the guard's points above the feed-forward duty of the lane's setpoint is `stuck`. The guard is
-   settable at run time and off by default.
+1. The forward tolerance is bounded. It applies to a feed started without `free_tip`, and to the
+   read with motion's search, whose filament may sit in an extruder. (A free-tip feed and a load
+   from the bay take the free tip's window rule: the filament falling `ACE2K_FEED_SNAG_LAG_UM`
+   behind the motor within a window of `ACE2K_FEED_SNAG_FWD_UM` ends the push.) Once this lane's
+   buffer reads full in such a move, the motor turns at most `ACE2K_FEED_SNAG_FWD_UM` (initially
+   20 mm) more before a verdict. If the filament falls `ACE2K_FEED_SNAG_LAG_UM` (initially 5 mm)
+   behind the motor in that stretch, the move ends on that tick: `blocked` in a feed, the
+   `obstacle` return in the search (rule 8).
+2. The duty guard, once set, ends the tolerance at once. During the forward tolerance, a duty more
+   than the guard's points above the feed-forward duty of the lane's setpoint ends the move as
+   rule 1's lag does. The guard is settable at run time and off by default.
 3. The plunger must come back. After each release manoeuvre, the lane waits at most
    `ACE2K_FEED_SNAG_REST_MS` (initially 500 ms) for its rest reading. If it is not at rest by
-   then, the result is `stuck`, with the motor stopped.
+   then, the motor stays stopped: forward, the move ends as rule 1's lag does; toward the spool,
+   it is `stuck`.
 4. The reverse tolerance needs free travel. A comparator trip toward the spool with the plunger
    taut is forgiven only when all of these hold: the mode is a rollback or an unload; the insert
    sensor reads present; the filament has come back at least `ACE2K_FEED_SNAG_FREE_UM` (initially
    50 mm) on the encoder since the mode started. Anything else stays `stuck` at once.
-5. One tolerance per mode. A second full (forward) or a second forgivable trip (reverse) in the
-   same mode is `stuck` at once.
+5. One tolerance per mode. A second full in the same mode (forward) ends the move at once, as rule
+   1's lag does; a second forgivable trip (reverse) is `stuck` at once.
 6. Every tolerance is announced and bounded. Each one sends the `snag` notice before the move
    resumes. Every motion it adds is one bounded lane move. A stop, the link, a shutdown, a runout
    and the supervisors end it as they end any move.
 7. Nothing else changes. The assists, a load's return and reacquire, the tail rule and the
    comparator's thresholds behave as before.
-8. The tag search never ends in an error. In the search, every verdict of the tolerance that is
-   `stuck` elsewhere is instead the `obstacle` return to the parking point.
+8. The tag search never ends in an error. A load from the bay's search runs the free tip's window
+   rule; its ends — the window lag, a stall, a deadline — are the `obstacle` return to the parking
+   point. The read with motion's search runs the tolerance; its verdicts, and its own move's stall
+   or deadline during the watch, are the `obstacle` return to where the read began.
 
 ### The feed-forward (additional rules)
 
 1. The feed-forward only acts on a lane in follow. Disarming the follow ends it, and the base rate
    returns to 0.
-2. A dose is a bounded move (`ff_chunk` at `ff_pulse`). The comparator judges it, and this lane's
-   full or the shared full ends it, as for a burst.
+2. A dose is a bounded move of `ff_chunk`. A forward dose is asked at `ff_pulse` and, being no
+   longer than the lane's landing, runs at the floor speed. A reverse dose runs at the
+   retraction's speed (never under `ff_pulse`), with no landing. The comparator judges a dose, and
+   this lane's full or the shared full ends it, as for a burst.
 3. The debt is capped at two doses, so a wrong rate never accumulates into a long feed.
 4. Ambiguity moves nothing. When two lanes of the same extruder are armed in follow at once,
    neither gets a base rate, and a console line says so. Each keeps the plain follow.
+5. A new active lane starts afresh. When the active lane of a shared extruder changes
+   (`ACEK_LANE_ACTIVE`, a host module's `hand_over` or `release`, or the active lane mapped to
+   another extruder), every unit's feed-forward forgets what it recorded for that extruder, once
+   the other followers ended: the retraction it was taking back, the credit, and
+   the extruder's moves planned so far. Those belong to the lane that leaves. The new lane gets
+   doses only for the moves planned after the change; the plain follow covers the rest.
 
 ### The tail (additional rules)
 

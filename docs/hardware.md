@@ -98,11 +98,18 @@ lane blinks on one shared clock, so lanes in the same state blink together.
 | filament present — idle, assisting or following | on, steady |
 | moving — feed, rollback, load, unload | blinking, 1 Hz |
 | lane in error | blinking, 5 Hz |
+| every lane empty and idle (after the intro, if one plays) | all four flash together for 100 ms every 10 s, the first flash 10 s after the last lane went dark |
 | boot of a proven image, every lane empty | dark 300 ms (the insert sensors settle), then the intro: 1 → 4 → 1 twice, 150 ms a step, once |
 | unproven image waiting for the host | chase 1 → 4, 250 ms a step, over every lane |
 
+The flash of all four shows only while every lane is off: a lane loaded, moving or in error shows
+its own pattern, and the other lanes stay dark, so an error is never hidden. It goes on whatever
+else runs: the dryer, Klipper stopped or shut down, the link down. The chase of an unproven image
+wins over it. The two values are compile-time constants (`ACE2K_LED_IDLE_PERIOD_MS`,
+`ACE2K_LED_IDLE_ON_MS`, `lane/led.h`).
+
 A loaded lane at rest looks like the factory firmware's idle. To tell them apart, look for the
-intro at boot (an empty unit) or use `ACE_STATUS`.
+intro at boot (an empty unit) or use `ACEK_STATUS`.
 
 ## Analogue inputs
 
@@ -184,8 +191,8 @@ stop.
 Asserted would be high. It was never seen asserted, not even through ≈ 245 s of driven heating
 (2026-09-13), so the asserted level is inferred, not observed. Its companions are the triac gate
 PC8 ("Heater", below) and PC9. PC9 is the pulse that resets the cutout's latch after an event.
-**No ace2k image drives or configures PC9.** Every image with the lane or the heater only reserves
-it, once, so that no host section can claim it (`protocol.md`, the dictionary's constants).
+**No ace2k image drives or configures PC9.** Every image only reserves it, once, so that no host
+section can claim it (`protocol.md`, the dictionary's constants).
 
 ## Chamber sensor
 
@@ -230,7 +237,7 @@ sits 40 °C below it. The cutout is a last resort, never part of the control.
 | Signal | Pin | Measured |
 |---|---|---|
 | Mains zero-cross | **PC0**, rising edge, one edge per half-cycle ("Counters") | 120 edges/s on 60 Hz mains, 118–122 through every heating run. A 7 ms lockout between edges rejected none on clean mains (2026-09-13). On 2026-09-28, at the moment the dryer took its first lease, the lockout rejected 2 edges and one 1 s window read 58.5 Hz (the next read 59.0–60.5): a transient dip the heater's mains bucket rides out. Every off-band window of the dryer bench (2026-09-28) spans a flash write of the dryer's log. Its erase and programming hold interrupts off, so all the edges in that time but one are lost. Since 2026-09-29 the frequency is measured from the edges' own times, over runs of edges that a write's late edge ends. The late edge is told by the input's pending bit, read as the write ends. So a write no longer reads as a dip, and a dip next to a write still does |
-| Triac gate | **PC8**, **high = heating** | an external pull-down holds the gate off with the pin released (read 0 floating, 2026-09-12). Polarity proven 2026-09-13: 24 half-cycles at 10 % for 2 s moved both outlet NTCs |
+| Triac gate | **PC8**, **high = heating** | reserved once in every image, so no host section can claim it. An external pull-down holds the gate off with the pin released (read 0 floating, 2026-09-12). Polarity proven 2026-09-13: 24 half-cycles at 10 % for 2 s moved both outlet NTCs |
 | Cutout fault | **PD15** | never asserted through ≈ 245 s of heating (2026-09-13) |
 
 **Firing.** Whole half-cycles, never phase angle. At a zero-cross edge the gate is raised for
@@ -447,7 +454,7 @@ constant for all four lanes until a calibration measures them.
 200 mm feed read +197.5 mm and the rollback −201.2 mm. The first reading by hand agreed (8 counts,
 +9.873 mm, 2026-09-17, a filament entered toward the printer). The same runs close the ±5 % check
 that the first, motor-off measurements left open. 197.5 mm read against ~195 mm on the ruler at
-the default constant. After `ACE_CALIBRATE_ENCODER`, the development unit's lane 1 wheel read
+the default constant. After `ACEK_CALIBRATE_ENCODER`, the development unit's lane 1 wheel read
 1.2188 mm per count (0.1 % against the ruler). The wheels differ by a few per cent. That is what
 the per-lane scale in `printer.cfg` is for (`laneN_encoder_scale`, accepted within ±20 % of the
 default; `ace2k_lane_scale_set`).
@@ -596,7 +603,7 @@ firmware reports these pairs over its protocol as `GET_MOTOR_STATUS`.
 
 **Read at every boot, never written.** The firmware checks the primary's CRC, then the backup's,
 then falls back to the defaults. It says which one it used (`ace2k_config_state`,
-`ace2k_sensors_thresholds`, `ACE_STATUS`). The pages are read through plain memory reads. The
+`ace2k_sensors_thresholds`, `ACEK_STATUS`). The pages are read through plain memory reads. The
 flash allow-list refuses both pages to the erase and program routines, and a host test proves it.
 
 Verified 2026-09-16 on the development unit's own page copy: the stored checksum reproduces with

@@ -1,31 +1,46 @@
-/* The load of the feed: the settle, the pull to the parking point and — with the reader's binding — the pause while a
- * read session holds the lane, the search past the parking point for a tag not seen yet, the
- * return to the parking point, the reacquire of a tag a stop left behind, the read on command
- * with motion, and the grip — an automatic load cut to a short pull with no search.  Every phase
- * is one bounded lane move (the feed's rule 2); a STOP, the link, a shutdown, a runout and
- * the supervisors end it as they end any mode.  Split from
- * feed_assist.c; the seam is feed_internal.h.  The tick runs in interrupt context, the starts
- * from task context with interrupts masked. */
+/* The feed's load.  It holds these phases.
+ * - The settle.
+ * - The pull to the parking point.
+ * - With the reader's binding, the pause while a read session holds the lane.
+ * - The search past the parking point, for a tag not seen yet.
+ * - The return to the parking point.
+ * - The reacquire of a tag that a stop left behind.
+ * - The read on command with motion.
+ * - The grip: an automatic load cut to a short pull, with no search.
+ * Every phase is one bounded lane move (the feed's rule 2).  A STOP, the link, a shutdown, a runout
+ * and the supervisors end it, as they end any mode.  This was split from feed_assist.c.  The seam
+ * is feed_internal.h.  The tick runs in interrupt context, and the starts run from task context
+ * with interrupts masked. */
 #include "feed/feed_internal.h"
 
-/* The strand's travel since the load began, on the encoder. */
+/* The travel of the filament since the load began, on the encoder. */
 static int32_t travel_um(const struct ace2k_feed *self, uint8_t lane)
 {
-    return ace2k_lane_encoder_um(self->lane, lane) - self->l[lane].enc_um_start;
+    return ace2k_feed_strand_since_um(self, lane, self->l[lane].enc_um_start);
 }
 
-static bool others_idle(const struct ace2k_feed *self, uint8_t lane)
+/* The tag search's rule 4, in one place: the search moves only while every other lane is quiet.
+ * Idle and error are quiet.  So is a follow with its motor at rest, when follow_at_rest_quiet:
+ * what the search needs is its own motor and the reader, and a follow at rest holds neither.  A
+ * follow that moves later makes the search yield (ace2k_feed_tick).  The read with motion and a
+ * resumed search take a follow at rest as quiet.  A load's search, after its pull, does not: it
+ * starts only with every other lane idle. */
+static bool others_quiet(const struct ace2k_feed *self, uint8_t lane, bool follow_at_rest_quiet)
 {
     for (uint8_t i = 0; i < ACE2K_LANE_COUNT; i++) {
-        if (i != lane && ace2k_feed_lane_busy(self, i)) {
+        if (i == lane || !ace2k_feed_lane_busy(self, i)) {
+            continue;
+        }
+        if (!follow_at_rest_quiet || self->l[i].mode != ACE2K_FEED_FOLLOWING ||
+            ace2k_lane_is_moving(self->lane, i)) {
             return false;
         }
     }
     return true;
 }
 
-/* A move of the load's own, the comparator's bases taken afresh; false when the lane refused
- * it — the caller ends the load. */
+/* A move of the load itself, with the bases of the comparator taken afresh.  It returns false when
+ * the lane refused it, and then the caller ends the load. */
 static bool load_move(struct ace2k_feed *self, uint8_t lane, enum ace2k_lane_dir dir, uint32_t um,
                       uint32_t speed_um_s, uint8_t sub, uint32_t now_ms)
 {
@@ -45,10 +60,11 @@ static void loaded(struct ace2k_feed *self, uint8_t lane, uint32_t now_ms)
     ace2k_feed_finish(self, lane, ACE2K_FEED_LOADED, now_ms);
 }
 
-/* Back to the return point — the parking point, or a read's start — from either side (rule 5
- * of the tag search: a search always ends there, a yield included): a strand past it comes
- * back; one short of it (a reacquire that reversed below it) goes forward to it, never past it,
- * which the tag search's rule 4 allows while another lane moves; within ACE2K_FEED_RETURN_MIN_UM it is there. */
+/* Go back to the return point: the parking point, or the start of a read.  This works from either
+ * side (rule 5 of the tag search: a search always ends there, a yield included).  A filament past
+ * the point comes back.  A filament short of it, after a reacquire that reversed below it, goes
+ * forward to it, never past it.  The tag search's rule 4 allows that while another lane moves.
+ * Within ACE2K_FEED_RETURN_MIN_UM, the filament is already there. */
 static void begin_return(struct ace2k_feed *self, uint8_t lane, uint8_t end, uint32_t now_ms)
 {
     struct ace2k_feed_lane *l = &self->l[lane];
@@ -68,7 +84,7 @@ static void begin_search(struct ace2k_feed *self, uint8_t lane, uint32_t now_ms)
 {
     struct ace2k_feed_lane *l = &self->l[lane];
     l->searched = true;
-    /* the search's reach counts from where the load (or the read with motion) began */
+    /* The search's reach counts from where the load, or the read with motion, began. */
     int32_t left = (int32_t)self->search_um - travel_um(self, lane);
     if (left < (int32_t)ACE2K_FEED_RETURN_MIN_UM) {
         begin_return(self, lane, ACE2K_FEED_SEARCH_LENGTH, now_ms);
@@ -76,6 +92,9 @@ static void begin_search(struct ace2k_feed *self, uint8_t lane, uint32_t now_ms)
     }
     if (!load_move(self, lane, ACE2K_LANE_FORWARD, (uint32_t)left, l->speed_um_s,
                    ACE2K_FEED_SUB_SEARCH, now_ms)) {
+        /* Not reached: the lane has stopped, the reach is clamped to a move, and the speed was
+         * checked at the start.  Still, loaded is what happened.  The pull is over, the filament
+         * waits where it stopped, and search_end stays none, because no search ran. */
         loaded(self, lane, now_ms);
     }
 }
@@ -87,7 +106,7 @@ static bool should_search(const struct ace2k_feed *self, uint8_t lane,
         ace2k_feed_bit(in->tag_read, lane)) {
         return false;
     }
-    return others_idle(self, lane); /* the tag search's rule 4 */
+    return others_quiet(self, lane, false); /* a load's search: every other lane idle */
 }
 
 static void after_pull(struct ace2k_feed *self, uint8_t lane, const struct ace2k_feed_inputs *in,
@@ -101,10 +120,11 @@ static void after_pull(struct ace2k_feed *self, uint8_t lane, const struct ace2k
     loaded(self, lane, now_ms);
 }
 
-/* The search goes on for what is left of it — unless its tag was read meanwhile (during a tip
- * snag's tolerance, which holds the load's tick: back, found), or another lane was given a start
- * while it was paused or reacquiring (the tag search's rule 4): then straight back, never forward past the parking
- * point while another lane moves. */
+/* The search goes on for what is left of it.  There are two exceptions, and both go straight back.
+ * One is a tag read meanwhile, during the watch of the read with motion, which holds the load's
+ * tick.  Then the search ends as found.  The other is a start given to another lane, or another
+ * lane's motor that ran, while the search was paused or reacquiring (the tag search's rule 4).
+ * The search never goes forward past the parking point while another lane moves. */
 static void resume_search(struct ace2k_feed *self, uint8_t lane, const struct ace2k_feed_inputs *in,
                           uint32_t now_ms)
 {
@@ -112,7 +132,7 @@ static void resume_search(struct ace2k_feed *self, uint8_t lane, const struct ac
         begin_return(self, lane, ACE2K_FEED_SEARCH_FOUND, now_ms);
         return;
     }
-    if (self->l[lane].yield || !others_idle(self, lane)) {
+    if (self->l[lane].yield || !others_quiet(self, lane, true)) {
         begin_return(self, lane, ACE2K_FEED_SEARCH_YIELD, now_ms);
         return;
     }
@@ -145,9 +165,9 @@ void ace2k_feed_load_resume_after_snag(struct ace2k_feed *self, uint8_t lane,
     resume(self, lane, in, self->l[lane].sub, now_ms); /* the snag never changes sub */
 }
 
-/* Why the search ends, in resume_search's order: its tag read on this tick's inputs (during a
- * tolerance, which holds the load's tick); a yield pending (the tag search's rule 4); otherwise the obstacle, not
- * stuck. */
+/* Why the search ends, in the order of resume_search.  First its tag read on this tick's inputs,
+ * during the watch of the read with motion, which holds the load's tick.  Then a pending yield (the
+ * tag search's rule 4).  Otherwise the obstacle, not stuck. */
 static uint8_t search_end_now(const struct ace2k_feed *self, uint8_t lane)
 {
     if (ace2k_feed_bit(self->last.tag_read, lane)) {
@@ -161,6 +181,11 @@ void ace2k_feed_load_search_return(struct ace2k_feed *self, uint8_t lane, uint32
     begin_return(self, lane, search_end_now(self, lane), now_ms);
 }
 
+/* The pause has no bound of its own.  It lasts while the reader's binding holds the lane for its
+ * read session, and the session is bounded there.  The session ends after
+ * ACE2K_RFID_SESSION_IDLE_MS without a host step, and at once when the link is lost (rfid/watch.c).
+ * A stop, the link, a shutdown and a runout end the paused load here, as they end any mode.  The
+ * motor is off throughout. */
 static void pause_load(struct ace2k_feed *self, uint8_t lane, uint32_t now_ms)
 {
     struct ace2k_feed_lane *l = &self->l[lane];
@@ -171,10 +196,11 @@ static void pause_load(struct ace2k_feed *self, uint8_t lane, uint32_t now_ms)
     l->sub = ACE2K_FEED_SUB_PAUSED;
 }
 
-/* How far a reacquire may reverse: ACE2K_FEED_REACQUIRE_UM, never behind the phase's own start
- * — the load's start during the pull, the return point (the parking point, a read's start)
- * during a search — so it cannot draw the tip back past the insert sensor or out of the drive,
- * nor leave a search's strand short of where it must come back to. */
+/* How far a reacquire may reverse: ACE2K_FEED_REACQUIRE_UM, and never behind the phase's own start.
+ * That start is the start of the load during the pull, and the return point during a search.  The
+ * return point is the parking point, or the start of a read.  So a reacquire cannot draw the tip
+ * back past the insert sensor or out of the drive.  It cannot leave the filament of a search short
+ * of where it must come back to. */
 static uint32_t reacquire_um(const struct ace2k_feed *self, uint8_t lane)
 {
     const struct ace2k_feed_lane *l = &self->l[lane];
@@ -186,9 +212,9 @@ static uint32_t reacquire_um(const struct ace2k_feed *self, uint8_t lane)
     return (uint32_t)room < ACE2K_FEED_REACQUIRE_UM ? (uint32_t)room : ACE2K_FEED_REACQUIRE_UM;
 }
 
-/* Once backwards at the floor speed for a tag a stop left behind; with no room behind the
- * phase's start (under ACE2K_FEED_RETURN_MIN_UM), no reverse: the phase goes on as if the tag
- * had not been lost. */
+/* Once backwards at the floor speed, for a tag that a stop left behind.  With no room behind the
+ * start of the phase, under ACE2K_FEED_RETURN_MIN_UM, there is no reverse.  The phase goes on as if
+ * the tag had not been lost. */
 static void reacquire(struct ace2k_feed *self, uint8_t lane, const struct ace2k_feed_inputs *in,
                       uint32_t now_ms)
 {
@@ -205,8 +231,11 @@ static void reacquire(struct ace2k_feed *self, uint8_t lane, const struct ace2k_
     }
 }
 
-/* The session released the lane: the tag read in the search → back; lost → once backwards;
- * otherwise (read in the pull, given up) the phase goes on; a search asked to yield returns. */
+/* The session released the lane.
+ * - The tag was read in the search: go back.
+ * - The tag was lost: go backwards once.
+ * - Otherwise, read in the pull or given up: the phase goes on.
+ * A search asked to yield returns. */
 static void on_released(struct ace2k_feed *self, uint8_t lane, const struct ace2k_feed_inputs *in,
                         uint32_t now_ms)
 {
@@ -235,14 +264,16 @@ static void on_moving(struct ace2k_feed *self, uint8_t lane, const struct ace2k_
     if (l->sub != ACE2K_FEED_SUB_SEARCH) {
         return;
     }
-    /* this lane's full is the tip snag's (feed_snag.c, after this step on the tick): its
-     * tolerance, or the obstacle return where it would be stuck */
+    /* This lane's full belongs to the tip snag, in feed_snag.c, after this step on the tick.  For a
+     * load from the bay, that is the free phase.  A lag gives the obstacle return, and a yield or a
+     * pause runs here through the phase.  For the read with motion, it is the watch, which holds
+     * this tick until it ends. */
     if (l->yield) {
         begin_return(self, lane, ACE2K_FEED_SEARCH_YIELD, now_ms);
     }
 }
 
-/* The settle — the hand is still pushing — then the pull to the parking point. */
+/* The settle, while the hand is still pushing, then the pull to the parking point. */
 static void load_settle(struct ace2k_feed *self, uint8_t lane, uint32_t now_ms)
 {
     const struct ace2k_feed_lane *l = &self->l[lane];
@@ -251,8 +282,9 @@ static void load_settle(struct ace2k_feed *self, uint8_t lane, uint32_t now_ms)
     }
     if (!load_move(self, lane, ACE2K_LANE_FORWARD, l->length_um, l->speed_um_s,
                    ACE2K_FEED_SUB_MOVING, now_ms)) {
-        /* not reached: the lane was idle through the settle and the bounds were checked at the
-         * start; still, a load that cannot pull ends, it does not hang */
+        /* Not reached: the lane was idle through the settle, and the bounds were checked at the
+         * start.  Still, a load that cannot pull ends, and does not hang.  It ends the way a stop
+         * during the settle ends it: stopped, with nothing moved. */
         ace2k_feed_finish(self, lane, ACE2K_FEED_STOPPED, now_ms);
     }
 }
@@ -261,7 +293,11 @@ void ace2k_feed_load_tick(struct ace2k_feed *self, uint8_t lane, const struct ac
                           uint32_t now_ms)
 {
     if (ace2k_feed_snag_active(self, lane)) {
-        return; /* the tolerance owns the lane's moves; a read session waits for it */
+        /* The watch, touch or wait of the read with motion owns the moves of the lane, so a read
+         * session waits for it.  The free phase of a load from the bay only judges, and never holds
+         * this tick.  A pause for a read session and a yield run through it, and end it
+         * (feed_snag.c). */
+        return;
     }
     switch (self->l[lane].sub) {
     case ACE2K_FEED_SUB_SETTLE:
@@ -329,15 +365,23 @@ static void reset_load(struct ace2k_feed_lane *l, uint32_t return_um)
     l->resume_sub = ACE2K_FEED_SUB_NONE;
 }
 
-/* A grip set takes this load: the pull is grip_um and nothing follows
- * it.  A host's load never finds one — its start cleared it first (feed_start.c). */
+/* The grip slot holds a pull length, not one of its reserved values (feed.h). */
+static bool grip_is_length(uint32_t grip_um)
+{
+    return (bool)(grip_um != 0 && grip_um != ACE2K_FEED_GRIP_PARK &&
+                  grip_um != ACE2K_FEED_GRIP_WAIT);
+}
+
+/* A grip that is set takes this load.  The pull is grip_um, and nothing follows it.  The park keeps
+ * the parking distance and drops only the search.  A load that the host starts never finds either
+ * one, because its start cleared it first (feed_start.c). */
 void ace2k_feed_begin_load(struct ace2k_feed *self, uint8_t lane, uint32_t park_um,
                            uint32_t speed_um_s, uint8_t seq, uint32_t now_ms)
 {
     struct ace2k_feed_lane *l = &self->l[lane];
     uint32_t grip_um = self->grip_um[lane];
     self->grip_um[lane] = 0;
-    if (grip_um != 0) {
+    if (grip_is_length(grip_um)) {
         park_um = grip_um;
     }
     ace2k_feed_enter(self, lane, ACE2K_FEED_LOADING, seq, now_ms);
@@ -345,17 +389,51 @@ void ace2k_feed_begin_load(struct ace2k_feed *self, uint8_t lane, uint32_t park_
     l->length_um = park_um;
     l->speed_um_s = speed_um_s;
     reset_load(l, park_um);
-    l->gripped = grip_um != 0;
+    l->gripped = (bool)(grip_is_length(grip_um) || grip_um == ACE2K_FEED_GRIP_PARK);
+    l->grace = true; /* the hand and the pinch catching the filament are not a slip */
+    /* The filament comes from the bay with nothing ahead of it.  So its pull and its search take
+     * the free rule (feed_snag.c).  The read with motion never comes here.  Its filament may sit in
+     * an extruder, and it keeps the watch. */
+    l->free_tip = true;
 }
 
 int ace2k_feed_grip_set(struct ace2k_feed *self, uint8_t lane, uint32_t grip_um)
 {
     if (lane >= ACE2K_LANE_COUNT ||
-        (grip_um != 0 && (grip_um < ACE2K_FEED_GRIP_UM_MIN || grip_um > ACE2K_FEED_GRIP_UM_MAX))) {
+        (grip_um != 0 &&
+         !ace2k_within_u32(grip_um, ACE2K_FEED_GRIP_UM_MIN, ACE2K_FEED_GRIP_UM_MAX))) {
         return -ACE2K_EINVAL;
     }
     self->grip_um[lane] = grip_um;
     return 0;
+}
+
+/* Puts one of the grip slot's reserved values on a lane: the park or the wait. */
+static int slot_set(struct ace2k_feed *self, uint8_t lane, uint32_t value)
+{
+    if (lane >= ACE2K_LANE_COUNT) {
+        return -ACE2K_EINVAL;
+    }
+    self->grip_um[lane] = value;
+    return 0;
+}
+
+int ace2k_feed_park_set(struct ace2k_feed *self, uint8_t lane)
+{
+    return slot_set(self, lane, ACE2K_FEED_GRIP_PARK);
+}
+
+int ace2k_feed_wait_set(struct ace2k_feed *self, uint8_t lane)
+{
+    return slot_set(self, lane, ACE2K_FEED_GRIP_WAIT);
+}
+
+/* The bounds of a load, for the command and for the settings alike: a parking distance that the
+ * lane can move in one move, and a pull speed within the lane's bounds. */
+static bool load_in_bounds(uint32_t park_um, uint32_t speed_um_s)
+{
+    return (bool)(park_um != 0 && park_um <= ACE2K_LANE_MOVE_MAX_UM &&
+                  ace2k_lane_speed_in_bounds(speed_um_s));
 }
 
 enum ace2k_feed_refusal ace2k_feed_load_start(struct ace2k_feed *self, uint8_t lane,
@@ -364,46 +442,75 @@ enum ace2k_feed_refusal ace2k_feed_load_start(struct ace2k_feed *self, uint8_t l
 {
     uint32_t park_um = length_um != 0 ? length_um : self->load.park_um;
     uint32_t pull_um_s = speed_um_s != 0 ? speed_um_s : self->load.speed_um_s;
-    if (park_um == 0 || park_um > ACE2K_LANE_MOVE_MAX_UM ||
-        !ace2k_lane_speed_in_bounds(pull_um_s)) {
+    if (!load_in_bounds(park_um, pull_um_s)) {
         return ACE2K_FEED_REFUSED_BOUNDS;
     }
     ace2k_feed_begin_load(self, lane, park_um, pull_um_s, seq, now_ms);
     return ACE2K_FEED_ACCEPTED;
 }
 
-void ace2k_feed_search_set(struct ace2k_feed *self, uint32_t search_um)
+int ace2k_feed_load_set(struct ace2k_feed *self, const struct ace2k_feed_load_cfg *cfg)
 {
-    self->search_um = search_um;
+    if (!load_in_bounds(cfg->park_um, cfg->speed_um_s)) {
+        return -ACE2K_EINVAL;
+    }
+    self->load = *cfg;
+    return 0;
 }
 
-enum ace2k_feed_refusal ace2k_feed_search_start(struct ace2k_feed *self, uint8_t lane,
+int ace2k_feed_search_set(struct ace2k_feed *self, uint32_t search_um)
+{
+    if (search_um > ACE2K_FEED_SEARCH_MAX_UM) {
+        return -ACE2K_EINVAL;
+    }
+    self->search_um = search_um;
+    return 0;
+}
+
+bool ace2k_feed_search_retry(const struct ace2k_feed *self, uint8_t lane, uint8_t seq,
+                             uint32_t now_ms)
+{
+    if (lane >= ACE2K_LANE_COUNT || seq == 0 || seq != self->l[lane].search_seq) {
+        return false;
+    }
+    const struct ace2k_feed_lane *l = &self->l[lane];
+    if (l->search_on) {
+        return true; /* the search that read started still runs */
+    }
+    return ace2k_time_since(now_ms, l->search_end_ms) <= ACE2K_FEED_RETRY_WINDOW_MS;
+}
+
+enum ace2k_feed_refusal ace2k_feed_search_start(struct ace2k_feed *self, uint8_t lane, uint8_t seq,
                                                 uint32_t now_ms)
 {
-    if (self->shut_down || lane >= ACE2K_LANE_COUNT || !self->last.link_ok) {
+    if (self->shut_down) {
         return lane >= ACE2K_LANE_COUNT ? ACE2K_FEED_REFUSED_BOUNDS : ACE2K_FEED_REFUSED_NO_LINK;
     }
-    if (self->l[lane].mode == ACE2K_FEED_ERROR) {
-        return ACE2K_FEED_REFUSED_IN_ERROR;
+    /* The refusals of every start, a load's among them: the search needs filament at the bay. */
+    const enum ace2k_feed_refusal verdict =
+        ace2k_feed_start_refusal(self, lane, ACE2K_FEED_CMD_LOAD);
+    if (verdict != ACE2K_FEED_ACCEPTED) {
+        return verdict;
     }
-    if (self->l[lane].mode != ACE2K_FEED_IDLE || ace2k_lane_is_moving(self->lane, lane)) {
-        return ACE2K_FEED_REFUSED_BUSY;
-    }
-    if (!ace2k_feed_bit(self->last.insert, lane)) {
-        return ACE2K_FEED_REFUSED_NO_FILAMENT;
-    }
-    if (!others_idle(self, lane)) {
+    if (!others_quiet(self, lane, true)) {
         return ACE2K_FEED_REFUSED_OTHER_LANE;
     }
     if (self->search_um == 0) {
         return ACE2K_FEED_REFUSED_BOUNDS;
     }
     self->grip_um[lane] = 0; /* a host start */
+    /* free_tip stays false, as the entry left it.  The filament may sit in an extruder, where a
+     * filament that follows the motor proves nothing.  So the search keeps the tip snag's watch. */
     ace2k_feed_enter(self, lane, ACE2K_FEED_LOADING, 0, now_ms);
     self->l[lane].length_um = 0;
     self->l[lane].speed_um_s = self->load.speed_um_s;
     reset_load(&self->l[lane], 0);
     begin_search(self, lane, now_ms);
+    /* The key after the search began: a search with nothing left to run ended it already. */
+    if (self->l[lane].mode == ACE2K_FEED_LOADING) {
+        self->l[lane].search_seq = seq;
+        self->l[lane].search_on = seq != 0;
+    }
     return ACE2K_FEED_ACCEPTED;
 }
 

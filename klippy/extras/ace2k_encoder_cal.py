@@ -1,77 +1,197 @@
-"""The automatic encoder calibration: a lane's encoder scale
-read off the lane's extruder.
+"""Calibrates the encoder of a lane automatically, using the extruder of the lane as the reference.
 
-The follow feeds the filament; the extruder pulls the plunger from rest back to taut at the
-extrusion's speed, so a taut is a sharp, repeatable plunger position, and between two of them
-the filament through the encoder is exactly what the extruder took.  A mark is an increment of the
-unit's taut count (ace2k_feed_ff_state) — the switch itself closes for less than a report — at
-which the encoder, still since the burst before, and the extruder's position are paired; a
-least-squares line through the marks gives the scale: the scale in use over its slope.
+The follow feeds the filament. The extruder pulls the plunger from rest back to taut, at the speed
+of the extrusion. A taut is a sharp and repeatable plunger position. Between two of them, the
+filament that passes the encoder is exactly what the extruder took.
 
-``ACE_CALIBRATE_ENCODER LANE=n AUTO=1 [LENGTH=500] [SPEED=4]`` runs it.  Refused, each with its
-reason and before anything is sent: an image without the feed-forward, a print printing or
-paused, the lane without an extruder, that extruder not the active one or too cold to extrude,
-the lane without filament, in error or busy in a mode other than idle and the follow, a run already
-going.  The run arms the follow if the lane is idle (at assist_speed, as ACE_ASSIST DIR=BOTH),
-holds the lane's feed-forward (the follow alone feeds), raises both reports to 10 Hz, and
-extrudes LENGTH in 25 mm chunks under SAVE_GCODE_STATE / RESTORE_GCODE_STATE — only the extruder
-moves — each chunk queued once the last has run, so an abort (a full: the shared switch, or the
-lane's own full count rising; the lane in error or out of the follow; an epoch change; a
-shutdown) lets the running chunk end and queues no other.  Every ending releases the hold, puts
-the reports back at their own rates, stops the follow only if the run armed it and restores the
-G-code state — after a shutdown, nothing is sent and no G-code run: Klipper refuses it then, and
-the state does not outlive the restart.  Then the marks are judged, and the scale applied — in
-use at once, staged for SAVE_CONFIG — or refused, with "nothing changed"."""
+A mark pairs two readings. It is made at each increase of the taut count of the unit
+(``ace2k_feed_ff_state``). The switch itself closes for less than one report, so the count is
+used. The mark pairs the encoder reading with the position of the extruder. The encoder must
+have been still since the burst before: the last two readings before the mark are equal.
+A least-squares line through the marks gives the slope. The new scale is the scale in use
+divided by that slope.
+
+``ACEK_CALIBRATE_ENCODER LANE=n AUTO=1 [LENGTH=500] [SPEED=4]`` runs it.
+
+Before anything is sent, the command refuses to run, and gives the reason, in these cases.
+- The firmware image has no feed-forward.
+- A print is printing or paused.
+- The lane has no extruder.
+- That extruder is not the active one, or it is too cold to extrude.
+- The lane has no filament, is in error, or is busy in a mode other than idle and the follow.
+- A run is already going.
+
+A run does these steps.
+1. It arms the follow if the lane is idle, at ``assist_speed`` as ``ACEK_ASSIST DIR=BOTH`` does.
+2. It holds the feed-forward of the lane, so the follow alone feeds.
+3. It raises both reports to 10 Hz.
+4. It extrudes LENGTH in chunks of 25 mm, between SAVE_GCODE_STATE and RESTORE_GCODE_STATE. Only
+   the extruder moves.
+
+Each chunk is queued after the last one has run. So an abort lets the running chunk end and queues
+no other. These conditions abort the run.
+- A full: the shared switch is set, or the full count of the lane rises.
+- The lane is in error or out of the follow.
+- An epoch change.
+- A shutdown.
+
+Every ending does these things.
+- It releases the hold.
+- It puts the reports back at their own rates.
+- It stops the follow, but only if the run armed it.
+- It restores the G-code state. After a shutdown it sends nothing and runs no G-code, because
+  Klipper refuses G-code then, and the state does not outlive the restart.
+
+Then the marks are judged. The scale is either applied or refused. An applied scale is in use at
+once and staged for SAVE_CONFIG. A refusal says "nothing changed".
+"""
+
+from __future__ import annotations
 
 import collections
 import math
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, Union
 
-COUNT_MASK = 0xFFFF  # the unit's taut count is uint16
-MIN_MARKS = 10  # fewer, and the line rests on too little travel to defend 0.1 %
-MAX_SCATTER_MM = 1.0  # RMS off the line above this: the filament slipped somewhere
-# a larger change is applied, with a warning: an extruder off its own calibration
+try:
+    from .ace2k_link import LANE_REPORT_S, FeedRefused
+except ImportError:  # the host tests put klippy/extras on the path and import by bare name
+    from ace2k_link import LANE_REPORT_S, FeedRefused  # type: ignore[import-not-found, no-redef]
+
+if TYPE_CHECKING:
+    from .ace2k_feed_proto import Move
+    from .ace2k_klipper_types import (
+        MCU,
+        Extruder,
+        GCode,
+        GCodeCommand,
+        LaneStatus,
+        Printer,
+        PrintStats,
+        ToolHead,
+    )
+
+    class FeedForwardProto(Protocol):
+        """The feed-forward (``ace2k_ff.FeedForward``), as the run holds the dosing of a lane."""
+
+        def hold(self, lane: int, held: bool) -> None: ...
+        def extruder_of(self, lane: int) -> str | None: ...
+
+    class UnitProto(Protocol):
+        """The unit (``ace2k.Ace2k``), as the run raises its lane counters and reads the switch."""
+
+        @property
+        def pulled_any(self) -> bool | None: ...
+        def set_counters_period(self, seconds: float) -> None: ...
+
+    class FeedProto(Protocol):
+        """The feed (``ace2k_feed.Ace2kFeed``) that the calibration runs on."""
+
+        @property
+        def lanes(self) -> list[LaneStatus]: ...
+        @property
+        def ff(self) -> FeedForwardProto: ...
+        @property
+        def unit(self) -> UnitProto: ...
+        @property
+        def has_ff(self) -> bool: ...
+        @property
+        def scale_low(self) -> float: ...
+        @property
+        def scale_high(self) -> float: ...
+        @property
+        def assist_speed_mm_s(self) -> float: ...
+        @property
+        def report_period_ms(self) -> int: ...
+        def lane_unavailable(
+            self, index: int, allow: tuple[str, ...] | None = ("idle",)
+        ) -> str | None: ...
+        def not_active_text(self, index: int) -> str | None: ...
+        def start_follow_as(self, owner: str, lane_index: int, speed_mm_s: float) -> Move: ...
+        def start_move(
+            self,
+            lane_index: int,
+            mode: str,
+            length_mm: float,
+            speed_mm_s: float,
+            free_tip: bool = False,
+        ) -> Move: ...
+        def stop(self, lane_index: int, by: str = "host") -> None: ...
+        def apply_scale(self, index: int, scale: float) -> None: ...
+        def set_counts_period(self, seconds: float) -> None: ...
+
+
+# A frame that the serial thread queues for a run. It is either a reading of the lane counters
+# (receive time, encoder mm) or a counters frame (receive time, taut count of the lane, epoch).
+Frame = Union[tuple[Literal["reading"], float, float], tuple[Literal["counts"], float, int, int]]
+Point = tuple[float, float]  # (x, y); a mark is (extruder mm, encoder mm)
+
+COUNT_MASK = 0xFFFF  # the taut count of the unit is a uint16
+MIN_MARKS = 10  # with fewer marks, the line rests on too little travel to defend 0.1 %
+MAX_SCATTER_MM = 1.0  # an RMS distance from the line above this means the filament slipped
+# A larger change is applied with a warning. The extruder may be off its own calibration.
 WARN_CHANGE = 0.03
-CHUNK_MM = 25.0  # the extrusion's step: an abort stops at the end of the running one
-LENGTH_MM = (500.0, 200.0, 2000.0)  # default, least, most
+CHUNK_MM = 25.0  # the step of the extrusion; an abort stops at the end of the running chunk
+LENGTH_MM = (500.0, 200.0, 2000.0)  # default, minimum, maximum
 SPEED_MM_S = 4.0
-REPORT_S = 0.1  # the feed-forward counters and the lane counters at 10 Hz for the run
-# the lane counters' period between runs: ace2k.LANE_REPORT_S, which this module cannot import
-# (ace2k loads ace2k_feed, which loads this one); a test holds the two equal
-LANE_REPORT_S = 1.0
-POLL_S = 0.25  # the frames turned into marks this often: the extruder's history is short
-# The follow's arm is seen in the state report within this at least, or within two of the
-# report's periods and ARM_WAIT_MARGIN_S at a slower feed_report_hz: one report may be lost
+REPORT_S = 0.1  # period of the feed-forward counters and the lane counters (10 Hz) during the run
+POLL_S = 0.25  # how often the frames become marks; the history of the extruder is short
+# The state report must show the arm of the follow within this time. At a slower feed_report_hz,
+# the time is two periods of the report plus ARM_WAIT_MARGIN_S, because one report may be lost.
 ARM_WAIT_S = 3.0
 ARM_WAIT_MARGIN_S = 0.5
-GCODE_STATE = "ACE2K_ENCODER_CAL"  # the SAVE_GCODE_STATE name around the run
-SHUTDOWN = "Klipper shut down"  # the abort's reason
-FULL = "the buffer went full"  # the abort's reason
+GCODE_STATE = "ACE2K_ENCODER_CAL"  # the name for SAVE_GCODE_STATE around the run
+SHUTDOWN = "Klipper shut down"  # reason for an abort
+FULL = "the buffer went full"  # reason for an abort
+STILL_READINGS = 2  # for a still encoder, the last two readings before a mark are equal
+
+
+class Verdict(TypedDict, total=False):
+    """The verdict that ``judge`` gives on the marks of a run.
+
+    The docstring of ``judge`` says which keys are present, and when.
+    The keys are read by name, which vulture does not see. The noqa on a key says so.
+    """
+
+    n: int
+    refusal: str | None  # noqa: V107
+    warn: bool  # noqa: V107
+    scatter: float  # noqa: V107
+    span_e: float  # noqa: V107
+    span_enc: float  # noqa: V107
+    new: float
+    change: float
 
 
 class EpochChanged(Exception):  # noqa: N818 — a condition of the run, not an error class
-    """The lane re-entered a mode during the run: its counters restarted."""
+    """Raised when the lane re-entered a mode during the run, so its counters restarted."""
 
 
 class MarkTracker:
-    """The run's frames, in arrival order, turned into marks.  reading(pt, encoder_mm): a lane
-    counters reading; counts(pt, taut, epoch): a counters frame with the lane's taut count and
-    epoch — returns the mark the frame closes, (instant, encoder_mm), or None."""
+    """Turns the frames of a run, in the order they arrive, into marks.
 
-    def __init__(self):
-        self.readings = []  # (pt, encoder_mm) since the frame the last episode was seen in
-        self.prev = None  # (pt, taut, epoch) of the last counters frame
-        # the frame the last episode was seen in: older readings may predate its burst
-        self.after = None
-        self.episodes = 0  # taut episodes seen in the run
+    ``reading(pt, encoder_mm)`` takes a reading of the lane counters.
+    ``counts(pt, taut, epoch)`` takes a counters frame with the taut count and the epoch of the
+    lane. It returns the mark that the frame closes, as (instant, encoder_mm), or None.
+    """
+
+    def __init__(self) -> None:
+        # (pt, encoder_mm), since the frame in which the last episode was seen
+        self.readings: list[Point] = []
+        self.prev: tuple[float, int, int] | None = None  # (pt, taut, epoch) of the last frame
+        # The frame in which the last episode was seen. Older readings may predate its burst.
+        self.after: float | None = None
+        self.episodes = 0  # taut episodes seen during the run
         self.dropped = 0  # marks dropped: two increments in one interval, or no still reading
 
-    def reading(self, pt, encoder_mm):
+    def reading(self, pt: float, encoder_mm: float) -> None:
         self.readings.append((pt, encoder_mm))
 
-    def counts(self, pt, taut, epoch):
+    def counts(self, pt: float, taut: int, epoch: int) -> Point | None:
         prev, self.prev = self.prev, (pt, taut, epoch)
         if prev is None:
-            return None  # the baseline
+            return None  # this frame is the baseline
         if epoch != prev[2]:
             raise EpochChanged()
         step = (taut - prev[1]) & COUNT_MASK
@@ -83,25 +203,31 @@ class MarkTracker:
         self.after = pt
         self.readings = [r for r in self.readings if r[0] > pt]
         if self.episodes == step:
-            self.dropped += step - 1  # any others in its interval are marks dropped
-            return None  # the run's first episode: where the plunger started is unknown
+            self.dropped += step - 1  # any other episodes in its interval are dropped marks
+            return None  # first episode of the run: the start position of the plunger is unknown
         if step > 1 or encoder is None:
             self.dropped += step
             return None
         return ((lo + pt) / 2.0, encoder)
 
-    def _still_before(self, lo, after):
-        """The last reading before lo, equal to the one before it, both after `after`."""
+    def _still_before(self, lo: float, after: float | None) -> float | None:
+        """Return the last reading before `lo`, if it equals the one before it.
+
+        Both readings must be after `after`. Otherwise return None.
+        """
         before = [r for r in self.readings if r[0] < lo and (after is None or r[0] > after)]
-        if len(before) < 2:
+        if len(before) < STILL_READINGS:
             return None
         (_, a), (_, b) = before[-2], before[-1]
         return b if a == b else None
 
 
-def fit_line(points):
-    """Least squares of y on x over [(x, y)]: (slope, intercept, RMS of the residuals).  Needs at
-    least two points with distinct x: with every x equal there is no line, and the slope is 0."""
+def fit_line(points: Sequence[Point]) -> tuple[float, float, float]:
+    """Fit a least-squares line of y on x through the points (x, y).
+
+    Return the slope, the intercept and the RMS of the residuals. The fit needs at least two points
+    with different x. If every x is equal there is no line, and the slope is 0.
+    """
     n = len(points)
     mx = sum(x for x, _ in points) / n
     my = sum(y for _, y in points) / n
@@ -114,17 +240,30 @@ def fit_line(points):
     return slope, icpt, rms
 
 
-def judge(marks, scale, low, high, dropped=None):
-    """The verdict on a run's marks [(extruder_mm, encoder_mm)] for a lane at `scale` (mm per
-    count), the unit's window low..high: a dict — n, refusal (None when it may be applied) and
-    warn; with enough marks for a line also scatter, span_e and span_enc; and new and change
-    unless the slope is 0 or below (refused: the encoder did not follow).  Each check is made on
-    the value as it is shown and sent, so no line can contradict the verdict: new to 4 decimals
-    (staged so, sent in 0.1 µm/count), the change from that new and to 0.01 %, the scatter to
-    0.01 mm.  dropped, when given (MarkTracker.dropped), is named in the too-few refusal: many
-    taut episodes with their marks dropped point at the encoder, not at the extruder."""
+def judge(
+    marks: Sequence[Point], scale: float, low: float, high: float, dropped: int | None = None
+) -> Verdict:
+    """Judge the marks of a run and return a verdict.
+
+    `marks` are pairs (extruder_mm, encoder_mm) for a lane at `scale` (mm per count). The window
+    `low` to `high` is the range of scales that the unit accepts.
+
+    The verdict is a dict with these keys.
+    - ``n``, ``refusal`` and ``warn``. ``refusal`` is None when the scale may be applied.
+    - ``scatter``, ``span_e`` and ``span_enc``, if there are enough marks for a line.
+    - ``new`` and ``change``, unless the slope is 0 or below. Then the encoder did not follow,
+      and the run is refused.
+
+    Each check uses the value as it is shown and sent, so no printed line can contradict the
+    verdict. ``new`` is rounded to 4 decimals. It is staged so, and sent in units of 0.1 µm per
+    count. ``change`` is computed from that ``new`` and rounded to 0.01 %. The scatter is rounded
+    to 0.01 mm.
+
+    `dropped` is optional (``MarkTracker.dropped``). The refusal for too few marks names it. Many
+    taut episodes with dropped marks point at the encoder, not at the extruder.
+    """
     n = len(marks)
-    verdict = dict(n=n, refusal=None, warn=False)
+    verdict = Verdict(n=n, refusal=None, warn=False)
     if n < MIN_MARKS:
         noun = "mark" if n == 1 else "marks"
         lost = "" if dropped is None else f" ({dropped} dropped)"
@@ -135,16 +274,19 @@ def judge(marks, scale, low, high, dropped=None):
         return verdict
     slope, _icpt, rms = fit_line(marks)
     verdict.update(
-        scatter=rms,
-        span_e=marks[-1][0] - marks[0][0],
-        span_enc=marks[-1][1] - marks[0][1],
+        {
+            "scatter": rms,
+            "span_e": marks[-1][0] - marks[0][0],
+            "span_enc": marks[-1][1] - marks[0][1],
+        }
     )
     if slope <= 0.0:
         verdict["refusal"] = "the encoder did not follow the extruder"
         return verdict
-    new = round(scale / slope, 4)  # the scale as staged and sent
-    verdict.update(new=new, change=new / scale - 1.0)
-    shown = round(rms, 2)  # a refusal never reads 1.00 mm
+    new = round(scale / slope, 4)  # the scale as it is staged and sent
+    change = new / scale - 1.0
+    verdict.update({"new": new, "change": change})
+    shown = round(rms, 2)  # so a refusal never reads 1.00 mm
     if shown > MAX_SCATTER_MM:
         verdict["refusal"] = (
             f"scatter {shown:.2f} mm, more than {MAX_SCATTER_MM:g} mm: the filament slipped"
@@ -153,90 +295,119 @@ def judge(marks, scale, low, high, dropped=None):
         verdict["refusal"] = (
             f"{new:.4f} mm/count is outside the unit's window {low:.4f}..{high:.4f}"
         )
-    else:  # a change shown as +3.00 % never carries the warning
-        verdict["warn"] = abs(round(verdict["change"] * 100.0, 2)) > WARN_CHANGE * 100.0
+    else:
+        # A change that shows as +3.00 % never carries the warning.
+        verdict["warn"] = abs(round(change * 100.0, 2)) > WARN_CHANGE * 100.0
     return verdict
 
 
 class _Sink:
-    """What the serial thread collects for one run: the lane, the run's frames, and the lane's
-    full count — the (epoch, count) of the run's first counters frame, and whether a later frame
-    of that epoch carried another: a full the follow took up during the run.  The baseline is the
-    run's first frame, not the status at its start: a run that armed the follow restarted the
-    unit's counters, and the status may still show the session before."""
+    """What the serial thread collects for one run.
+
+    It holds the lane, the frames of the run and the full count of the lane. The full count is
+    the pair (epoch, count) of the first counters frame of the run. ``full_seen`` says whether a
+    later frame of that epoch carried another count, which means the follow took up a full during
+    the run.
+
+    The baseline is the first frame of the run, not the status at its start. A run that armed the
+    follow restarted the counters of the unit, and the status may still show the session before.
+    """
 
     __slots__ = ("lane", "frames", "full", "full_seen")
 
-    def __init__(self, lane, frames):
+    def __init__(self, lane: int, frames: collections.deque[Frame]) -> None:
         self.lane = lane
         self.frames = frames
-        self.full = None
+        self.full: tuple[int, int] | None = None
         self.full_seen = False
 
-    def note_full(self, epoch, count):
-        """A counters frame's full count.  Within the baseline's epoch only: a count that a new
-        epoch restarted is the re-entry the tracker aborts on, not a full."""
+    def note_full(self, epoch: int, count: int) -> None:
+        """Note the full count of a counters frame.
+
+        Only counts in the epoch of the baseline matter. A count that a new epoch restarted is the
+        re-entry on which the tracker aborts. It is not a full.
+        """
         if self.full is None:
             self.full = (epoch, count)
         elif epoch == self.full[0] and count != self.full[1]:
             self.full_seen = True
 
 
-class EncoderCalibration:
-    """ACE_CALIBRATE_ENCODER AUTO=1.  The frames reach it on the serial thread while a run
-    holds a lane; run() drives the run on the reactor."""
+@dataclass
+class _Run:
+    """What the polls of one run work on.
 
-    def __init__(self, printer, feed):
+    It holds the sink, the extruder that the marks are read off, the tracker that turns frames
+    into marks, and the marks so far.
+    """
+
+    sink: _Sink
+    extruder: Extruder
+    tracker: MarkTracker
+    marks: list[Point]
+
+
+class EncoderCalibration:
+    """Implements ``ACEK_CALIBRATE_ENCODER AUTO=1``.
+
+    The frames reach it on the serial thread while a run holds a lane. ``run()`` drives the run on
+    the reactor.
+    """
+
+    def __init__(self, printer: Printer, feed: FeedProto) -> None:
         self.printer = printer
         self.feed = feed
         self.reactor = printer.get_reactor()
-        self.frames = collections.deque()  # ("counts", rt, taut, epoch) / ("reading", rt, mm)
-        # the run's _Sink while a run holds a lane, None between runs: one attribute, so the
-        # serial thread reads the lane and its run's frames in one go.  Each run collects into a
-        # sink and a deque of its own, so a frame read under one run lands in that run's, never
-        # in the next one's.
-        self._sink = None
+        # The frames are ("counts", rt, taut, epoch) or ("reading", rt, mm).
+        self.frames: collections.deque[Frame] = collections.deque()
+        # The _Sink of the run while a run holds a lane, and None between runs. It is one
+        # attribute, so the serial thread reads the lane and the frames of its run in one go.
+        # Each run collects into its own sink and its own deque. So a frame read during one run
+        # goes to that run, never to the next one.
+        self._sink: _Sink | None = None
 
     @property
-    def lane(self):
-        """The lane a run holds; None between runs."""
+    def lane(self) -> int | None:
+        """The lane that a run holds, or None between runs."""
         sink = self._sink
         return None if sink is None else sink.lane
 
     @lane.setter
-    def lane(self, lane):
+    def lane(self, lane: int | None) -> None:
         self._sink = None if lane is None else _Sink(lane, self.frames)
 
-    def on_ff_state(self, receive_time, taut, epoch):
+    def on_ff_state(self, receive_time: float, taut: Sequence[int], epoch: Sequence[int]) -> None:
         sink = self._sink
         if sink is not None:
             lane = sink.lane
-            # the lane's full count of this same frame (ace2k_feed stores the counters first),
-            # noted before the frame is queued: once queued, a poll may drain it at any moment
+            # Note the full count of the lane for this same frame (ace2k_feed stores the counters
+            # first) before the frame is queued. Once it is queued, a poll may drain it at any
+            # moment.
             sink.note_full(epoch[lane], self.feed.lanes[lane]["ff_full_fixes"])
             sink.frames.append(("counts", receive_time, taut[lane], epoch[lane]))
 
-    def on_counters(self, receive_time, encoder_um):
+    def on_counters(self, receive_time: float, encoder_um: Sequence[int]) -> None:
         sink = self._sink
         if sink is not None:
             sink.frames.append(("reading", receive_time, encoder_um[sink.lane] / 1000.0))
 
-    # --- the run (the reactor) -----------------------------------------------------------
+    # --- the run (on the reactor) -----------------------------------------------------------
 
-    def run(self, gcmd, index):
-        """ACE_CALIBRATE_ENCODER LANE=n AUTO=1 [LENGTH=] [SPEED=] on lane index (0..3)."""
+    def run(self, gcmd: GCodeCommand, index: int) -> None:
+        """Run ``ACEK_CALIBRATE_ENCODER AUTO=1`` (with LENGTH and SPEED) on lane `index`, 0 to 3."""
         default, least, most = LENGTH_MM
         length = gcmd.get_float("LENGTH", default, minval=least, maxval=most)
         speed = gcmd.get_float("SPEED", SPEED_MM_S, above=0.0)
         extruder = self._check(gcmd, index)
         n = index + 1
-        scale = self.feed.lanes[index]["encoder_scale"]  # the readings' scale, the whole run
+        # The scale of the readings, for the whole run.
+        scale = self.feed.lanes[index]["encoder_scale"]
         gcmd.respond_info(
             f"ace2k: lane {n}: calibrating against {extruder.get_name()} — {length:g} mm at"
             f" {speed:g} mm/s"
         )
         tracker = MarkTracker()
-        marks = []
+        marks: list[Point] = []
         reason = None
         armed = held = listening = False
         try:
@@ -245,16 +416,17 @@ class EncoderCalibration:
                 armed = True
                 self._wait_following(gcmd, index)
             if self.printer.is_shutdown():
-                reason = SHUTDOWN  # during the arm's wait: nothing more goes out
+                reason = SHUTDOWN  # during the wait for the arm, so nothing more goes out
             else:
                 held = True
                 self.feed.ff.hold(index, True)
                 listening = True
-                sink = self._listen(index)
-                reason = self._extrude(sink, extruder, length, speed, tracker, marks)
+                run = _Run(self._listen(index), extruder, tracker, marks)
+                reason = self._extrude(run, length, speed)
         finally:
-            # every ending, before any verdict — a scale goes out with the reports back at their
-            # own rates and the follow as the user had it; nothing is sent after a shutdown
+            # Every ending does this before any verdict. A scale then goes out with the reports back
+            # at their own rates and the follow as the user had it. Nothing is sent after a
+            # shutdown.
             if listening:
                 self._unlisten()
             if held:
@@ -283,9 +455,12 @@ class EncoderCalibration:
                 " extruder's own calibration too"
             )
 
-    def _check(self, gcmd, index):
-        """The extruder to calibrate against, or a G-code error naming what stands in the way —
-        before anything is sent."""
+    def _check(self, gcmd: GCodeCommand, index: int) -> Extruder:
+        """Return the extruder to calibrate against.
+
+        If something stands in the way, raise a G-code error that names it. This happens before
+        anything is sent.
+        """
         n = index + 1
         if self.lane is not None:
             raise gcmd.error("ace2k: a calibration is already running")
@@ -293,7 +468,7 @@ class EncoderCalibration:
             raise gcmd.error(
                 "ace2k: the unit's firmware has no feed-forward (its taut count); flash v0.9.0"
             )
-        stats = self.printer.lookup_object("print_stats", None)
+        stats: PrintStats | None = self.printer.lookup_object("print_stats", None)
         if stats is not None:
             state = stats.get_status(self.reactor.monotonic()).get("state")
             if state in ("printing", "paused"):
@@ -301,34 +476,45 @@ class EncoderCalibration:
         name = self.feed.ff.extruder_of(index)
         if not name:
             raise gcmd.error(f"ace2k: lane {n} has no extruder (lane{n}_extruder)")
-        extruder = self.printer.lookup_object(name, None)
+        extruder: Extruder | None = self.printer.lookup_object(name, None)
         if extruder is None or not hasattr(extruder, "find_past_position"):
             raise gcmd.error(f"ace2k: lane {n}: no extruder {name}")
-        if self.printer.lookup_object("toolhead").get_extruder() is not extruder:
+        toolhead: ToolHead = self.printer.lookup_object("toolhead")
+        if toolhead.get_extruder() is not extruder:
             raise gcmd.error(f"ace2k: {name} is not the active extruder; select it first")
         if not extruder.get_heater().can_extrude:
             raise gcmd.error(f"ace2k: {name} is too cold to extrude; heat it for the filament")
         lane = self.feed.lanes[index]
-        if self.feed.unit.lanes[index]["insert"] is not True:
+        unavailable = self.feed.lane_unavailable(index, ("idle", "following"))
+        if unavailable == "no_filament":
             raise gcmd.error(f"ace2k: lane {n} has no filament")
-        if lane["mode"] == "error":
-            raise gcmd.error(f"ace2k: lane {n} is in error ({lane['error']}); ACE_CLEAR first")
-        if lane["mode"] not in ("idle", "following"):
+        if unavailable == "error":
+            raise gcmd.error(f"ace2k: lane {n} is in error ({lane['error']}); ACEK_CLEAR first")
+        if unavailable == "busy":
             raise gcmd.error(f"ace2k: lane {n} is busy ({lane['mode']})")
+        # The run follows the lane, so it must be the active lane.
+        why = self.feed.not_active_text(index)
+        if why is not None:
+            raise gcmd.error(why)
         return extruder
 
-    def _arm(self, gcmd, index):
-        """The follow on the idle lane, at assist_speed (ACE_ASSIST DIR=BOTH's default); the
-        unit's refusal (or a host that cannot start it) a G-code error, as ACE_ASSIST's."""
+    def _arm(self, gcmd: GCodeCommand, index: int) -> None:
+        """Arm the follow on the idle lane, at assist_speed (the default of ACEK_ASSIST DIR=BOTH).
+
+        If the unit refuses, or the host cannot start it, raise a G-code error, as ACEK_ASSIST does.
+        """
         try:
-            self.feed.start_move(index, "assist_both", 0.0, self.feed.assist_speed)
-        except (self.feed.FeedRefused, RuntimeError) as e:
+            self.feed.start_follow_as("ACEK_CALIBRATE_ENCODER", index, self.feed.assist_speed_mm_s)
+        except (FeedRefused, RuntimeError) as e:
             raise gcmd.error(str(e)) from e
 
-    def _wait_following(self, gcmd, index):
-        """The arm seen in the state report within ARM_WAIT_S, or two of the report's periods and
-        ARM_WAIT_MARGIN_S if longer, else a G-code error.  A shutdown ends the wait: the run
-        aborts on it, and nothing more is sent."""
+    def _wait_following(self, gcmd: GCodeCommand, index: int) -> None:
+        """Wait until the state report shows the arm of the follow.
+
+        The wait lasts ARM_WAIT_S, or two periods of the report plus ARM_WAIT_MARGIN_S if that is
+        longer. After that, raise a G-code error. A shutdown ends the wait. The run then aborts, and
+        nothing more is sent.
+        """
         period_s = self.feed.report_period_ms / 1000.0
         deadline = self.reactor.monotonic() + max(ARM_WAIT_S, 2 * period_s + ARM_WAIT_MARGIN_S)
         while self.feed.lanes[index]["mode"] != "following":
@@ -339,33 +525,39 @@ class EncoderCalibration:
                 raise gcmd.error(f"ace2k: lane {index + 1} did not enter the follow")
             self.reactor.pause(now + 0.1)
 
-    def _listen(self, index):
-        """The lane's frames collected from here on, into a sink and a deque of the run's own,
-        and both reports at 10 Hz.  The run's sink."""
+    def _listen(self, index: int) -> _Sink:
+        """Start to collect the frames of the lane, and return the sink of the run.
+
+        The frames go into a sink and a deque that belong to this run. Both reports are set to
+        10 Hz.
+        """
         self.frames = collections.deque()
-        self.lane = index
+        sink = self._sink = _Sink(index, self.frames)  # from here the run holds the lane
         if not self.printer.is_shutdown():
             self.feed.set_counts_period(REPORT_S)
             self.feed.unit.set_counters_period(REPORT_S)
-        return self._sink
+        return sink
 
-    def _unlisten(self):
-        """No frame collected any more, and both reports back at their own rates."""
+    def _unlisten(self) -> None:
+        """Stop collecting frames, and put both reports back at their own rates."""
         self.lane = None
         if not self.printer.is_shutdown():
             self.feed.set_counts_period(self.feed.report_period_ms / 1000.0)
             self.feed.unit.set_counters_period(LANE_REPORT_S)
 
-    def _extrude(self, sink, extruder, length, speed, tracker, marks):
-        """LENGTH in CHUNK_MM chunks under the saved G-code state, each queued once the last has
-        run, while the frames become marks.  The abort's reason, or None: a condition seen while
-        a chunk runs lets that chunk end and queues no other; one there before the first, none."""
-        gcode = self.printer.lookup_object("gcode")
-        toolhead = self.printer.lookup_object("toolhead")
-        clock = self.printer.lookup_object("mcu")  # the print time
+    def _extrude(self, run: _Run, length: float, speed: float) -> str | None:
+        """Extrude `length` in chunks of CHUNK_MM, and turn the frames into marks meanwhile.
 
-        def poll():
-            return self._poll(sink, tracker, marks, extruder, clock)
+        The G-code state is saved first. Each chunk is queued after the last one has run.
+        Return the reason for an abort, or None. A condition seen while a chunk runs lets that
+        chunk end and queues no other. A condition present before the first chunk queues none.
+        """
+        gcode: GCode = self.printer.lookup_object("gcode")
+        toolhead: ToolHead = self.printer.lookup_object("toolhead")
+        clock: MCU = self.printer.lookup_object("mcu")  # converts to print time
+
+        def poll() -> str | None:
+            return self._poll(run, clock)
 
         gcode.run_script_from_command(f"SAVE_GCODE_STATE NAME={GCODE_STATE}\nM83")
         try:
@@ -384,24 +576,57 @@ class EncoderCalibration:
                     reason = poll()
             toolhead.wait_moves()
             if reason is None:
-                self.reactor.pause(self.reactor.monotonic() + 2 * REPORT_S)  # the last frames
+                # Wait for the last frames.
+                self.reactor.pause(self.reactor.monotonic() + 2 * REPORT_S)
                 reason = poll()
         finally:
-            # not after a shutdown: Klipper refuses G-code then, and its error would replace the
-            # abort's own line; the G-code state does not outlive the restart anyway
+            # Not after a shutdown. Klipper refuses G-code then, and its error would replace the
+            # line of the abort. The G-code state does not outlive the restart anyway.
             if not self.printer.is_shutdown():
                 gcode.run_script_from_command(f"RESTORE_GCODE_STATE NAME={GCODE_STATE}")
         return reason
 
-    def _poll(self, sink, tracker, marks, extruder, clock):
-        """The abort conditions, then every frame received so far turned into marks — the
-        extruder's position looked up as its frame arrives — then the lane's full count again.
-        The abort's reason, or None."""
+    def _poll(self, run: _Run, clock: MCU) -> str | None:
+        """Check the abort conditions, then turn every frame received so far into marks.
+
+        The position of the extruder is looked up as each frame arrives. Then check the full count
+        of the lane again. Return the reason for an abort, or None.
+        """
+        sink = run.sink
         n = sink.lane + 1
+        reason = self._abort_reason(sink, n)
+        if reason is not None:
+            return reason
+        frames = sink.frames
+        while frames:
+            frame = frames.popleft()
+            pt = clock.estimated_print_time(frame[1])
+            if frame[0] == "reading":
+                run.tracker.reading(pt, frame[2])
+                continue
+            try:
+                mark = run.tracker.counts(pt, frame[2], frame[3])
+            except EpochChanged:
+                return f"lane {n} re-entered a mode"
+            if mark is not None:
+                instant, encoder_mm = mark
+                run.marks.append((run.extruder.find_past_position(instant), encoder_mm))
+        # Check again. A frame queued after the first check was drained with the rest. Its full
+        # count was noted before it was queued (see on_ff_state). So no drained frame carries a
+        # full that was not seen. This also holds at the last poll, just before the verdict.
+        if sink.full_seen:
+            return FULL
+        return None
+
+    def _abort_reason(self, sink: _Sink, n: int) -> str | None:
+        """Return what aborts the run before its frames are drained, or None.
+
+        A shutdown, a full, or the lane being in error or out of the follow aborts the run.
+        """
         if self.printer.is_shutdown():
             return SHUTDOWN
-        # the switch is a 10 Hz sample, the lane's full count exact: a full taken up within a
-        # tick shows only in the count
+        # The switch is sampled at 10 Hz, but the full count of the lane is exact. A full that the
+        # follow takes up within one tick shows only in the count.
         if self.feed.unit.pulled_any or sink.full_seen:
             return FULL
         lane = self.feed.lanes[sink.lane]
@@ -409,23 +634,4 @@ class EncoderCalibration:
             return f"lane {n} in error ({lane['error']})"
         if lane["mode"] != "following":
             return f"lane {n} left the follow ({lane['mode']})"
-        frames = sink.frames
-        while frames:
-            kind, rt, *data = frames.popleft()
-            pt = clock.estimated_print_time(rt)
-            if kind == "reading":
-                tracker.reading(pt, data[0])
-                continue
-            try:
-                mark = tracker.counts(pt, data[0], data[1])
-            except EpochChanged:
-                return f"lane {n} re-entered a mode"
-            if mark is not None:
-                instant, encoder_mm = mark
-                marks.append((extruder.find_past_position(instant), encoder_mm))
-        # and again: a frame queued after the look above was drained with the rest, and its full
-        # was noted before it was queued (on_ff_state), so none drained carries a full unseen —
-        # at the last poll, just before the verdict, too
-        if sink.full_seen:
-            return FULL
         return None

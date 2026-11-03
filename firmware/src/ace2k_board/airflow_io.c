@@ -1,16 +1,16 @@
 // ace2k board air path: the fans and the flap coils as GPIO outputs (docs/hardware.md "Fans",
-// "Exhaust flaps").  A fan's read-back is the pin's input register: on an F1-compatible port the
-// input register follows the pin in output mode too (GD32F30x User Manual, GPIO chapter), so a
-// pin held low by a fault reads low while the output register says high.
+// "Exhaust flaps"). The read-back of a fan is the input register of its pin. On an F1-compatible
+// port the input register follows the pin in output mode too (GD32F30x User Manual, GPIO chapter).
+// So a pin held low by a fault reads low, while the output register says high.
 #include "ace2k_board/airflow_io.h"
 #include "ace2k_board/pins.h"
 #include "board/gpio.h"     // gpio_out_setup, gpio_out_write, struct gpio_out
 #include "board/internal.h" // GPIO_TypeDef
 #include "command.h"        // DECL_CONSTANT_STR
 
-// The host reserves every RESERVE_PINS_* constant, so no [output_pin] or [fan] section can
-// claim a fan or a flap coil (pins.h names them; docs/hardware.md "Fans", "Exhaust flaps").
-// PD5/PD6 leave RESERVE_PINS_ace2k_remap in this image (ace2k_board/motor.c).
+// The host reserves every RESERVE_PINS_* constant, so no [output_pin] or [fan] section can claim
+// a fan or a flap coil. pins.h names them (docs/hardware.md "Fans", "Exhaust flaps"). In this
+// image, PD5/PD6 leave RESERVE_PINS_ace2k_remap (ace2k_board/motor.c).
 DECL_CONSTANT_STR("RESERVE_PINS_ace2k_airflow", "PE12,PE8,PD3,PD4,PD5,PD6");
 
 static struct gpio_out ace2k_airflow_io_fan_left;
@@ -57,7 +57,8 @@ void ace2k_airflow_io_flap(uint8_t flap, bool open_coil, bool close_coil)
     if (flap >= ACE2K_AIRFLOW_IO_FLAPS) {
         return;
     }
-    // the coil going low first: the two are never high together, not even for one write
+    // The coil that goes low comes first. So the two are never high together, not even for one
+    // write.
     if (!open_coil) {
         gpio_out_write(ace2k_airflow_io_open[flap], 0);
     }

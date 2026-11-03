@@ -13,7 +13,7 @@ static struct rig r; /* ~10 KB: kept off the stack */
 /* The simulator's chamber loss to the room is assumed, not fitted (fake_thermal.h), so these
  * cycles assert what the model can prove: the invariants of every cycle, and the chamber's
  * accuracy only where the model makes it feasible.  The chamber's real accuracy and the NTC's real
- * overshoot are settled on the bench. */
+ * overshoot are settled by measurements on the unit. */
 #define CYCLE_NTC_BAND_MC      2000 /* the measured NTC's overshoot above the drive cap */
 #define CYCLE_OVERSHOOT_MC     2500 /* the measured NTC above the cycle's own highest drive */
 #define CYCLE_SETTLED_MC       500  /* the chamber's range (hi − lo) over the last 10 min */
@@ -78,8 +78,9 @@ TEST(a_55_c_cycle_at_15_c_holds_the_chamber_with_no_fault)
     assert_chamber_on_target(&seen, 55U);
 }
 
-/* The drive is capped at 73 °C (rule 8), and on the model's assumed chamber loss that cap holds
- * the chamber short of 65 °C: it settles at ≈ 61.7 °C.  The bench decides the real value. */
+/* The drive is capped at 73 °C (rule 8), and on the model's assumed chamber loss that cap holds the
+ * chamber short of 65 °C: it settles at ≈ 61.7 °C.  A measurement on the unit decides the real
+ * value. */
 TEST(a_65_c_cycle_at_15_c_saturates_the_drive_at_the_cap_with_no_fault)
 {
     struct cycle_seen seen;
@@ -366,7 +367,7 @@ static void watch_cooldown(uint32_t max_ms, uint32_t after_ms, struct cool_seen 
  * the fans on while hot and, once handed to rule 7, until both NTCs read 42 °C or less, the
  * flaps pulsed open once each at the entry and closed once each at the end (never both coils),
  * the notice and its event only on the hand-over.  The simulator's plant has no flap term: the
- * open flaps change nothing in these runs; their thermal gain is measured on the bench. */
+ * open flaps change nothing in these runs; their thermal gain is measured on the unit. */
 static void assert_cooldown(const struct cool_seen *seen)
 {
     ASSERT_TRUE(seen->idle);
@@ -428,9 +429,9 @@ TEST(a_stop_releases_the_lease_at_once_and_cools_down_to_idle)
     ASSERT_EQ(r.log.cycles_completed, 0U);
 }
 
-/* On the model's assumed chamber loss the chamber is still ≈ 47.5 °C at 10 min, so this
- * cool-down ends by the 10-min hand-over to rule 7 (with the notice); on a leakier chamber it
- * ends by the cool rule (the synthetic test below).  Both are legal; the bench decides. */
+/* On the model's assumed chamber loss the chamber is still ≈ 47.5 °C at 10 min, so this cool-down
+ * ends by the 10-min hand-over to rule 7 (with the notice); on a leakier chamber it ends by the
+ * cool rule (the synthetic test below).  Both are legal; a measurement on the unit decides. */
 TEST(a_42_c_ambient_cool_down_reaches_idle_within_ten_minutes)
 {
     rig_init(&r, 42000);
@@ -615,6 +616,21 @@ TEST(a_boot_with_a_persisted_cutout_closes_at_boot_and_again_at_the_faults_end)
     }
     ASSERT_TRUE(!r.flap_overlap);
     ASSERT_TRUE(!r.flap_claimed);
+}
+
+/* A boot with a persisted cutout times its cool-down from the boot, against the NTCs it reads: a
+ * cold unit, steady at 25 °C, is released one window (30 s) after the boot, not two. */
+TEST(a_boot_with_a_persisted_cutout_times_its_cool_down_from_the_boot)
+{
+    rig_init(&r, 25000);
+    r.log.flags |= ACE2K_DRYER_LOG_CUTOUT;
+    ace2k_airflow_init(&r.airflow, &rig_airflow_ops, &r);
+    ace2k_heat_init(&r.heat, &rig_heat_ops, &r);
+    ace2k_dryer_init(&r.dryer, &r.heat, &r.airflow, &r.log, false, r.now_ms);
+    ASSERT_EQ(r.dryer.state, ACE2K_DRYER_FAULT);
+    rig_run_ms(&r, ACE2K_DRYER_COOL_MIN_MS + 2000U);
+    ASSERT_EQ(r.dryer.state, ACE2K_DRYER_FAULT);
+    ASSERT_EQ(r.dryer.cool, ACE2K_DRYER_COOL_RELEASED);
 }
 
 /* A fault on the first tick, the boot's close still in flight: the fault's close still runs, after
@@ -905,6 +921,120 @@ TEST(the_controller_starts_from_zero_on_every_cycle)
     ASSERT_EQ(r.dryer.ctl.duty_cpct, 0U);
 }
 
+/* The duty the PID gives with no derivative term: P on the error, plus the integral it holds. */
+static int32_t pid_without_d(int32_t hotter_mc)
+{
+    int32_t err = ace2k_dryer_drive_mc(&r.dryer) - hotter_mc;
+    int32_t out = (err * ACE2K_DRYER_KP_CPCT_PER_C / ACE2K_DRYER_MC_PER_C) +
+                  (r.dryer.ctl.integ_m / ACE2K_DRYER_MC_PER_C);
+    return ace2k_clamp_i32(out, 0, ACE2K_DRYER_DUTY_MAX_CPCT);
+}
+
+/* The derivative acts on the outlet, not on the error: a step of the drive target (the chamber
+ * loop's trim, a spool-rule lowering) moves the duty by P alone, while a moving outlet is still
+ * damped by it. */
+TEST(a_step_of_the_drive_target_gives_no_derivative_kick)
+{
+    rig_init(&r, 25000);
+    r.dryer.target_c = 55U;
+    uint32_t now = r.now_ms;
+    ace2k_dryer_ctl_reset(&r.dryer, now);
+    struct ace2k_dryer_inputs in;
+    rig_readings(&r, &in);
+    in.ntc_left_mc = 55000;
+    in.ntc_right_mc = 55000;
+    (void)ace2k_dryer_ctl_step(&r.dryer, &in, now); /* primes the derivative */
+    now += ACE2K_DRYER_PID_PERIOD_MS;
+    r.dryer.ctl.trim_mc = ACE2K_DRYER_TRIM_MAX_MC; /* the drive target 2 °C up */
+    (void)ace2k_dryer_ctl_step(&r.dryer, &in, now);
+    ASSERT_EQ((int32_t)r.dryer.ctl.duty_cpct, pid_without_d(55000));
+    now += ACE2K_DRYER_PID_PERIOD_MS;
+    r.dryer.ctl.trim_mc = -ACE2K_DRYER_TRIM_MAX_MC; /* and 4 °C down */
+    (void)ace2k_dryer_ctl_step(&r.dryer, &in, now);
+    ASSERT_EQ((int32_t)r.dryer.ctl.duty_cpct, pid_without_d(55000));
+    now += ACE2K_DRYER_PID_PERIOD_MS;
+    in.ntc_left_mc = 54000; /* the outlet falls 1 °C: the derivative pushes the duty up */
+    in.ntc_right_mc = 54000;
+    (void)ace2k_dryer_ctl_step(&r.dryer, &in, now);
+    ASSERT_EQ((int32_t)r.dryer.ctl.duty_cpct,
+              pid_without_d(54000) + (1000 * ACE2K_DRYER_KD_CPCT_PER_C / ACE2K_DRYER_MC_PER_C));
+}
+
+/* The chamber loop takes no step on a reading older than the staleness bound, though its valid
+ * bit is set: a sensor that stopped answering is not a chamber at 45 °C. */
+TEST(the_chamber_loop_ignores_a_stale_reading)
+{
+    rig_init(&r, 25000);
+    r.dryer.target_c = 55U;
+    uint32_t now = r.now_ms;
+    ace2k_dryer_ctl_reset(&r.dryer, now);
+    struct ace2k_dryer_inputs in;
+    rig_readings(&r, &in);
+    in.chamber_mc = 45000;
+    in.chamber_valid = true;
+    in.chamber_age_ms = ACE2K_DRYER_CHAMBER_STALE_MS + 1U;
+    for (uint32_t t = 0; t <= ACE2K_DRYER_OUTER_PERIOD_MS + ACE2K_DRYER_PID_PERIOD_MS;
+         t += ACE2K_DRYER_PID_PERIOD_MS) {
+        (void)ace2k_dryer_ctl_step(&r.dryer, &in, now + t);
+    }
+    ASSERT_EQ(r.dryer.ctl.trim_mc, 0);
+    in.chamber_age_ms = 0U; /* the same reading, fresh: the loop steps */
+    for (uint32_t t = 0; t <= ACE2K_DRYER_OUTER_PERIOD_MS + ACE2K_DRYER_PID_PERIOD_MS;
+         t += ACE2K_DRYER_PID_PERIOD_MS) {
+        (void)ace2k_dryer_ctl_step(&r.dryer, &in, now + ACE2K_DRYER_OUTER_PERIOD_MS + t);
+    }
+    ASSERT_TRUE(r.dryer.ctl.trim_mc > 0);
+}
+
+/* One chamber period of PID steps from a reset: the close (the step that ends the period) and the
+ * steps before it each take the reading the caller gives.  Returns the trim after it. */
+static int32_t chamber_period(int32_t close_mc, bool close_fresh, int32_t mid_mc, bool mid_fresh,
+                              int32_t first_mc)
+{
+    rig_init(&r, 25000);
+    r.dryer.target_c = 55U;
+    uint32_t now = r.now_ms;
+    ace2k_dryer_ctl_reset(&r.dryer, now);
+    struct ace2k_dryer_inputs in;
+    rig_readings(&r, &in);
+    in.chamber_valid = true;
+    for (uint32_t t = 0; t <= ACE2K_DRYER_OUTER_PERIOD_MS + ACE2K_DRYER_PID_PERIOD_MS;
+         t += ACE2K_DRYER_PID_PERIOD_MS) {
+        bool close = ace2k_time_after(now + t, r.dryer.ctl.outer_next_ms);
+        bool fresh = mid_fresh;
+        in.chamber_mc = mid_mc;
+        if (t == 0U) {
+            fresh = true; /* the period's first reading, fresh */
+            in.chamber_mc = first_mc;
+        }
+        if (close) {
+            fresh = close_fresh;
+            in.chamber_mc = close_mc;
+        }
+        in.chamber_age_ms = fresh ? 0U : ACE2K_DRYER_CHAMBER_STALE_MS + 1U;
+        (void)ace2k_dryer_ctl_step(&r.dryer, &in, now + t);
+        if (close) {
+            break;
+        }
+    }
+    return r.dryer.ctl.trim_mc;
+}
+
+/* The period's close is judged on the close's own reading, and the period's spread on its fresh
+ * readings only. */
+TEST(the_chamber_loop_judges_a_period_on_its_fresh_readings_only)
+{
+    /* fresh at 45 °C throughout, the close stale: no step */
+    ASSERT_EQ(chamber_period(45000, false, 45000, true, 45000), 0);
+    /* the same with a fresh close: the loop steps up */
+    ASSERT_TRUE(chamber_period(45000, true, 45000, true, 45000) > 0);
+    /* 53 °C fresh at the start and the close, a stale 45 °C between: the stale reading is not
+     * part of the spread, so the period is steady and the loop steps */
+    ASSERT_TRUE(chamber_period(53000, true, 45000, false, 53000) > 0);
+    /* the same 45 °C fresh: an 8 °C spread is no steady chamber, no step */
+    ASSERT_EQ(chamber_period(53000, true, 45000, true, 53000), 0);
+}
+
 TEST(a_reset_mid_cycle_leaves_the_dryer_idle_and_fires_nothing)
 {
     rig_init(&r, 25000);
@@ -937,6 +1067,55 @@ TEST(a_shutdown_releases_the_lease_fires_nothing_after_and_refuses_a_start)
      * pin after a clear_shutdown) */
     ASSERT_EQ(ace2k_dryer_start(&r.dryer, 55U, 60U, r.now_ms), ACE2K_DRYER_SHUTDOWN);
     ASSERT_EQ(ace2k_heat_lease(&r.heat, 20U, 1000U, r.now_ms), -ACE2K_EREFUSED);
+}
+
+/* After a shutdown a clear answers shutdown and changes nothing, in a fault or not: the
+ * cool-down no longer runs, so nothing a clear would judge is current. */
+TEST(a_clear_after_a_shutdown_answers_shutdown_and_keeps_the_state)
+{
+    rig_init(&r, 25000);
+    ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
+    rig_run_ms(&r, 5000U);
+    r.chamber_valid = false; /* the chamber sensor gone: chamber_stale */
+    ASSERT_TRUE(rig_run_until(&r, ACE2K_DRYER_FAULT, 1000U));
+    ace2k_dryer_shutdown(&r.dryer);
+    r.chamber_valid = true; /* the cause gone */
+    rig_run_ms(&r, 1000U);
+    ASSERT_EQ(ace2k_dryer_clear(&r.dryer, r.now_ms), ACE2K_DRYER_SHUTDOWN);
+    ASSERT_EQ(r.dryer.state, ACE2K_DRYER_FAULT);
+    ASSERT_EQ(r.dryer.fault, ACE2K_DRYER_FAULT_CHAMBER_STALE);
+
+    rig_init(&r, 25000);
+    ace2k_dryer_shutdown(&r.dryer);
+    ASSERT_EQ(ace2k_dryer_clear(&r.dryer, r.now_ms), ACE2K_DRYER_SHUTDOWN);
+    ASSERT_EQ(r.dryer.state, ACE2K_DRYER_IDLE);
+}
+
+/* A shutdown keeps a fault: the status still says fault with its reason, never idle with a
+ * fault code.  A shutdown outside a fault leaves the dryer idle, as before. */
+TEST(a_shutdown_in_a_fault_keeps_the_fault_state)
+{
+    rig_init(&r, 25000);
+    ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
+    rig_run_ms(&r, 5000U);
+    r.chamber_valid = false; /* the chamber sensor gone: chamber_stale */
+    ASSERT_TRUE(rig_run_until(&r, ACE2K_DRYER_FAULT, 1000U));
+    ASSERT_EQ(r.dryer.fault, ACE2K_DRYER_FAULT_CHAMBER_STALE);
+    ace2k_dryer_shutdown(&r.dryer);
+    rig_run_ms(&r, 1000U);
+    struct ace2k_dryer_status st;
+    ace2k_dryer_status(&r.dryer, &st, r.now_ms);
+    ASSERT_EQ(st.state, ACE2K_DRYER_FAULT);
+    ASSERT_EQ(st.fault, ACE2K_DRYER_FAULT_CHAMBER_STALE);
+    ASSERT_EQ(ace2k_dryer_start(&r.dryer, 55U, 60U, r.now_ms), ACE2K_DRYER_SHUTDOWN);
+    ASSERT_TRUE(!ace2k_heat_leased(&r.heat));
+
+    rig_init(&r, 25000);
+    ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
+    ace2k_dryer_shutdown(&r.dryer);
+    ace2k_dryer_status(&r.dryer, &st, r.now_ms);
+    ASSERT_EQ(st.state, ACE2K_DRYER_IDLE);
+    ASSERT_EQ(st.fault, ACE2K_DRYER_FAULT_NONE);
 }
 
 /* The shutdown gives the dryer's claim on the fans up although heat held them on at the last
@@ -1285,8 +1464,8 @@ TEST(an_eighth_unacknowledged_event_is_dropped_and_counted_in_the_status)
     ASSERT_EQ(send_all(&r.dryer, NULL), ACE2K_DRYER_EVENT_RING - 1U);
 }
 
-/* Measured on the unit: the overshoot after the heater stops passed "fell less than 1 °C/min" and closed
- * the flaps early.  A window over which an outlet rose never ends the cool-down. */
+/* Measured on the unit: the overshoot after the heater stops passed "fell less than 1 °C/min"
+ * and closed the flaps early.  A window over which an outlet rose never ends the cool-down. */
 TEST(a_cool_down_never_ends_on_a_rising_outlet)
 {
     rig_init(&r, 25000);
@@ -1419,6 +1598,70 @@ TEST(a_cool_down_does_not_end_on_one_rising_outlet)
     rig_run_ms(&r, ACE2K_DRYER_COOL_MIN_MS); /* the second: the right one rose */
     ASSERT_EQ(r.dryer.state, ACE2K_DRYER_COOLDOWN);
     ASSERT_EQ(r.dryer.cool, ACE2K_DRYER_COOL_WAITING);
+}
+
+/* The retarget: a manual start over an automatic cycle replaces it in place. */
+TEST(a_retarget_while_heating_moves_the_target_and_the_end)
+{
+    rig_init(&r, 25000);
+    ASSERT_EQ(rig_start(&r, 60U, 30U), ACE2K_DRYER_OK);
+    ASSERT_EQ(r.dryer.state, ACE2K_DRYER_HEATING);
+    r.dryer.notices |= ACE2K_DRYER_NOTICE_LOWERED;
+    ASSERT_EQ(ace2k_dryer_retarget(&r.dryer, 50U, 120U, r.now_ms), ACE2K_DRYER_OK);
+    ASSERT_EQ(r.dryer.target_c, 50U);
+    ASSERT_EQ(r.dryer.highest_target_c, 60U); /* the ceiling never drops within a cycle */
+    ASSERT_EQ(r.dryer.end_ms, r.now_ms + (120U * 60000U));
+    ASSERT_EQ(r.dryer.notices & ACE2K_DRYER_NOTICE_LOWERED, 0U);
+    ASSERT_EQ(ace2k_dryer_retarget(&r.dryer, 65U, 10U, r.now_ms), ACE2K_DRYER_OK);
+    ASSERT_EQ(r.dryer.highest_target_c, 65U);
+}
+
+TEST(a_retarget_outside_a_running_cycle_is_refused_and_changes_nothing)
+{
+    rig_init(&r, 25000);
+    ASSERT_EQ(ace2k_dryer_retarget(&r.dryer, 50U, 60U, r.now_ms), ACE2K_DRYER_BUSY);
+    ASSERT_EQ(r.dryer.state, ACE2K_DRYER_IDLE);
+    ASSERT_EQ(rig_start(&r, 45U, 1U), ACE2K_DRYER_OK);
+    ASSERT_EQ(ace2k_dryer_stop(&r.dryer, r.now_ms), ACE2K_DRYER_OK);
+    ASSERT_EQ(r.dryer.state, ACE2K_DRYER_COOLDOWN);
+    ASSERT_EQ(ace2k_dryer_retarget(&r.dryer, 50U, 60U, r.now_ms), ACE2K_DRYER_BUSY);
+    ASSERT_EQ(r.dryer.target_c, 45U);
+}
+
+TEST(a_retarget_out_of_range_is_refused)
+{
+    rig_init(&r, 25000);
+    ASSERT_EQ(rig_start(&r, 45U, 30U), ACE2K_DRYER_OK);
+    uint32_t end = r.dryer.end_ms;
+    ASSERT_EQ(ace2k_dryer_retarget(&r.dryer, 66U, 60U, r.now_ms), ACE2K_DRYER_RANGE);
+    ASSERT_EQ(ace2k_dryer_retarget(&r.dryer, 45U, 0U, r.now_ms), ACE2K_DRYER_RANGE);
+    ASSERT_EQ(ace2k_dryer_retarget(&r.dryer, 45U, 1441U, r.now_ms), ACE2K_DRYER_RANGE);
+    ASSERT_EQ(r.dryer.target_c, 45U);
+    ASSERT_EQ(r.dryer.end_ms, end);
+}
+
+TEST(a_retarget_while_starting_moves_the_target_and_the_end)
+{
+    rig_init(&r, 25000);
+    ASSERT_EQ(ace2k_dryer_start(&r.dryer, 45U, 30U, r.now_ms), ACE2K_DRYER_OK);
+    ASSERT_EQ(r.dryer.state, ACE2K_DRYER_STARTING); /* no tick yet: still waiting for the fans */
+    ASSERT_EQ(ace2k_dryer_retarget(&r.dryer, 55U, 90U, r.now_ms), ACE2K_DRYER_OK);
+    ASSERT_EQ(r.dryer.state, ACE2K_DRYER_STARTING);
+    ASSERT_EQ(r.dryer.target_c, 55U);
+    ASSERT_EQ(r.dryer.end_ms, r.now_ms + (90U * RIG_MIN_MS));
+}
+
+TEST(a_retarget_in_fault_is_refused_as_faulted_and_changes_nothing)
+{
+    rig_init(&r, 25000);
+    ASSERT_EQ(rig_start(&r, 45U, 30U), ACE2K_DRYER_OK);
+    uint32_t end = r.dryer.end_ms;
+    r.cutout = true;
+    rig_tick(&r);
+    ASSERT_EQ(r.dryer.state, ACE2K_DRYER_FAULT);
+    ASSERT_EQ(ace2k_dryer_retarget(&r.dryer, 55U, 90U, r.now_ms), ACE2K_DRYER_FAULTED);
+    ASSERT_EQ(r.dryer.target_c, 45U);
+    ASSERT_EQ(r.dryer.end_ms, end);
 }
 
 int main(int argc, char **argv)

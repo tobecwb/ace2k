@@ -9,6 +9,8 @@ env.c interpolates linearly between entries (worst error ≈ 0.3 °C at the hot 
     ntc_table.py --check OUT    exit 1 if OUT differs from what would be written
 """
 
+from __future__ import annotations
+
 import math
 import sys
 
@@ -17,35 +19,48 @@ MIN_MV, MAX_MV, STEP_MV = 100, 3200, 25
 
 
 def millidegrees(mv: int) -> int:
+    """Return the NTC temperature, in millidegrees Celsius, for a divider reading in millivolts."""
     r = PULLUP * mv / (VREF_MV - mv)
     t = 1.0 / (1.0 / T25_K + math.log(r / R25) / BETA) - 273.15
     return round(t * 1000)
 
 
-COLUMN_LIMIT, INDENT = 100, 4  # src/ace2k/.clang-format
+COLUMN_LIMIT, INDENT = 100, 4  # as set in src/ace2k/.clang-format
+# clang-format does not pad a column of a braced list by more than this many characters
+COLUMN_PADDING_MAX = 10
 
 
-def column_sizes(items: list) -> list:
-    """The column widths (comma included) clang-format gives a long braced list: as many columns
-    as fit the column limit, each as wide as its widest item, the fewest lines and, on a tie,
-    the fewest columns.  Rendering the table the same way keeps the committed header identical
-    to what `make format` would write, so --check and format-check agree."""
+def column_sizes(items: list[str]) -> list[int]:
+    """Return the column widths that clang-format gives a long braced list, each comma included.
+
+    clang-format uses as many columns as fit the column limit.  Each column is as wide as its
+    widest item.  It picks the layout with the fewest lines, and on a tie the fewest columns.
+    The table is laid out the same way, so the committed header is exactly what `make format`
+    would write.  This keeps --check and format-check in agreement.
+    """
     widths = [len(v) + 1 for v in items]  # the item and its comma
-    best = None
-    for columns in range(1, COLUMN_LIMIT // 3 + 1):
-        by_column = [widths[i::columns] for i in range(columns)]
-        sizes = [max(w) for w in by_column]
-        lines = -(-len(items) // columns)
-        if any(max(w) - min(w) > 10 for w in by_column[:-1]):
-            continue  # clang-format refuses a column with that much padding
-        if sum(sizes) + columns - 1 > COLUMN_LIMIT - INDENT:
-            continue
-        if best is None or lines < best[0]:
-            best = (lines, sizes)
-    return best[1]
+    layouts = [
+        (-(-len(items) // columns), columns, sizes)
+        for columns in range(1, COLUMN_LIMIT // 3 + 1)
+        if (sizes := fitting_sizes(widths, columns)) is not None
+    ]
+    # render() passes short numbers, so one column always fits and the list is never empty
+    return min(layouts)[2]
+
+
+def fitting_sizes(widths: list[int], columns: int) -> list[int] | None:
+    """Return the column widths in this many columns, or None if clang-format refuses them."""
+    by_column = [widths[i::columns] for i in range(columns)]
+    if any(max(w) - min(w) > COLUMN_PADDING_MAX for w in by_column[:-1]):
+        return None  # clang-format refuses a column with that much padding
+    sizes = [max(w) for w in by_column]
+    if sum(sizes) + columns - 1 > COLUMN_LIMIT - INDENT:
+        return None
+    return sizes
 
 
 def render() -> str:
+    """Return the text of the whole header."""
     items = [str(millidegrees(mv)) for mv in range(MIN_MV, MAX_MV + 1, STEP_MV)]
     sizes = column_sizes(items)
     rows = []
@@ -72,24 +87,29 @@ def render() -> str:
     )
 
 
-def main() -> None:
-    check = "--check" in sys.argv
-    args = [a for a in sys.argv[1:] if a != "--check"]
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    args = [a for a in argv if a != "--check"]
     if len(args) != 1:
         sys.exit(__doc__)
-    text = render()
-    if check:
-        with open(args[0], encoding="utf-8") as f:
-            current = f.read()
-        if current != text:
-            print(f"ntc_table: {args[0]} is out of date; regenerate it", file=sys.stderr)
-            sys.exit(1)
-        print(f"ntc_table: {args[0]} is current")
-        return
+    if "--check" in argv:
+        return check(args[0], render())
     with open(args[0], "w", encoding="utf-8") as f:
-        f.write(text)
+        f.write(render())
     print(f"ntc_table: wrote {args[0]}")
+    return 0
+
+
+def check(path: str, text: str) -> int:
+    """Return 0 if the file at path holds exactly text, else 1."""
+    with open(path, encoding="utf-8") as f:
+        current = f.read()
+    if current != text:
+        print(f"ntc_table: {path} is out of date; regenerate it", file=sys.stderr)
+        return 1
+    print(f"ntc_table: {path} is current")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

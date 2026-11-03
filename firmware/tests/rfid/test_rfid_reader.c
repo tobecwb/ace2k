@@ -7,7 +7,7 @@ struct ace2k_fake_bus {
     uint8_t regs[ACE2K_RFID_READER_COUNT][64];
     bool selected[ACE2K_RFID_READER_COUNT];
     int rst_low_calls;
-    int xfers_unselected;
+    int xfers, xfers_unselected;
     int polls_until_reset_done; /* reads of CommandReg during a reset before the bit clears */
     bool mute;                  /* the bus answers 0xFF */
     uint8_t last_out[2];
@@ -43,6 +43,7 @@ static void fake_xfer(void *ctx, uint8_t *buf, uint8_t len)
 {
     struct ace2k_fake_bus *f = ctx;
     int reader = selected_reader(f);
+    f->xfers++;
     f->last_out[0] = buf[0];
     f->last_out[1] = buf[1];
     if (reader < 0) {
@@ -76,7 +77,7 @@ static void fake_delay(void *ctx, uint32_t us)
     ((struct ace2k_fake_bus *)ctx)->delayed_us += us;
 }
 
-static const struct ace2k_rfid_reader_ops ace2k_fake_ops = {
+static const struct ace2k_rfid_reader_ops fake_ops = {
     .nss = fake_nss,
     .rst = fake_rst,
     .spi_xfer = fake_xfer,
@@ -96,7 +97,7 @@ TEST(address_framing_and_chip_select)
     struct ace2k_fake_bus f;
     struct ace2k_rfid_reader r;
     fake_init(&f, 0x18, 0x18);
-    ace2k_rfid_reader_init(&r, &ace2k_fake_ops, &f);
+    ace2k_rfid_reader_init(&r, &fake_ops, &f);
     ASSERT_TRUE(!f.selected[0] && !f.selected[1]);
     ASSERT_EQ(ace2k_rfid_reader_read_reg(&r, ACE2K_RFID_READER_A, ACE2K_RFID_REG_VERSION), 0x18);
     ASSERT_EQ(f.last_out[0], 0xEE);
@@ -114,7 +115,7 @@ TEST(probe_resets_polls_and_reads_the_version)
     struct ace2k_fake_bus f;
     struct ace2k_rfid_reader r;
     fake_init(&f, 0x18, 0x92);
-    ace2k_rfid_reader_init(&r, &ace2k_fake_ops, &f);
+    ace2k_rfid_reader_init(&r, &fake_ops, &f);
     ASSERT_EQ(ace2k_rfid_reader_probe(&r, ACE2K_RFID_READER_A), 0);
     ASSERT_EQ(r.version[0], 0x18);
     ASSERT_TRUE(r.version_ok[0]);
@@ -132,15 +133,31 @@ TEST(a_mute_bus_and_a_reset_that_never_completes_fail)
     struct ace2k_rfid_reader r;
     fake_init(&f, 0x18, 0x18);
     f.mute = true;
-    ace2k_rfid_reader_init(&r, &ace2k_fake_ops, &f);
+    ace2k_rfid_reader_init(&r, &fake_ops, &f);
     ASSERT_EQ(ace2k_rfid_reader_probe(&r, ACE2K_RFID_READER_A), -ACE2K_EIO);
     ASSERT_EQ(f.delayed_us, 150 * 1000); /* the 150 ms cap: 150 polls of 1 ms */
     ASSERT_TRUE(!r.version_ok[0]);
     fake_init(&f, 0x18, 0x18);
     f.polls_until_reset_done = (int)ACE2K_RFID_RESET_POLLS + 1; /* one poll past the cap */
-    ace2k_rfid_reader_init(&r, &ace2k_fake_ops, &f);
+    ace2k_rfid_reader_init(&r, &fake_ops, &f);
     ASSERT_EQ(ace2k_rfid_reader_soft_reset(&r, ACE2K_RFID_READER_B), -ACE2K_EIO);
     ASSERT_EQ(f.rst_low_calls, 0);
+}
+
+TEST(a_reader_out_of_range_touches_no_line)
+{
+    struct ace2k_fake_bus f;
+    struct ace2k_rfid_reader r;
+    fake_init(&f, 0x18, 0x18);
+    ace2k_rfid_reader_init(&r, &fake_ops, &f);
+    ASSERT_EQ(ace2k_rfid_reader_read_reg(&r, 2, ACE2K_RFID_REG_VERSION), 0);
+    ace2k_rfid_reader_write_reg(&r, 2, ACE2K_RFID_REG_COMMAND, ACE2K_RFID_CMD_SOFT_RESET);
+    ASSERT_EQ(ace2k_rfid_reader_soft_reset(&r, 2), -ACE2K_EINVAL);
+    ASSERT_EQ(ace2k_rfid_reader_soft_reset(&r, 255), -ACE2K_EINVAL);
+    ASSERT_EQ(f.xfers, 0);
+    ASSERT_EQ(f.delayed_us, 0);
+    ASSERT_EQ(r.reset_count[0], 0);
+    ASSERT_EQ(r.reset_count[1], 0);
 }
 
 // NOLINTNEXTLINE(readability-identifier-naming)

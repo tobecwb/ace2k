@@ -1,7 +1,7 @@
-/* The cascade controller: an inner PID on the hotter outlet
- * NTC toward the drive target, every ACE2K_DRYER_PID_PERIOD_MS, in 0.01 % of duty; an outer
- * loop that trims the drive target from the chamber, at most once per outer period and only
- * with the chamber steady.  Fixed point throughout: millidegrees in, cpct out. */
+/* The cascade controller. An inner PID drives the hotter outlet NTC toward the drive target,
+ * every ACE2K_DRYER_PID_PERIOD_MS, in 0.01 % of duty. An outer loop trims the drive target from
+ * the chamber. It acts at most once per outer period, and only with the chamber steady. Fixed
+ * point throughout: millidegrees in, cpct out. */
 #include "dryer/dryer.h"
 #include "dryer/dryer_internal.h"
 
@@ -45,9 +45,13 @@ static bool integrate_allowed(int32_t out_cpct, int32_t err_mc)
 static void pid_step(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in)
 {
     struct ace2k_dryer_ctl *c = &self->ctl;
-    int32_t err = ace2k_dryer_drive_mc(self) - ace2k_dryer_hotter_mc(in);
-    int32_t derr = c->primed ? err - c->prev_err_mc : 0;
-    c->prev_err_mc = err;
+    int32_t hotter = ace2k_dryer_hotter_mc(in);
+    int32_t err = ace2k_dryer_drive_mc(self) - hotter;
+    /* The derivative acts on the outlet, not on the error. Otherwise a step of the drive target
+     * would kick the duty for one period. Such a step is a trim of the chamber loop, or a
+     * lowering by the spool rule. */
+    int32_t derr = c->primed ? c->prev_hotter_mc - hotter : 0;
+    c->prev_hotter_mc = hotter;
     c->primed = true;
     int32_t p = err * ACE2K_DRYER_KP_CPCT_PER_C / ACE2K_DRYER_MC_PER_C;
     int32_t d = derr * ACE2K_DRYER_KD_CPCT_PER_C / ACE2K_DRYER_MC_PER_C;
@@ -60,14 +64,16 @@ static void pid_step(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *
     c->duty_cpct = (uint16_t)ace2k_clamp_i32(out, 0, ACE2K_DRYER_DUTY_MAX_CPCT);
 }
 
-/* The outer loop: the chamber's range over the period; a steady period moves the trim by half
- * the chamber's error, within ±ACE2K_DRYER_TRIM_MAX_MC.  A period that closes on a tick with no
- * valid chamber reading takes no step: an invalid reading is not a temperature. */
+/* The outer loop tracks the chamber's range over the period. A steady period moves the trim
+ * by half the chamber's error, within ±ACE2K_DRYER_TRIM_MAX_MC. A period that closes on a
+ * tick with no fresh chamber reading takes no step, because an invalid or stale reading is not a
+ * temperature. */
 static void outer_step(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in,
                        uint32_t now_ms)
 {
     struct ace2k_dryer_ctl *c = &self->ctl;
-    if (in->chamber_valid) {
+    bool fresh = ace2k_dryer_chamber_fresh(in);
+    if (fresh) {
         if (in->chamber_mc < c->ch_min_mc) {
             c->ch_min_mc = in->chamber_mc;
         }
@@ -80,7 +86,7 @@ static void outer_step(struct ace2k_dryer *self, const struct ace2k_dryer_inputs
     }
     c->outer_next_ms = now_ms + ACE2K_DRYER_OUTER_PERIOD_MS;
     bool seen = c->ch_max_mc >= c->ch_min_mc;
-    if (in->chamber_valid && seen && c->ch_max_mc - c->ch_min_mc < ACE2K_DRYER_CHAMBER_STEADY_MC) {
+    if (fresh && seen && c->ch_max_mc - c->ch_min_mc < ACE2K_DRYER_CHAMBER_STEADY_MC) {
         int32_t target_mc = (int32_t)self->target_c * ACE2K_DRYER_MC_PER_C;
         int32_t step = (target_mc - in->chamber_mc) / ACE2K_DRYER_TRIM_GAIN_DIV;
         c->trim_mc =
@@ -99,5 +105,5 @@ uint8_t ace2k_dryer_ctl_step(struct ace2k_dryer *self, const struct ace2k_dryer_
         c->step_next_ms = now_ms + ACE2K_DRYER_PID_PERIOD_MS;
         pid_step(self, in);
     }
-    return (uint8_t)((c->duty_cpct + (ACE2K_DRYER_CPCT_PER_PCT / 2U)) / ACE2K_DRYER_CPCT_PER_PCT);
+    return ace2k_dryer_duty_pct(c->duty_cpct);
 }

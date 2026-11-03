@@ -165,7 +165,7 @@ static bool gate_low(void *ctx)
     return false;
 }
 
-static const struct ace2k_heat_ops ace2k_heat_nop_ops = {
+static const struct ace2k_heat_ops heat_nop_ops = {
     .gate_fire = gate_nop,
     .gate_off = gate_nop,
     .gate_read = gate_low,
@@ -194,7 +194,7 @@ static void flap_write(void *ctx, enum ace2k_flap f, bool o, bool c)
     (void)c;
 }
 
-static const struct ace2k_airflow_ops ace2k_log_airflow_ops = {
+static const struct ace2k_airflow_ops log_airflow_ops = {
     .fan_write = fan_write,
     .fan_read = fan_read,
     .flap_write = flap_write,
@@ -211,8 +211,8 @@ static void rig_boot(struct log_rig *r, struct ace2k_dryer_log *log, bool power_
 {
     ace2k_fans_on = false;
     ace2k_fans_fail = false;
-    ace2k_heat_init(&r->heat, &ace2k_heat_nop_ops, NULL);
-    ace2k_airflow_init(&r->airflow, &ace2k_log_airflow_ops, NULL);
+    ace2k_heat_init(&r->heat, &heat_nop_ops, NULL);
+    ace2k_airflow_init(&r->airflow, &log_airflow_ops, NULL);
     ace2k_dryer_init(&r->dryer, &r->heat, &r->airflow, log, power_on, 0);
 }
 

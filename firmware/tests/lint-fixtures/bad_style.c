@@ -1,5 +1,5 @@
-/* Lint self-test fixture.  Deliberately violates the rules clang-tidy enforces; `make lint-selftest`
- * expects findings here.  Not compiled into anything. */
+/* Lint self-test fixture.  Deliberately violates the rules clang-tidy enforces;
+ * `make lint-selftest` expects findings here.  Not compiled into anything. */
 #include <stdint.h>
 
 int BadName;                       /* global: wrong case, no prefix */

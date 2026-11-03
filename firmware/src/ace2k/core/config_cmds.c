@@ -1,11 +1,11 @@
-// Binding of the config record to the board flash, and of the factory calibration pages (read
-// once, never written).  No policy here.
+// Binding of the config record to the flash of the board, and of the factory calibration pages.
+// Those are read once and never written. No policy here.
 #include "core/config_cmds.h"
 #include "ace2k_board/flash.h"
 #include "board/irq.h" // irq_save, irq_restore
 #include "command.h"   // DECL_COMMAND, sendf
 
-static const struct ace2k_config_ops ace2k_config_board_ops = {
+static const struct ace2k_config_ops board_ops = {
     .flash_read = ace2k_flash_read,
     .flash_erase_page = ace2k_flash_erase_page,
     .flash_program_word = ace2k_flash_program_word,
@@ -17,7 +17,7 @@ static bool ace2k_config_loaded;
 struct ace2k_config *ace2k_config_binding(void)
 {
     if (!ace2k_config_loaded) {
-        ace2k_config_init(&ace2k_config_instance, &ace2k_config_board_ops, NULL);
+        ace2k_config_init(&ace2k_config_instance, &board_ops, NULL);
         ace2k_config_loaded = true;
     }
     return &ace2k_config_instance;
@@ -39,17 +39,23 @@ int ace2k_config_binding_register_store_veto(ace2k_config_store_veto_fn fn, void
     return 0;
 }
 
+bool ace2k_config_binding_store_vetoed(void)
+{
+    return (bool)(ace2k_config_store_veto != NULL &&
+                  ace2k_config_store_veto(ace2k_config_store_veto_ctx));
+}
+
 static volatile bool ace2k_config_storing;
 
-// The dryer's rule 13 as one step: the veto asked and the store marked in progress under one interrupt
-// bracket, so no tick can begin a lease between the two; the heat binding reads the mark at every
-// tick and refuses a new lease until the store returns.
+// The flash is written only with the gate idle. This makes that rule one step. The veto is asked,
+// and the store marked in progress, under one interrupt bracket. So no tick can begin a lease
+// between the two. The heat binding reads the mark at every tick, and refuses a new lease until
+// the store returns.
 int ace2k_config_binding_store(void)
 {
     struct ace2k_config *cfg = ace2k_config_binding(); // loaded before the bracket
     irqstatus_t flag = irq_save();
-    bool vetoed =
-        ace2k_config_store_veto != NULL && ace2k_config_store_veto(ace2k_config_store_veto_ctx);
+    bool vetoed = ace2k_config_binding_store_vetoed();
     if (!vetoed) {
         ace2k_config_storing = true;
     }
@@ -73,13 +79,14 @@ static bool ace2k_config_factory_loaded;
 const struct ace2k_factory_calibration *ace2k_config_binding_factory(void)
 {
     if (!ace2k_config_factory_loaded) {
-        ace2k_config_factory_read(&ace2k_config_board_ops, NULL, &ace2k_config_factory);
+        ace2k_config_factory_read(&board_ops, NULL, &ace2k_config_factory);
         ace2k_config_factory_loaded = true;
     }
     return &ace2k_config_factory;
 }
 
-// page: 0 valid, 1 blank, 2 corrupt — the enum's order; calibration_source: 0 default, 1 factory.
+// page: 0 valid, 1 blank, 2 corrupt, in the enum's order. calibration_source: 0 default,
+// 1 factory.
 void ace2k_config_cmd_state(uint32_t *args)
 {
     (void)args;

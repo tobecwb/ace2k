@@ -20,23 +20,47 @@ index e2d77924d..fa324d9ae 100644
  static uint32_t
  timer_dispatch_many(void)
 diff --git a/src/generic/misc.h b/src/generic/misc.h
-index fe0804e48..f62a4e188 100644
+index fe0804e48..db75cb839 100644
 --- a/src/generic/misc.h
 +++ b/src/generic/misc.h
-@@ -6,6 +6,8 @@
+@@ -6,7 +6,10 @@
  
  struct command_encoder;
  void console_sendf(const struct command_encoder *ce, va_list args);
 +uint8_t console_try_sendf(const struct command_encoder *ce, uint_fast8_t reserve
 +                          , va_list args);
  void *console_receive_buffer(void);
++extern uint32_t console_frames_received;
  
  uint32_t timer_from_us(uint32_t us);
+ uint8_t timer_is_before(uint32_t time1, uint32_t time2);
 diff --git a/src/generic/serial_irq.c b/src/generic/serial_irq.c
-index 4c05ef3ef..992996018 100644
+index 4c05ef3ef..b1bad09da 100644
 --- a/src/generic/serial_irq.c
 +++ b/src/generic/serial_irq.c
-@@ -89,9 +89,12 @@ console_task(void)
+@@ -70,14 +70,20 @@ console_pop_input(uint_fast8_t len)
+     }
+ }
+ 
++// Valid frames received (CRC and sequence checked); ace2k's link presence
++// counts these, not bytes
++uint32_t console_frames_received;
++
+ // Process any incoming commands
+ void
+ console_task(void)
+ {
+     uint_fast8_t rpos = readb(&receive_pos), pop_count;
+     int_fast8_t ret = command_find_block(receive_buf, rpos, &pop_count);
+-    if (ret > 0)
++    if (ret > 0) {
++        writel(&console_frames_received, readl(&console_frames_received) + 1);
+         command_dispatch(receive_buf, pop_count);
++    }
+     if (ret) {
+         if (CONFIG_HAVE_BOOTLOADER_REQUEST && ret < 0 && pop_count == 32
+             && !memcmp(receive_buf, " \x1c Request Serial Bootloader!! ~", 32))
+@@ -89,9 +95,12 @@ console_task(void)
  }
  DECL_TASK(console_task);
  
@@ -52,7 +76,7 @@ index 4c05ef3ef..992996018 100644
  {
      // Verify space for message
      uint_fast8_t tpos = readb(&transmit_pos), tmax = readb(&transmit_max);
-@@ -101,15 +104,16 @@ console_sendf(const struct command_encoder *ce, va_list args)
+@@ -101,15 +110,16 @@ console_sendf(const struct command_encoder *ce, va_list args)
          writeb(&transmit_pos, 0);
      }
      if (tmax + READP(ce->max_size) > sizeof(transmit_buf)) {
@@ -72,7 +96,7 @@ index 4c05ef3ef..992996018 100644
          writeb(&transmit_max, tmax);
          serial_enable_tx_irq();
      }
-@@ -118,10 +122,18 @@ console_sendf(const struct command_encoder *ce, va_list args)
+@@ -118,10 +128,18 @@ console_sendf(const struct command_encoder *ce, va_list args)
      uint8_t *buf = &transmit_buf[tmax];
      uint_fast8_t msglen = command_encode_and_frame(
          buf, sizeof(transmit_buf) - tmax, ce, args);
@@ -145,9 +169,18 @@ index 843ab461a..1bc9f0d4f 100644
                         , uint8_t write_len, uint8_t *write);
  int i2c_software_read(struct i2c_software *sw_i2c
 diff --git a/src/stm32/Kconfig b/src/stm32/Kconfig
-index cdfccbb28..c5babf76e 100644
+index cdfccbb28..ea30ec275 100644
 --- a/src/stm32/Kconfig
 +++ b/src/stm32/Kconfig
+@@ -15,7 +15,7 @@ config STM32_SELECT
+     select HAVE_CHIPID
+     select HAVE_STEPPER_OPTIMIZED_BOTH_EDGE if !MACH_STM32H7
+     select HAVE_BOOTLOADER_REQUEST
+-    select HAVE_LIMITED_CODE_SIZE if FLASH_SIZE < 0x10000
++    select HAVE_LIMITED_CODE_SIZE if FLASH_SIZE < 0x10000 || MACH_GD32F303
+ 
+ config BOARD_DIRECTORY
+     string
 @@ -111,6 +111,9 @@ choice
          bool "Nation N32G455"
          select MACH_N32G45x
@@ -191,7 +224,35 @@ index cdfccbb28..c5babf76e 100644
  
  config STACK_SIZE
      int
-@@ -428,6 +436,10 @@ choice
+@@ -350,20 +358,27 @@ config ARMCM_RAM_VECTORTABLE
+ 
+ choice
+     prompt "Clock Reference" if LOW_LEVEL_OPTIONS
++    # The GD32F303 clock setup (gd32f30x.c) supports only a 24 MHz crystal
+     config STM32_CLOCK_REF_8M
+         bool "8 MHz crystal"
++        depends on !MACH_GD32F303
+     config STM32_CLOCK_REF_12M
+         bool "12 MHz crystal"
++        depends on !MACH_GD32F303
+     config STM32_CLOCK_REF_16M
+         bool "16 MHz crystal"
++        depends on !MACH_GD32F303
+     config STM32_CLOCK_REF_20M
+         bool "20 MHz crystal"
++        depends on !MACH_GD32F303
+     config STM32_CLOCK_REF_24M
+         bool "24 MHz crystal"
+     config STM32_CLOCK_REF_25M
+         bool "25 MHz crystal"
++        depends on !MACH_GD32F303
+     config STM32_CLOCK_REF_INTERNAL
+         bool "Internal clock"
++        depends on !MACH_GD32F303
+ endchoice
+ config CLOCK_REF_FREQ
+     int
+@@ -428,6 +443,10 @@ choice
          bool "Serial (on USART3 PD9/PD8)" if LOW_LEVEL_OPTIONS
          depends on !MACH_STM32F0 && !MACH_STM32F401
          select SERIAL
@@ -202,7 +263,7 @@ index cdfccbb28..c5babf76e 100644
      config STM32_SERIAL_USART3_ALT_PC11_PC10
          bool "Serial (on USART3 PC11/PC10)" if LOW_LEVEL_OPTIONS
          depends on MACH_STM32G474
-@@ -558,4 +570,6 @@ config STM32_CANBUS_PH13_PH14
+@@ -558,4 +577,6 @@ config STM32_CANBUS_PH13_PH14
      bool
      default y if STM32_MMENU_CANBUS_PH13_PH14 || STM32_CMENU_CANBUS_PH13_PH14
  

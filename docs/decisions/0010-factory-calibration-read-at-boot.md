@@ -14,8 +14,8 @@ The firmware reads the factory pages at every boot. It tries the primary page's 
 backup's, then falls back to the built-in defaults. It applies the factory firmware's own rule for
 a degenerate pair. It uses those bands unless `printer.cfg` names others for a lane.
 
-The values in use and their source are reported (`ace2k_sensors_thresholds`, `ACE_STATUS`).
-`ACE_CALIBRATION_SAVE` stages them for `SAVE_CONFIG`, when a user wants them in the file to edit.
+The values in use and their source are reported (`ace2k_sensors_thresholds`, `ACEK_STATUS`).
+`ACEK_CALIBRATION_SAVE` stages them for `SAVE_CONFIG`, when a user wants them in the file to edit.
 The pages are read through plain memory reads. The flash allow-list refuses them to the write
 routines, and a test proves it.
 

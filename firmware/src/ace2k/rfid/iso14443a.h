@@ -1,27 +1,31 @@
-/* What: the ISO/IEC 14443-A tag protocol on the unit's two readers — CRC_A, the read-only gate,
- * the inventory of a field (every tag in it, by bit-level anticollision over up to three cascade
- * levels, each tag halted once found) and the two reads of one target UID: up to three groups of
- * four NTAG pages, or up to three data blocks of one MIFARE Classic sector after an
- * authentication with a key the caller hands in.
- * How: a job per reader, begun with ace2k_iso14443a_begin() and advanced by one
- * ace2k_iso14443a_step() per task run — each step polls the exchange running and, once it ended,
- * acts on its answer and starts the next: at most one start and one poll per step, never a wait.
- * An exchange with no answer after ACE2K_ISO_POLL_MAX polls
- * ends the job in error.  A read job that read all its blocks ends with HLTA — for MIFARE sent
- * while Crypto1 is still on, which the reader encrypts itself — so its tag is halted and the next
- * job's WUPA wakes it (a tag left ACTIVE or AUTHENTICATED ignores a WUPA).  A read job's WUPA
- * that meets silence is sent once more before the job ends TAG_GONE: a job that ended in error
- * sent no HLTA, and its tag, still ACTIVE, drops silently to IDLE or HALT on the first WUPA.  Every frame to a tag
- * leaves through ace2k_iso14443a_send(), whose gate
- * lets through only the nine first bytes of the protocol's activation and read commands — no
- * write, value or password command can reach a tag (rule 1).  The key of a MIFARE job is wiped
- * the moment its authentication is started, and the whole job at its end, through ace2k_wipe()
- * (rule 7).  The reader
- * behind the ops is rfid/transceive; the tests put a field of fake tags there.  Sources:
- * ISO/IEC 14443-3 (activation, anticollision, CRC_A in Annex B); NXP MIFARE Classic and NTAG213
- * datasheets (READ, HLTA, authentication).
- * Depends on: <stdbool.h>, <stdint.h>, rfid/transceive.h (the poll status, the received frame,
- * the reader command codes), util.h. */
+/* What: the ISO/IEC 14443-A tag protocol on the unit's two readers.  It covers these parts.
+ * - CRC_A.
+ * - The read-only gate.
+ * - The inventory of a field.  It finds every tag in the field by bit-level anticollision, over up
+ *   to three cascade levels, and halts each tag once found.
+ * - The two reads of one target UID.  An NTAG read reads up to three groups of four pages.  A
+ *   MIFARE Classic read reads up to three data blocks of one sector, after an authentication with a
+ *   key that the caller hands in.
+ * How: each reader runs one job.  ace2k_iso14443a_begin() starts the job, and
+ * ace2k_iso14443a_step() advances it once per task run.  Each step polls the running exchange.
+ * Once the exchange ended, the step acts on its answer and starts the next one.  A step makes at
+ * most one start and one poll, and never waits.  An exchange with no answer after
+ * ACE2K_ISO_POLL_MAX polls ends the job in error.
+ * A read job that read all its blocks ends with HLTA, so its tag is halted, and the WUPA of the
+ * next job wakes it.  A tag left ACTIVE or AUTHENTICATED ignores a WUPA.  For MIFARE, the HLTA is
+ * sent while Crypto1 is still on, and the reader encrypts it itself.  When the WUPA of a read job
+ * meets silence, it is sent once more before the job ends with TAG_GONE.  The reason is that a job
+ * that ended in error sent no HLTA.  Its tag is still ACTIVE, and the first WUPA only drops it to
+ * IDLE or HALT, without an answer.
+ * Every frame to a tag leaves through ace2k_iso14443a_send().  Its gate lets through only nine
+ * first bytes, those of the activation and read commands of the protocol.  So no write, value or
+ * password command can reach a tag (rule 1).  The key of a MIFARE job is wiped as soon as its
+ * authentication is started, and the whole job is wiped at its end, through ace2k_wipe() (rule 7).
+ * The reader behind the ops is rfid/transceive.  The tests put a field of fake tags there.
+ * Sources: ISO/IEC 14443-3 for the activation, the anticollision and CRC_A (Annex B).  The NXP
+ * MIFARE Classic and NTAG213 datasheets for READ, HLTA and the authentication.
+ * Depends on: <stdbool.h>, <stdint.h>, util.h, and rfid/transceive.h for the poll status, the
+ * received frame and the reader command codes. */
 #ifndef ACE2K_RFID_ISO14443A_H
 #define ACE2K_RFID_ISO14443A_H
 #include <stdbool.h>
@@ -61,13 +65,13 @@
 #define ACE2K_ISO_AUTH_FRAME           12U
 #define ACE2K_ISO_MIFARE_SECTORS       16U
 #define ACE2K_ISO_BLOCKS_PER_SECTOR    4U
-#define ACE2K_ISO_DATA_BLOCKS_MASK     0x07U /* blocks 0..2 of a sector: never its trailer */
+#define ACE2K_ISO_DATA_BLOCKS_MASK     0x07U /* blocks 0..2 of a sector, never its trailer */
 #define ACE2K_ISO_NTAG_PAGES_PER_READ  4U
 #define ACE2K_ISO_NTAG_LAST_FIRST_PAGE 244U /* the last group of three reads ends on page 255 */
 #define ACE2K_ISO_SELECT_FRAME         9U
 #define ACE2K_ISO_SAK_FRAME            3U
 #define ACE2K_ISO_READ_CMD_FRAME       4U
-#define ACE2K_ISO_POLL_MAX     10U /* 100 ms of task runs: four times the reader's own timer */
+#define ACE2K_ISO_POLL_MAX     10U /* 100 ms of task runs, four times the timer of the reader */
 #define ACE2K_ISO_ANTICOLL_MAX 32U
 
 enum ace2k_iso14443a_job_kind {
@@ -81,22 +85,24 @@ enum ace2k_iso14443a_result {
     ACE2K_ISO_OK = 0,
     ACE2K_ISO_AUTH_FAILED = 1,
     ACE2K_ISO_TAG_GONE = 2, /* the target did not answer two wake-ups or its selection */
-    ACE2K_ISO_ERROR = 3,    /* a malformed answer, a CRC, a NAK, a reader that never answered */
+    ACE2K_ISO_ERROR = 3,    /* a bad answer or CRC, a NAK, or a reader that never answered */
 };
 
 struct ace2k_iso14443a_tag {
     uint8_t uid[ACE2K_ISO_UID_MAX];
     uint8_t uid_len; /* 4, 7 or 10 */
-    uint16_t atqa;   /* the answer to the wake-up, little-endian as sent; 0 after a collision */
+    uint16_t atqa;   /* the answer to the wake-up, little-endian as sent.  It is 0 after a
+                    * collision, or when the answer was not two bytes long.  The tag is still
+                    * selected then. */
     uint8_t sak;
 };
 
 struct ace2k_iso14443a_job {
     uint8_t kind;                      /* enum ace2k_iso14443a_job_kind */
-    struct ace2k_iso14443a_tag target; /* the reads: the tag to select */
-    uint8_t arg;                       /* NTAG: the first page; MIFARE: the sector, 0..15 */
+    struct ace2k_iso14443a_tag target; /* for the reads, the tag to select */
+    uint8_t arg;                       /* NTAG: the first page.  MIFARE: the sector, 0..15 */
     uint8_t count; /* NTAG: groups of four pages, 1..3; MIFARE: the data blocks' mask, bits 0..2 */
-    uint8_t key_type; /* MIFARE: 0 key A, 1 key B */
+    uint8_t key_type; /* MIFARE: 0 for key A, 1 for key B */
     uint8_t key[ACE2K_ISO_KEY_BYTES];
 };
 
@@ -105,7 +111,7 @@ struct ace2k_iso14443a_out {
     struct ace2k_iso14443a_tag tags[ACE2K_ISO_INVENTORY_MAX];
     uint8_t tag_count;
     uint8_t data[ACE2K_ISO_READS_MAX][ACE2K_ISO_BLOCK_BYTES];
-    uint8_t data_first[ACE2K_ISO_READS_MAX]; /* the block, or the first page, of each */
+    uint8_t data_first[ACE2K_ISO_READS_MAX]; /* the block, or the first page, of each read */
     uint8_t data_count;
 };
 
@@ -121,14 +127,15 @@ struct ace2k_iso14443a_engine {
     struct ace2k_iso14443a_out out;
     uint8_t phase;
     bool waiting;
-    bool woken;   /* the inventory's first wake was the WUPA; the next are REQAs */
-    bool rewoken; /* a read's WUPA met silence once and was sent again */
+    bool woken;   /* the first wake of the inventory was the WUPA; the next ones are REQAs */
+    bool rewoken; /* the WUPA of a read met silence once and was sent again */
     uint8_t polls;
     uint8_t level;
     uint8_t cl[ACE2K_ISO_CL_BYTES];
     uint8_t known_bits;
     uint8_t iterations;
     struct ace2k_iso14443a_tag cur;
+    uint8_t selected; /* the selections of an inventory; a tag selected twice counts twice */
     uint8_t reads_total;
     uint8_t reads_done;
     uint8_t read_addr[ACE2K_ISO_READS_MAX];
@@ -143,34 +150,41 @@ struct ace2k_iso14443a {
 void ace2k_iso14443a_init(struct ace2k_iso14443a *self, const struct ace2k_iso14443a_ops *ops,
                           void *ctx);
 
-/* CRC_A of len bytes, low byte first into out[0..1] (ISO/IEC 14443-3 Annex B). */
+/* Computes the CRC_A of len bytes into out[0..1], low byte first (ISO/IEC 14443-3 Annex B). */
 void ace2k_iso14443a_crc_a(const uint8_t *data, uint8_t len, uint8_t out[2]);
 
-/* The first bytes the gate lets through: REQA, WUPA, the three SEL codes, HLTA, READ and the
- * two authentication codes — nothing that writes, changes a value or presents a password. */
+/* Returns true for a first byte that the gate lets through.  These are REQA, WUPA, the three SEL
+ * codes, HLTA, READ and the two authentication codes.  Nothing that writes, changes a value or
+ * presents a password gets through. */
 bool ace2k_iso14443a_frame_allowed(uint8_t first);
 
-/* The one path of a frame to a tag: -ACE2K_EREFUSED, the reader untouched, when the first byte
- * is not allowed; otherwise ops->start's answer. */
+/* Sends a frame to a tag.  This is the only path for such a frame.  When the first byte is not
+ * allowed, it returns -ACE2K_EREFUSED and the reader is not touched.  Otherwise it returns the
+ * answer of ops->start. */
 int ace2k_iso14443a_send(struct ace2k_iso14443a *self, uint8_t reader, uint8_t cmd,
                          const uint8_t *tx, uint8_t len, uint8_t last_bits);
 
-/* Starts a job: -ACE2K_EREFUSED while one runs on the reader, -ACE2K_EINVAL for a job out of
- * bounds (a reader ≥ 2, an unknown kind, a target UID not 4, 7 or 10 bytes, NTAG groups outside
- * 1..3 or a first page past ACE2K_ISO_NTAG_LAST_FIRST_PAGE, a sector ≥ 16, a block mask 0 or
- * with bit 3, a key type above 1). */
+/* Starts a job.  It returns -ACE2K_EREFUSED while another job runs on the reader.  It returns
+ * -ACE2K_EINVAL for a job out of bounds.  Out of bounds means any of these.
+ * - A reader ≥ 2.
+ * - An unknown kind.
+ * - A target UID that is not 4, 7 or 10 bytes long.
+ * - NTAG groups outside 1..3, or a first page past ACE2K_ISO_NTAG_LAST_FIRST_PAGE.
+ * - A sector ≥ 16, a block mask of 0 or with bit 3 set, or a key type above 1. */
 int ace2k_iso14443a_begin(struct ace2k_iso14443a *self, uint8_t reader,
                           const struct ace2k_iso14443a_job *job);
 
-/* The bounds begin() checks on a job, for a caller that validates a job before it queues it. */
+/* Checks the bounds that begin() checks on a job.  It is for a caller that validates a job before
+ * it queues it. */
 bool ace2k_iso14443a_job_valid(const struct ace2k_iso14443a_job *job);
 
 bool ace2k_iso14443a_busy(const struct ace2k_iso14443a *self, uint8_t reader);
 
-/* One step of the reader's job; true on the step it ended (its result readable until the next
- * begin). */
+/* Runs one step of the job of the reader.  It returns true on the step where the job ended.  The
+ * result can be read until the next begin. */
 bool ace2k_iso14443a_step(struct ace2k_iso14443a *self, uint8_t reader);
 
+/* Returns the last result of the reader, or NULL for a reader out of range. */
 const struct ace2k_iso14443a_out *ace2k_iso14443a_result(const struct ace2k_iso14443a *self,
                                                          uint8_t reader);
 

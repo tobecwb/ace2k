@@ -5,39 +5,67 @@ void ace2k_link_turnaround_init(struct ace2k_link_turnaround *self, uint32_t idl
     self->idle_ticks = idle_ticks;
     self->last_rx = 0;
     self->rx_seen = false;
+    self->last_frame = 0;
+    self->frame_seen = false;
     self->lost = false;
     self->tx_pending = false;
     self->deferred = 0;
     self->rearmed = 0;
+    self->max_gap = 0;
+}
+
+static void note_gap(struct ace2k_link_turnaround *self, uint32_t gap)
+{
+    if (gap > self->max_gap) {
+        self->max_gap = gap;
+    }
 }
 
 void ace2k_link_turnaround_rx(struct ace2k_link_turnaround *self, uint32_t now)
 {
     self->last_rx = now;
     self->rx_seen = true;
+}
+
+void ace2k_link_turnaround_frame(struct ace2k_link_turnaround *self, uint32_t now)
+{
+    if (self->frame_seen) {
+        note_gap(self, now - self->last_frame);
+    }
+    self->last_frame = now;
+    self->frame_seen = true;
     self->lost = false;
 }
 
-/* The age is unsigned on purpose: a signed difference would turn negative half a wrap after the
- * last byte and read as recent; the unsigned one reads small again a whole wrap later, and the
- * latch — set on the first call that finds the silence long enough — holds through it. */
+void ace2k_link_turnaround_gap_clear(struct ace2k_link_turnaround *self)
+{
+    self->max_gap = 0;
+}
+
+/* The age is unsigned on purpose.  A signed difference would turn negative half a wrap after the
+ * last frame, and the age would read as recent.  The unsigned age reads small again only a whole
+ * wrap later.  By then the latch holds: the first call that finds the silence long enough sets
+ * it. */
 bool ace2k_link_turnaround_link_ok(struct ace2k_link_turnaround *self, uint32_t now,
                                    uint32_t lost_ticks)
 {
-    if (!self->rx_seen || self->lost) {
+    if (!self->frame_seen || self->lost) {
         return false;
     }
-    if (now - self->last_rx >= lost_ticks) {
+    uint32_t age = now - self->last_frame;
+    if (age >= lost_ticks) {
         self->lost = true;
+        note_gap(self, age);
         return false;
     }
     return true;
 }
 
-/* Busy only within one idle window either side of the last byte (signed: the tick counter
- * wraps): a byte a few ticks "after" the caller's clock is the receive interrupt racing the call
- * and stays busy; a host silent for longer than half the counter's range is quiet, not busy
- * again.  A unit that never received a byte owns the line.  last_rx is the caller's one read. */
+/* The line is busy only within one idle window on either side of the last byte.  The difference
+ * is signed because the tick counter wraps.  A byte a few ticks "after" the caller's clock comes
+ * from the receive interrupt racing the call, and the line stays busy.  A host silent for longer
+ * than half the range of the counter is quiet, not busy again.  A unit that never received
+ * a byte owns the line.  last_rx is the one read that the caller made. */
 static bool line_quiet(const struct ace2k_link_turnaround *self, uint32_t now, uint32_t last_rx)
 {
     if (!self->rx_seen) {

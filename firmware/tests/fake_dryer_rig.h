@@ -14,6 +14,7 @@
 
 #include "heat/airflow.h"
 #include "dryer/dryer.h"
+#include "dryer/dryer_auto.h"
 #include "dryer/dryer_internal.h"
 #include "fake_thermal.h"
 #include "heat/heat.h"
@@ -22,7 +23,7 @@
 #define RIG_TICK_US             10000U
 #define RIG_HALF_CYCLE_US       8333U /* 60 Hz, two edges per cycle */
 #define RIG_MAINS_HZ10          600U  /* what the mains measures of it */
-#define RIG_MAINS_HZ10_OFF_BAND 585U  /* the bench's dip: one window read 58.5 Hz */
+#define RIG_MAINS_HZ10_OFF_BAND 585U  /* the dip seen on the unit: one window read 58.5 Hz */
 #define RIG_PLANT_MS            100U
 #define RIG_EDGES_PER_PLANT     12U
 #define RIG_EV_MAX              64U
@@ -58,7 +59,8 @@ struct rig {
     /* the world */
     bool heater_dead, dryer_frozen;
     bool mains_present, mains_plausible, cutout, link_ok, chamber_valid;
-    bool mains_unmeasured; /* no window measured yet (a boot): hz10 0 */
+    bool mains_unmeasured;  /* no window measured yet (a boot): hz10 0 */
+    bool cutout_dryer_only; /* the cutout reaches the dryer's inputs, not heat's */
     uint32_t chamber_age_ms;
     uint8_t insert_mask;
     uint16_t rh_pct10; /* the chamber's RH, 0.1 % (the model has none): 30 % by default */
@@ -73,6 +75,7 @@ struct rig {
     struct ace2k_dryer_event ev[RIG_EV_MAX];
     uint32_t ev_n;
     struct ace2k_dryer_inputs last_in;
+    struct ace2k_dryer_auto *auto_; /* when set, ticked right after the dryer */
 };
 
 static inline void rig_fan_write(void *ctx, bool on)
@@ -291,6 +294,15 @@ static inline bool rig_mains_measured(const struct rig *r, const struct ace2k_dr
     return in->mains_present;
 }
 
+/* The cutout as heat reads it: the dryer's own input, unless the test keeps it from heat. */
+static inline bool rig_heat_cutout(const struct rig *r, const struct ace2k_dryer_inputs *in)
+{
+    if (r->cutout_dryer_only) {
+        return false;
+    }
+    return in->cutout;
+}
+
 static inline void rig_tick(struct rig *r)
 {
     uint8_t state_before = r->dryer.state;
@@ -301,7 +313,8 @@ static inline void rig_tick(struct rig *r)
     rig_plant(r);
     struct ace2k_dryer_inputs in;
     rig_readings(r, &in);
-    r->airflow.heat_holds = ace2k_heat_active(&r->heat); /* as the binding, before airflow */
+    ace2k_airflow_set_heat_holds(&r->airflow,
+                                 ace2k_heat_active(&r->heat)); /* as the binding, before airflow */
     ace2k_airflow_tick(&r->airflow, in.ntc_left_mc, in.ntc_right_mc, in.left_valid, in.right_valid,
                        r->now_ms);
     struct ace2k_heat_inputs hi = {
@@ -312,7 +325,7 @@ static inline void rig_tick(struct rig *r)
         .mains_present = in.mains_present,
         .mains_hz10 = rig_hz10(r, &in),
         .mains_measured = rig_mains_measured(r, &in),
-        .cutout = in.cutout,
+        .cutout = rig_heat_cutout(r, &in),
         .fans_read = ace2k_airflow_fans_read(&r->airflow),
         .fans_commanded = ace2k_airflow_fans_commanded(&r->airflow),
     };
@@ -320,6 +333,9 @@ static inline void rig_tick(struct rig *r)
     rig_check_flaps(r);
     if (!r->dryer_frozen) {
         ace2k_dryer_tick(&r->dryer, &in, r->now_ms);
+        if (r->auto_ != NULL) {
+            ace2k_dryer_auto_tick(r->auto_, &in, r->now_ms);
+        }
     }
     rig_check_flaps(r);
     r->entered_by_tick = r->dryer.state != state_before;

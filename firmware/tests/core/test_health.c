@@ -13,7 +13,6 @@ static void all_good(struct ace2k_health_inputs *in)
         in->insert_connected[i] = true;
         in->buffer_consistent[i] = true;
     }
-    in->buffer_check_enabled = true;
     in->sensors_fresh = in->vdda_ok = true;
     in->clock_ok = in->watchdog_ok = in->config_page_ok = in->image_crc_ok = true;
 }
@@ -60,14 +59,13 @@ TEST(all_good_is_zero_and_each_input_maps_to_its_bit)
     ASSERT_EQ(ace2k_health_evaluate(&in), ACE2K_HEALTH_BIT(ACE2K_HEALTH_FG1));
     in.fg_delta[0] = 0;
     in.buffer_consistent[3] = false;
-    in.buffer_check_enabled = false;
-    ASSERT_EQ(ace2k_health_evaluate(&in), 0); /* not enabled: never a bit */
+    ASSERT_EQ(ace2k_health_evaluate(&in), ACE2K_HEALTH_BIT(ACE2K_HEALTH_BUFFER1 + 3));
 }
 
 TEST(apply_keeps_boot_only_bits_on_a_periodic_pass_and_latches)
 {
     struct ace2k_health h;
-    ace2k_health_init(&h, ACE2K_RESET_POWER_ON);
+    ace2k_health_init(&h, ACE2K_RESET_POWER_ON, 0);
     ASSERT_EQ(h.reset_cause, ACE2K_RESET_POWER_ON);
     ASSERT_TRUE(!h.post_done);
     ace2k_health_apply(
@@ -91,6 +89,47 @@ TEST(apply_keeps_boot_only_bits_on_a_periodic_pass_and_latches)
     ace2k_health_apply(&h, 0, 5000, true);
     ASSERT_EQ(h.now, 0);
     ASSERT_EQ(h.post_ms, 5000);
+}
+
+/* Ticks on time are settled from the first one after init. */
+TEST(ticks_on_time_are_settled)
+{
+    struct ace2k_health h;
+    ace2k_health_init(&h, ACE2K_RESET_POWER_ON, 5000U);
+    for (uint32_t now = 5010U; now <= 6000U; now += 10U) {
+        ASSERT_TRUE(ace2k_health_tick_settled(&h, now, 10U));
+    }
+    /* two periods late is still on time */
+    ASSERT_TRUE(ace2k_health_tick_settled(&h, 6020U, 10U));
+}
+
+/* A tick more than two periods late opens the settle window; the passes resume at its end. */
+TEST(a_late_tick_holds_the_passes_for_the_settle_window)
+{
+    struct ace2k_health h;
+    ace2k_health_init(&h, ACE2K_RESET_POWER_ON, 1000U);
+    ASSERT_TRUE(ace2k_health_tick_settled(&h, 1010U, 10U));
+    ASSERT_TRUE(!ace2k_health_tick_settled(&h, 1041U, 10U)); /* 31 ms after the last */
+    uint32_t now = 1041U;
+    while (now + 10U < 1041U + ACE2K_HEALTH_SETTLE_MS) {
+        now += 10U;
+        ASSERT_TRUE(!ace2k_health_tick_settled(&h, now, 10U));
+    }
+    ASSERT_TRUE(ace2k_health_tick_settled(&h, 1041U + ACE2K_HEALTH_SETTLE_MS, 10U));
+}
+
+/* The window's end is compared across the 49-day wrap of the millisecond clock. */
+TEST(the_settle_window_survives_the_clock_wrap)
+{
+    struct ace2k_health h;
+    ace2k_health_init(&h, ACE2K_RESET_POWER_ON, 0xFFFFFFE0U);
+    ASSERT_TRUE(!ace2k_health_tick_settled(&h, 0xFFFFFFFFU, 10U)); /* 31 ms late */
+    /* the window ends at 0xFFFFFFFF + 50 = 49, past the wrap */
+    ASSERT_EQ(0xFFFFFFFFU + ACE2K_HEALTH_SETTLE_MS, 49U);
+    for (uint32_t now = 9U; now < 49U; now += 10U) {
+        ASSERT_TRUE(!ace2k_health_tick_settled(&h, now, 10U));
+    }
+    ASSERT_TRUE(ace2k_health_tick_settled(&h, 49U, 10U));
 }
 
 // NOLINTNEXTLINE(readability-identifier-naming)

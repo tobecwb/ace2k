@@ -18,7 +18,7 @@ bool ace2k_guard_flash_allowed(uint32_t addr, uint32_t len)
     if (addr < ACE2K_GUARD_CONFIG_PAGE_ADDR) {
         return false;
     }
-    /* Subtraction first: addr + len could wrap at the top of the address space. */
+    /* Subtract first, because addr + len could wrap at the top of the address space. */
     return addr - ACE2K_GUARD_CONFIG_PAGE_ADDR <= ACE2K_GUARD_CONFIG_PAGE_SIZE - len;
 }
 

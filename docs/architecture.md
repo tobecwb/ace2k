@@ -133,7 +133,7 @@ properties of the unit's bootloader, which ace2k never writes:
 So:
 
 ```
-ace2k running ──(1) G-code ACE_RESTORE_STOCK ──▶ MCU: motion stopped, heater off;
+ace2k running ──(1) G-code ACEK_RESTORE_STOCK ─▶ MCU: motion stopped, heater off;
                                                  refused while the heater is leased or a lane moves
                                            (2) stops feeding the watchdog, interrupts off, spins
                                            (3) ≤ 0.5 s later the watchdog resets the chip
@@ -274,11 +274,68 @@ shape is used for feed error kinds and LED patterns.
 The host side mirrors the MCU modules, one file per concern:
 
 - `ace2k.py` (the `[ace2k]` section, the `[mcu]` binding, G-code);
+- `ace2k_link.py` (the constants and the query function that every host module shares, and
+  `FeedRefused`);
+- `ace2k_units.py` (what spans units, below);
+- `ace2k_feed.py` (load/unload sequencing with the extruder), with `ace2k_feed_base.py` (the
+  attributes its parts share), `ace2k_feed_connect.py` (the feed keys and the setup at connect),
+  `ace2k_feed_motion.py` (the lane starts and stops), `ace2k_feed_proto.py` (the names and message
+  formats of the unit's feed) and `ace2k_feed_settings.py` (the settings it checks and sends);
+- `ace2k_follow.py` (turns the follow on by default);
+- `ace2k_ff.py` (the feed-forward: the lane meters out what its extruder is about to use);
+- `ace2k_encoder_cal.py` (calibrates the encoder of a lane from its extruder);
 - `ace2k_dryer.py`;
-- `ace2k_rfid.py` (the spool model);
-- `ace2k_feed.py` (load/unload sequencing with the extruder).
+- `ace2k_env.py` (the temperatures of the unit as Klipper temperature sensors);
+- `ace2k_health.py` (the self-test of the unit);
+- `ace2k_rfid.py` (the spool model and the read session), with `ace2k_rfid_kept.py` (the last
+  read of each lane, kept across a restart);
+- `ace2k_tag.py` (the settings of one `[ace2k_tag <brand>]` section);
+- `ace2k_tags/` (one module per spool brand, a registry and the shared crypto);
+- `ace2k_klipper_types.py` (types of the Klipper objects, for the type checker only).
 
 It is thin, because the policy lives in the MCU.
+
+**The unit and the coordinator.** Each `[ace2k]` or `[ace2k <name>]` section builds one unit
+object. The unit owns the MCU binding and its own feed, tag reader and dryer. These are printer
+objects named after the section (`ace2k_feed`, or `ace2k_feed b`), and no module looks another
+unit's up by a fixed name. A unit never consults another.
+
+What spans units belongs to one coordinator, the printer object `ace2k_units`. The first unit to
+load creates it from the sections the config declares, and every unit adds itself. It does three
+things:
+
+- It owns the commands. Each `ACEK_*` command is registered once with Klipper. The coordinator
+  reads `UNIT=`, runs that unit's handler, and puts the unit's name on the console lines.
+- It owns the extruder groups. It gathers the lane map of every unit and keeps the one active lane
+  of each extruder that several lanes feed. Each unit's follow asks it whether a lane may be armed,
+  so two units cannot arm two lanes on one extruder.
+- It answers the feed-forward. A unit asks it for the followers of an extruder before it doses,
+  and doses only when its own lane is the one.
+
+Another host module can make a lane the active lane of its shared extruder without a G-code
+command: `Units.hand_over(unit, lane, pause_wait_s)` (host interface 11) stops every other follower of
+that extruder, on any unit, waits for their ends, and records the choice. It arms nothing: the
+caller moves the lane first and arms it after. If a follower does not end in time it raises
+`RuntimeError` and the choice stays as it was. A lane with its own extruder has nothing to choose.
+`Units.release(extruder, pause_wait_s)` (host interface 13) undoes the choice. It stops every
+follower of that extruder, the active lane included, waits for their ends, and leaves no lane
+active.
+
+A single place decides, so two units cannot choose at the same moment. The config errors that
+concern the units as a whole are raised here at the start.
+
+Host interface 12 adds `start_move`'s `free_tip` argument (default false). A host module that pushes
+filament to a head, with no extruder holding the tip, passes true; `ACEK_FEED FREE=1` does the same
+by hand. The unit then judges the full plunger by the filament, in windows, and never by the touch.
+A load from the bay always does; the read with motion never does (its filament may be in an
+extruder). An image without `free_tip` on `ace2k_feed_start` is refused at connect
+(another format): reflash it.
+
+Host interface 13 adds three calls a timer may make where a G-code cannot run:
+`feed.set_speed(lane, speed)` for `ACEK_SPEED`, and the dryer's `start(target_c, minutes)`, `stop()`
+and `clear()` for `ACEK_DRY`, `ACEK_DRY_STOP` and `ACEK_DRY_CLEAR`. Each sends the same request as
+its G-code and waits for the unit's answer; a refusal raises (`FeedRefused`, `DryerRefused`). The
+firmware is unchanged.
 
 ## Repository layout
 

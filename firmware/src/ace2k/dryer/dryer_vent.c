@@ -1,11 +1,11 @@
-/* The vent and the humidity guard (dryer_vent.h).  The table: saturation vapour density over
- * water, ρ = 216.7 · e / (273.15 + T) g/m³ with e = 6.112 · exp(17.67 T / (T + 243.5)) hPa — the
- * Magnus formula — in 0.01 g/m³, rounded, 0–90 °C. */
+/* The vent and the humidity guard (dryer_vent.h). The table holds the saturation vapour density
+ * over water, ρ = 216.7 · e / (273.15 + T) g/m³, with e = 6.112 · exp(17.67 T / (T + 243.5)) hPa.
+ * That is the Magnus formula. The values are in 0.01 g/m³, rounded, for 0–90 °C. */
 #include "dryer/dryer_vent.h"
 
 #define VENT_TABLE_MAX_C 90
 
-static const uint16_t ace2k_vent_sat_cg[VENT_TABLE_MAX_C + 1] = {
+static const uint16_t vent_sat_cg[VENT_TABLE_MAX_C + 1] = {
     485,   519,   556,   595,   636,   679,   726,   775,   826,   881,   939,   1000,  1065,
     1133,  1205,  1282,  1362,  1446,  1535,  1629,  1727,  1831,  1940,  2055,  2176,  2302,
     2435,  2574,  2721,  2874,  3035,  3203,  3380,  3564,  3758,  3960,  4172,  4393,  4624,
@@ -20,9 +20,9 @@ uint32_t ace2k_dryer_vent_ah_cg(int32_t chamber_mc, uint16_t rh_pct10)
     int32_t mc = ace2k_clamp_i32(chamber_mc, 0, (VENT_TABLE_MAX_C * ACE2K_DRYER_MC_PER_C) - 1);
     uint32_t i = (uint32_t)mc / (uint32_t)ACE2K_DRYER_MC_PER_C;
     uint32_t frac = (uint32_t)mc % (uint32_t)ACE2K_DRYER_MC_PER_C;
-    uint32_t lo = ace2k_vent_sat_cg[i];
+    uint32_t lo = vent_sat_cg[i];
     uint32_t sat =
-        lo + ((((uint32_t)ace2k_vent_sat_cg[i + 1U] - lo) * frac) / (uint32_t)ACE2K_DRYER_MC_PER_C);
+        lo + ((((uint32_t)vent_sat_cg[i + 1U] - lo) * frac) / (uint32_t)ACE2K_DRYER_MC_PER_C);
     uint32_t rh = rh_pct10;
     if (rh > ACE2K_DRYER_RH_FULL_PCT10) {
         rh = ACE2K_DRYER_RH_FULL_PCT10; /* no air holds more than saturation */
@@ -111,7 +111,7 @@ static int32_t newest(const struct ace2k_dryer_vent *v)
     return v->hist_mc[(v->hist_next + ACE2K_DRYER_VENT_SLOTS - 1U) % ACE2K_DRYER_VENT_SLOTS];
 }
 
-/* The ring is full: the oldest slot is the one written next. */
+/* Use only when the ring is full. Then the oldest slot is the one written next. */
 static int32_t oldest(const struct ace2k_dryer_vent *v)
 {
     return v->hist_mc[v->hist_next];
@@ -131,8 +131,10 @@ static bool open_due(const struct ace2k_dryer_vent *v, int32_t target_mc, uint32
     return newest(v) - oldest(v) < ACE2K_DRYER_VENT_RISE_MC;
 }
 
-/* The guard wants the flaps the other way: open and drier than the room by more than the close
- * margin (never, with a room below the margin), or closed and humid again by the hysteresis. */
+/* True when the guard wants the flaps the other way. With the flaps open, that is when the
+ * chamber is drier than the room by more than the close margin. It never happens when the room
+ * itself is below the margin. With the flaps closed, it is when the chamber is humid again by the
+ * hysteresis. */
 static bool guard_wants(const struct ace2k_dryer_vent *v, uint32_t ah)
 {
     if (v->open) {
@@ -149,8 +151,8 @@ static enum ace2k_dryer_vent_action guard(struct ace2k_dryer_vent *v,
 {
     uint32_t ah = ace2k_dryer_vent_sample_cg(s);
     if (v->room_cg == ACE2K_DRYER_VENT_AH_UNKNOWN || ah == ACE2K_DRYER_VENT_AH_UNKNOWN) {
-        /* frozen where it is, and the hold restarts: the condition must hold
-         * ACE2K_DRYER_VENT_GUARD_HOLD_MS of valid readings, an invalid stretch counts for none */
+        /* The guard stays where it is, and the hold restarts. The condition must hold for
+         * ACE2K_DRYER_VENT_GUARD_HOLD_MS of valid readings. An invalid stretch counts for none. */
         v->cond = false;
         return ACE2K_DRYER_VENT_HOLD;
     }
@@ -193,8 +195,8 @@ enum ace2k_dryer_vent_action ace2k_dryer_vent_step(struct ace2k_dryer_vent *v, i
         return guard(v, s, now_ms);
     }
     if (!s->chamber_valid) {
-        /* no decision on no reading, and the window restarts: "stopped rising" is judged over
-         * ACE2K_DRYER_VENT_SLOTS valid samples on the grid, never across a gap */
+        /* No reading means no decision, and the window restarts. "Stopped rising" is judged over
+         * ACE2K_DRYER_VENT_SLOTS valid samples in a row, never across a gap. */
         v->hist_n = 0U;
         v->hist_next = 0U;
         return ACE2K_DRYER_VENT_HOLD;

@@ -2,6 +2,7 @@
 #include "core/config.h"
 #include "core/guard.h"
 #include "core/util.h"
+#include "dryer/dryer.h" // ACE2K_DRYER_EV_FAULT, the log entries' kind
 
 /* A RAM page that behaves like the flash controller: erase sets 0xFF, a word programs only
  * onto an erased word, every call outside the config page counts as a violation. */
@@ -10,7 +11,9 @@ struct ace2k_fake_flash {
     int erases;
     int programs;
     int violations;
-    int fail_erase;
+    int refuse_erase;     /* the guard refuses the erase before the controller is touched */
+    int fail_erase;       /* the controller flags an error: the page untouched */
+    int fail_blank_check; /* the erase runs, but a word from this page offset on stays written */
     int fail_program;
     int lie_on_readback;
     int lie_at; /* a page offset whose byte reads back flipped, or -1 */
@@ -24,7 +27,9 @@ static void fake_reset(struct ace2k_fake_flash *f)
     f->erases = 0;
     f->programs = 0;
     f->violations = 0;
+    f->refuse_erase = 0;
     f->fail_erase = 0;
+    f->fail_blank_check = -1;
     f->fail_program = 0;
     f->lie_on_readback = 0;
     f->lie_at = -1;
@@ -51,6 +56,9 @@ static void fake_read(void *ctx, uint32_t addr, uint8_t *out, uint32_t len)
 static int fake_erase(void *ctx, uint32_t addr)
 {
     struct ace2k_fake_flash *f = ctx;
+    if (f->refuse_erase) {
+        return -ACE2K_EREFUSED;
+    }
     if (!ace2k_guard_flash_allowed(addr, ACE2K_GUARD_CONFIG_PAGE_SIZE)) {
         f->violations++;
         return -ACE2K_EREFUSED;
@@ -59,10 +67,11 @@ static int fake_erase(void *ctx, uint32_t addr)
     if (f->fail_erase) {
         return -ACE2K_EFLASH;
     }
-    for (size_t i = 0; i < sizeof f->page; i++) {
+    size_t end = f->fail_blank_check >= 0 ? (size_t)f->fail_blank_check : sizeof f->page;
+    for (size_t i = 0; i < end; i++) {
         f->page[i] = 0xFF;
     }
-    return 0;
+    return f->fail_blank_check >= 0 ? -ACE2K_EFLASH : 0;
 }
 
 static int fake_program(void *ctx, uint32_t addr, uint32_t word)
@@ -86,7 +95,7 @@ static int fake_program(void *ctx, uint32_t addr, uint32_t word)
     return 0;
 }
 
-static const struct ace2k_config_ops ace2k_fake_ops = {
+static const struct ace2k_config_ops fake_ops = {
     .flash_read = fake_read,
     .flash_erase_page = fake_erase,
     .flash_program_word = fake_program,
@@ -98,7 +107,7 @@ TEST(a_blank_page_loads_the_defaults)
 {
     struct ace2k_config c;
     fake_reset(&ace2k_flash);
-    ace2k_config_init(&c, &ace2k_fake_ops, &ace2k_flash);
+    ace2k_config_init(&c, &fake_ops, &ace2k_flash);
     ASSERT_EQ(c.source, ACE2K_CONFIG_FROM_DEFAULTS_BLANK);
     ASSERT_STR_EQ(c.record.proven_version, "");
     ASSERT_EQ(c.record.flags, 0);
@@ -130,7 +139,7 @@ TEST(store_then_load_returns_the_record)
     struct ace2k_config c;
     struct ace2k_config again;
     fake_reset(&ace2k_flash);
-    ace2k_config_init(&c, &ace2k_fake_ops, &ace2k_flash);
+    ace2k_config_init(&c, &fake_ops, &ace2k_flash);
     ace2k_str_copy(c.record.proven_version, ACE2K_CONFIG_VERSION_LEN, "0.1.0");
     c.record.flags = ACE2K_CONFIG_FLAG_LINK_PROVEN;
     ASSERT_EQ(ace2k_config_store(&c), 0);
@@ -138,7 +147,7 @@ TEST(store_then_load_returns_the_record)
     ASSERT_EQ(ace2k_flash.erases, 1);
     ASSERT_EQ(ace2k_flash.programs, ACE2K_CONFIG_RECORD_LEN / 4);
     ASSERT_EQ(ace2k_flash.violations, 0);
-    ace2k_config_init(&again, &ace2k_fake_ops, &ace2k_flash);
+    ace2k_config_init(&again, &fake_ops, &ace2k_flash);
     ASSERT_EQ(again.source, ACE2K_CONFIG_FROM_FLASH);
     ASSERT_STR_EQ(again.record.proven_version, "0.1.0");
     ASSERT_EQ(again.record.flags, ACE2K_CONFIG_FLAG_LINK_PROVEN);
@@ -148,12 +157,12 @@ TEST(a_corrupt_page_loads_the_defaults)
 {
     struct ace2k_config c;
     fake_reset(&ace2k_flash);
-    ace2k_config_init(&c, &ace2k_fake_ops, &ace2k_flash);
+    ace2k_config_init(&c, &fake_ops, &ace2k_flash);
     ace2k_str_copy(c.record.proven_version, ACE2K_CONFIG_VERSION_LEN, "0.1.0");
     c.record.flags = ACE2K_CONFIG_FLAG_LINK_PROVEN;
     ASSERT_EQ(ace2k_config_store(&c), 0);
     ace2k_flash.page[12] ^= 0x40U; /* one bit of the version */
-    ace2k_config_init(&c, &ace2k_fake_ops, &ace2k_flash);
+    ace2k_config_init(&c, &fake_ops, &ace2k_flash);
     ASSERT_EQ(c.source, ACE2K_CONFIG_FROM_DEFAULTS_CORRUPT);
     ASSERT_STR_EQ(c.record.proven_version, "");
     ASSERT_EQ(c.record.flags, 0);
@@ -193,28 +202,88 @@ TEST(a_failing_erase_is_reported_and_nothing_is_programmed)
 {
     struct ace2k_config c;
     fake_reset(&ace2k_flash);
-    ace2k_config_init(&c, &ace2k_fake_ops, &ace2k_flash);
+    ace2k_config_init(&c, &fake_ops, &ace2k_flash);
     ace2k_flash.fail_erase = 1;
     ASSERT_EQ(ace2k_config_store(&c), -ACE2K_EFLASH);
     ASSERT_EQ(ace2k_flash.programs, 0);
     ASSERT_EQ(c.source, ACE2K_CONFIG_FROM_DEFAULTS_BLANK);
 }
 
+TEST(a_refused_erase_is_reported_as_refused_and_touches_nothing)
+{
+    struct ace2k_config c;
+    fake_reset(&ace2k_flash);
+    ace2k_config_init(&c, &fake_ops, &ace2k_flash);
+    ace2k_flash.refuse_erase = 1;
+    ASSERT_EQ(ace2k_config_store(&c), -ACE2K_EREFUSED);
+    ASSERT_EQ(ace2k_flash.erases, 0);
+    ASSERT_EQ(ace2k_flash.programs, 0);
+    ASSERT_EQ(c.source, ACE2K_CONFIG_FROM_DEFAULTS_BLANK); /* the page is as it was */
+}
+
 TEST(a_failing_program_is_reported)
 {
     struct ace2k_config c;
     fake_reset(&ace2k_flash);
-    ace2k_config_init(&c, &ace2k_fake_ops, &ace2k_flash);
+    ace2k_config_init(&c, &fake_ops, &ace2k_flash);
     ace2k_flash.fail_program = 1;
     ASSERT_EQ(ace2k_config_store(&c), -ACE2K_EFLASH);
     ASSERT_EQ(ace2k_flash.programs, 1);
+}
+
+/* A store that fails after the erase leaves the page erased or half written: the page is
+ * reported corrupt from then on, as the next boot will find it, not valid as before the store. */
+TEST(a_store_that_fails_after_the_erase_reports_the_page_corrupt)
+{
+    struct ace2k_config c;
+    fake_reset(&ace2k_flash);
+    ace2k_config_init(&c, &fake_ops, &ace2k_flash);
+    ASSERT_EQ(ace2k_config_store(&c), 0);
+    ASSERT_EQ(c.source, ACE2K_CONFIG_FROM_FLASH);
+    ace2k_flash.fail_program = 1;
+    ASSERT_EQ(ace2k_config_store(&c), -ACE2K_EFLASH);
+    ASSERT_EQ(c.source, ACE2K_CONFIG_FROM_DEFAULTS_CORRUPT);
+    struct ace2k_config again;
+    ace2k_config_init(&again, &fake_ops, &ace2k_flash);
+    ASSERT_TRUE(again.source != ACE2K_CONFIG_FROM_FLASH); /* the next boot finds no record */
+    ace2k_flash.fail_program = 0;
+    ASSERT_EQ(ace2k_config_store(&c), 0);
+    ASSERT_EQ(c.source, ACE2K_CONFIG_FROM_FLASH);
+    ace2k_flash.fail_erase = 1; /* an erase that fails changed nothing: the page stays valid */
+    ASSERT_EQ(ace2k_config_store(&c), -ACE2K_EFLASH);
+    ASSERT_EQ(c.source, ACE2K_CONFIG_FROM_FLASH);
+}
+
+/* An erase whose blank check fails has erased the page, or part of it: the page is read again
+ * and reported as it now is, not as it was before the store.  A refused erase touched nothing. */
+TEST(an_erase_that_fails_its_blank_check_reports_the_page_as_it_now_is)
+{
+    struct ace2k_config c;
+    fake_reset(&ace2k_flash);
+    ace2k_config_init(&c, &fake_ops, &ace2k_flash);
+    ASSERT_EQ(ace2k_config_store(&c), 0);
+    ASSERT_EQ(c.source, ACE2K_CONFIG_FROM_FLASH);
+    /* the first half of the record erased, the rest still written: no valid record */
+    ace2k_flash.fail_blank_check = (int)(ACE2K_CONFIG_RECORD_LEN / 2U);
+    ASSERT_EQ(ace2k_config_store(&c), -ACE2K_EFLASH);
+    ASSERT_EQ(ace2k_flash.programs, ACE2K_CONFIG_RECORD_LEN / 4); /* the first store's only */
+    ASSERT_EQ(c.source, ACE2K_CONFIG_FROM_DEFAULTS_CORRUPT);
+    /* the record erased whole, one word past it still written: the page reads blank */
+    ace2k_flash.fail_blank_check = -1;
+    ASSERT_EQ(ace2k_config_store(&c), 0);
+    ace2k_flash.fail_blank_check = (int)ACE2K_GUARD_CONFIG_PAGE_SIZE - 4;
+    ASSERT_EQ(ace2k_config_store(&c), -ACE2K_EFLASH);
+    ASSERT_EQ(c.source, ACE2K_CONFIG_FROM_DEFAULTS_BLANK);
+    struct ace2k_config again;
+    ace2k_config_init(&again, &fake_ops, &ace2k_flash);
+    ASSERT_EQ(again.source, c.source); /* what the next boot finds */
 }
 
 TEST(a_readback_mismatch_is_reported)
 {
     struct ace2k_config c;
     fake_reset(&ace2k_flash);
-    ace2k_config_init(&c, &ace2k_fake_ops, &ace2k_flash);
+    ace2k_config_init(&c, &fake_ops, &ace2k_flash);
     ace2k_flash.lie_on_readback = 1;
     ASSERT_EQ(ace2k_config_store(&c), -ACE2K_EFLASH);
     ASSERT_EQ(ace2k_flash.programs, ACE2K_CONFIG_RECORD_LEN / 4);
@@ -225,11 +294,12 @@ TEST(a_single_mismatching_word_on_readback_is_reported)
 {
     struct ace2k_config c;
     fake_reset(&ace2k_flash);
-    ace2k_config_init(&c, &ace2k_fake_ops, &ace2k_flash);
+    ace2k_config_init(&c, &fake_ops, &ace2k_flash);
     ace2k_flash.lie_at = ACE2K_CONFIG_RECORD_LEN - 1;
     ASSERT_EQ(ace2k_config_store(&c), -ACE2K_EFLASH);
     ASSERT_EQ(ace2k_flash.programs, ACE2K_CONFIG_RECORD_LEN / 4);
-    ASSERT_EQ(c.source, ACE2K_CONFIG_FROM_DEFAULTS_BLANK);
+    ASSERT_EQ(c.source,
+              ACE2K_CONFIG_FROM_DEFAULTS_CORRUPT); /* the readback failed after the erase */
     ace2k_flash.lie_at = 100;
     ASSERT_EQ(ace2k_config_store(&c), -ACE2K_EFLASH);
     ace2k_flash.lie_at = -1;
@@ -304,11 +374,11 @@ TEST(store_then_load_returns_the_log_in_60_words)
     struct ace2k_config c;
     struct ace2k_config again;
     fake_reset(&ace2k_flash);
-    ace2k_config_init(&c, &ace2k_fake_ops, &ace2k_flash);
+    ace2k_config_init(&c, &fake_ops, &ace2k_flash);
     c.record = sample_record();
     ASSERT_EQ(ace2k_config_store(&c), 0);
     ASSERT_EQ(ace2k_flash.programs, 60);
-    ace2k_config_init(&again, &ace2k_fake_ops, &ace2k_flash);
+    ace2k_config_init(&again, &fake_ops, &ace2k_flash);
     ASSERT_EQ(again.source, ACE2K_CONFIG_FROM_FLASH);
     assert_records_equal(&c.record, &again.record);
 }
@@ -333,16 +403,18 @@ TEST(a_layout_1_page_is_migrated_with_its_version_and_flags_and_an_empty_log)
     struct ace2k_config again;
     fake_reset(&ace2k_flash);
     write_layout1_page("0.4.0", ACE2K_CONFIG_FLAG_LINK_PROVEN);
-    ace2k_config_init(&c, &ace2k_fake_ops, &ace2k_flash);
+    ace2k_config_init(&c, &fake_ops, &ace2k_flash);
     ASSERT_EQ(c.source, ACE2K_CONFIG_FROM_FLASH);
     ASSERT_STR_EQ(c.record.proven_version, "0.4.0");
     ASSERT_EQ(c.record.flags, ACE2K_CONFIG_FLAG_LINK_PROVEN);
     ASSERT_EQ(c.record.dryer_log.cycles_started, 0);
     ASSERT_EQ(c.record.dryer_log.flags, 0);
     ASSERT_EQ(c.record.dryer_log.entry[0].kind, 0);
+    ASSERT_EQ(c.record.dryer_auto.mode, ACE2K_DRYER_AUTO_MANUAL);
+    ASSERT_EQ(c.record.dryer_auto.profile_c, ACE2K_DRYER_AUTO_PROFILE_C_DEFAULT);
     ASSERT_EQ(ace2k_config_store(&c), 0);
     ASSERT_EQ(ace2k_get_u16_le(ace2k_flash.page + 4), 2);
-    ace2k_config_init(&again, &ace2k_fake_ops, &ace2k_flash);
+    ace2k_config_init(&again, &fake_ops, &ace2k_flash);
     ASSERT_EQ(again.source, ACE2K_CONFIG_FROM_FLASH);
     ASSERT_STR_EQ(again.record.proven_version, "0.4.0");
 }
@@ -353,7 +425,7 @@ TEST(a_layout_1_page_with_a_bad_crc_is_corrupt)
     fake_reset(&ace2k_flash);
     write_layout1_page("0.4.0", ACE2K_CONFIG_FLAG_LINK_PROVEN);
     ace2k_flash.page[10] ^= 0x01U;
-    ace2k_config_init(&c, &ace2k_fake_ops, &ace2k_flash);
+    ace2k_config_init(&c, &fake_ops, &ace2k_flash);
     ASSERT_EQ(c.source, ACE2K_CONFIG_FROM_DEFAULTS_CORRUPT);
     ASSERT_STR_EQ(c.record.proven_version, "");
 }
@@ -369,6 +441,92 @@ TEST(any_flipped_byte_of_a_layout_2_page_is_corrupt)
         ASSERT_EQ(ace2k_config_decode(raw, &out), ACE2K_CONFIG_FROM_DEFAULTS_CORRUPT);
         ASSERT_EQ(out.dryer_log.cycles_started, 0);
     }
+}
+
+TEST(the_automatic_modes_round_trip_in_their_marked_block)
+{
+    struct ace2k_config_record rec;
+    ace2k_config_defaults(&rec);
+    ASSERT_EQ(rec.dryer_auto.limit_pct, ACE2K_DRYER_AUTO_LIMIT_DEFAULT_PCT);
+    rec.dryer_auto = (struct ace2k_dryer_auto_store){
+        .mode = ACE2K_DRYER_AUTO_HUMIDITY,
+        .limit_pct = 35U,
+        .max_failures = 6U,
+        .failures = 3U,
+        .profile_c = 60U,
+        .flags = ACE2K_DRYER_AUTO_STOPPED,
+        .profile_min = 300U,
+    };
+    rec.dryer_log.cycles_started = 12U;
+    uint8_t page[ACE2K_CONFIG_RECORD_LEN];
+    ace2k_config_encode(&rec, page);
+    ASSERT_EQ(page[196], 0xA7U);
+    struct ace2k_config_record back;
+    ASSERT_EQ(ace2k_config_decode(page, &back), ACE2K_CONFIG_FROM_FLASH);
+    ASSERT_EQ(back.dryer_auto.mode, ACE2K_DRYER_AUTO_HUMIDITY);
+    ASSERT_EQ(back.dryer_auto.limit_pct, 35U);
+    ASSERT_EQ(back.dryer_auto.max_failures, 6U);
+    ASSERT_EQ(back.dryer_auto.failures, 3U);
+    ASSERT_EQ(back.dryer_auto.profile_c, 60U);
+    ASSERT_EQ(back.dryer_auto.flags, ACE2K_DRYER_AUTO_STOPPED);
+    ASSERT_EQ(back.dryer_auto.profile_min, 300U);
+    ASSERT_EQ(back.dryer_log.cycles_started, 12U);
+}
+
+/* The modes are one byte on the page, with the values the host sends: manual 0, humidity 1,
+ * print 2. */
+TEST(each_mode_is_its_wire_value_in_one_byte_of_the_page)
+{
+    ASSERT_EQ(sizeof(((struct ace2k_dryer_auto_store *)NULL)->mode), 1U);
+    ASSERT_EQ(ACE2K_DRYER_AUTO_MODES, 3);
+    const uint8_t wire[] = { 0U, 1U, 2U };
+    const enum ace2k_dryer_auto_mode mode[] = {
+        ACE2K_DRYER_AUTO_MANUAL,
+        ACE2K_DRYER_AUTO_HUMIDITY,
+        ACE2K_DRYER_AUTO_PRINT,
+    };
+    for (size_t i = 0; i < 3U; i++) {
+        struct ace2k_config_record rec;
+        ace2k_config_defaults(&rec);
+        rec.dryer_auto.mode = (uint8_t)mode[i];
+        uint8_t page[ACE2K_CONFIG_RECORD_LEN];
+        ace2k_config_encode(&rec, page);
+        ASSERT_EQ(page[197], wire[i]);
+        struct ace2k_config_record back;
+        ASSERT_EQ(ace2k_config_decode(page, &back), ACE2K_CONFIG_FROM_FLASH);
+        ASSERT_EQ(back.dryer_auto.mode, wire[i]);
+    }
+}
+
+TEST(an_older_layout_2_page_keeps_its_log_and_gives_the_modes_defaults)
+{
+    struct ace2k_config_record rec;
+    ace2k_config_defaults(&rec);
+    rec.dryer_log.cycles_started = 7U;
+    rec.dryer_auto.mode = ACE2K_DRYER_AUTO_HUMIDITY;
+    uint8_t page[ACE2K_CONFIG_RECORD_LEN];
+    ace2k_config_encode(&rec, page);
+    for (size_t i = 196; i < 205; i++) {
+        page[i] = 0U; /* what an older image writes there */
+    }
+    ace2k_put_u16_le(page + ACE2K_CONFIG_RECORD_LEN - 2U,
+                     ace2k_crc16_ccitt(page, ACE2K_CONFIG_RECORD_LEN - 2U));
+    struct ace2k_config_record back;
+    ASSERT_EQ(ace2k_config_decode(page, &back), ACE2K_CONFIG_FROM_FLASH);
+    ASSERT_EQ(back.dryer_log.cycles_started, 7U);
+    ASSERT_EQ(back.dryer_auto.mode, ACE2K_DRYER_AUTO_MANUAL);
+    ASSERT_EQ(back.dryer_auto.limit_pct, ACE2K_DRYER_AUTO_LIMIT_DEFAULT_PCT);
+}
+
+TEST(a_marked_block_with_a_corrupt_crc_is_still_corrupt)
+{
+    struct ace2k_config_record rec;
+    ace2k_config_defaults(&rec);
+    uint8_t page[ACE2K_CONFIG_RECORD_LEN];
+    ace2k_config_encode(&rec, page);
+    page[198] ^= 0x01U;
+    struct ace2k_config_record back;
+    ASSERT_EQ(ace2k_config_decode(page, &back), ACE2K_CONFIG_FROM_DEFAULTS_CORRUPT);
 }
 
 TEST(an_unknown_layout_is_corrupt)
@@ -432,7 +590,7 @@ static int factory_program_refused(void *ctx, uint32_t addr, uint32_t word)
     return factory_write_refused(ctx, addr);
 }
 
-static const struct ace2k_config_ops ace2k_factory_ops = {
+static const struct ace2k_config_ops factory_ops = {
     .flash_read = factory_read,
     .flash_erase_page = factory_write_refused,
     .flash_program_word = factory_program_refused,
@@ -458,13 +616,13 @@ static void factory_page_build(uint8_t page[ACE2K_GUARD_FACTORY_PAGE_SIZE],
     page[ACE2K_CONFIG_FACTORY_CRC_OFF + 1] = (uint8_t)(crc >> 8U);
 }
 
-static const uint16_t ace2k_pairs_primary[ACE2K_LANE_COUNT][2] = {
+static const uint16_t pairs_primary[ACE2K_LANE_COUNT][2] = {
     { 610, 1190 },
     { 1205, 650 },
     { 590, 1210 },
     { 700, 1300 },
 };
-static const uint16_t ace2k_pairs_backup[ACE2K_LANE_COUNT][2] = {
+static const uint16_t pairs_backup[ACE2K_LANE_COUNT][2] = {
     { 500, 1000 },
     { 510, 1010 },
     { 520, 1020 },
@@ -477,9 +635,9 @@ TEST(factory_primary_page_yields_the_bands_low_first)
     struct ace2k_factory_calibration cal;
     f.violations = 0;
     f.writes = 0;
-    factory_page_build(f.primary, ace2k_pairs_primary);
-    factory_page_build(f.backup, ace2k_pairs_backup);
-    ASSERT_EQ(ace2k_config_factory_read(&ace2k_factory_ops, &f, &cal), 1);
+    factory_page_build(f.primary, pairs_primary);
+    factory_page_build(f.backup, pairs_backup);
+    ASSERT_EQ(ace2k_config_factory_read(&factory_ops, &f, &cal), 1);
     ASSERT_EQ(cal.source, ACE2K_CAL_FACTORY);
     ASSERT_EQ(cal.insert[0].low_mv, 610);
     ASSERT_EQ(cal.insert[0].high_mv, 1190);
@@ -496,10 +654,10 @@ TEST(factory_backup_page_is_used_when_the_primary_is_corrupt)
     static struct ace2k_fake_factory f;
     struct ace2k_factory_calibration cal;
     f.violations = 0;
-    factory_page_build(f.primary, ace2k_pairs_primary);
-    factory_page_build(f.backup, ace2k_pairs_backup);
+    factory_page_build(f.primary, pairs_primary);
+    factory_page_build(f.backup, pairs_backup);
     f.primary[100] ^= 0x01U;
-    ASSERT_EQ(ace2k_config_factory_read(&ace2k_factory_ops, &f, &cal), 2);
+    ASSERT_EQ(ace2k_config_factory_read(&factory_ops, &f, &cal), 2);
     ASSERT_EQ(cal.insert[0].low_mv, 500);
     ASSERT_EQ(cal.insert[3].high_mv, 1030);
     ASSERT_EQ(f.violations, 0);
@@ -512,9 +670,9 @@ TEST(factory_defaults_when_both_pages_fail_and_a_blank_page_is_corrupt)
     for (size_t i = 0; i < ACE2K_GUARD_FACTORY_PAGE_SIZE; i++) {
         f.primary[i] = 0xFF;
     }
-    factory_page_build(f.backup, ace2k_pairs_backup);
+    factory_page_build(f.backup, pairs_backup);
     f.backup[ACE2K_CONFIG_FACTORY_CRC_OFF] ^= 0xFFU;
-    ASSERT_EQ(ace2k_config_factory_read(&ace2k_factory_ops, &f, &cal), 0);
+    ASSERT_EQ(ace2k_config_factory_read(&factory_ops, &f, &cal), 0);
     ASSERT_EQ(cal.source, ACE2K_CAL_DEFAULT);
     for (size_t s = 0; s < ACE2K_LANE_COUNT; s++) {
         ASSERT_EQ(cal.insert[s].low_mv, ACE2K_CONFIG_INSERT_DEFAULT_LOW_MV);
@@ -534,8 +692,8 @@ TEST(factory_degenerate_pair_falls_back_to_the_defaults_for_that_lane_only)
         { 0, 0 },
     };
     factory_page_build(f.primary, pairs);
-    factory_page_build(f.backup, ace2k_pairs_backup);
-    ASSERT_EQ(ace2k_config_factory_read(&ace2k_factory_ops, &f, &cal), 1);
+    factory_page_build(f.backup, pairs_backup);
+    ASSERT_EQ(ace2k_config_factory_read(&factory_ops, &f, &cal), 1);
     ASSERT_EQ(cal.insert[0].source, ACE2K_CAL_FACTORY);
     ASSERT_EQ(cal.insert[1].source, ACE2K_CAL_DEFAULT); /* 99 mV apart: degenerate */
     ASSERT_EQ(cal.insert[1].low_mv, 600);

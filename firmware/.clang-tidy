@@ -29,7 +29,6 @@ CheckOptions:
   readability-identifier-naming.EnumConstantPrefix: 'ACE2K_'
   readability-identifier-naming.MacroDefinitionCase: UPPER_CASE
   readability-identifier-naming.GlobalConstantCase: lower_case
-  readability-identifier-naming.GlobalConstantPrefix: 'ace2k_'
   readability-identifier-naming.GlobalVariableCase: lower_case
   readability-identifier-naming.GlobalVariablePrefix: 'ace2k_'
   readability-identifier-naming.StaticConstantCase: lower_case

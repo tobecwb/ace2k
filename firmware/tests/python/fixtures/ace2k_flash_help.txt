@@ -1,0 +1,49 @@
+usage: ace2k_flash.py [-h] [--identify] [--port PORT] [--version VERSION]
+                      [--moonraker MOONRAKER] [--klipper-stop KLIPPER_STOP]
+                      [--klipper-start KLIPPER_START]
+                      [--calibration-dir CALIBRATION_DIR] [--yes]
+                      [--config-follows]
+                      [image]
+
+ace2k_flash: flash an ACE 2 Pro with an ace2k image or the factory image.
+
+positional arguments:
+  image                 the image: an ace2k .bin, or the factory .bin (not
+                        with --identify)
+
+options:
+  -h, --help            show this help message and exit
+  --identify            blink the unit on --port and exit; no image, nothing
+                        is written
+  --port PORT           the unit's serial port (default: from Klipper's
+                        config)
+  --version VERSION     the image's version, when the image does not carry it
+  --moonraker MOONRAKER
+                        Moonraker's URL (it starts with http:// or https://)
+  --klipper-stop KLIPPER_STOP
+                        the command that stops Klipper on this host
+  --klipper-start KLIPPER_START
+                        the command that starts Klipper on this host
+  --calibration-dir CALIBRATION_DIR
+                        where calibration files go
+  --yes                 do not ask for confirmation
+  --config-follows      the caller writes [ace2k] and starts Klipper after
+                        this run (an installer)
+
+Exit status:
+  0  flashed and verified
+  1  failed, or refused after something was done (Klipper stopped, the restore command sent, the
+     update started): the message says what state the unit and Klipper are in
+  2  flashed, but not verifiable here.  When this run stopped Klipper and could not start it
+     again, the status stays 2 and the last line says `Klipper did NOT start`
+  3  refused, and nothing was changed: at most read-only queries reached the unit, no command
+     that changes the unit or Klipper ran, and Klipper was neither stopped nor started (a
+     usage error too)
+  4  nothing answered on the port that this flasher can use: not the factory firmware, not
+     recovery, and no ace2k that this flasher can send to recovery.  Nothing that changes the
+     unit was sent.  Klipper may have been stopped and started again (when it was not ready and
+     used this port; if that start fails: 1).  The unit may be off, or run an ace2k image older
+     than ace2k_bootloader_enter
+  5  --identify only: the unit answered but cannot blink (recovery, or an ace2k image older than
+     ace2k_identify).  Nothing was sent that changes the unit
+Ctrl-C: 3 before any change, 1 after.

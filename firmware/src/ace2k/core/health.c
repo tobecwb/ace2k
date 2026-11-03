@@ -5,20 +5,17 @@ static uint32_t bit_if(bool failing, unsigned bit)
     return failing ? ACE2K_HEALTH_BIT(bit) : 0;
 }
 
-/* The bit when the check does NOT hold.  A separate reader instead of bit_if(!ok, …): in C a
- * `!` result is an int, and the lint refuses one handed to a bool parameter. */
+/* Returns the bit when the check does not hold. */
 static uint32_t bit_unless(bool ok, unsigned bit)
 {
-    return ok ? 0 : ACE2K_HEALTH_BIT(bit);
+    return bit_if((bool)!ok, bit);
 }
 
-/* |delta| > the quiet band, as an early return for the same reason. */
+/* True when |delta| is above the quiet band. */
 static bool encoder_moved(int32_t delta)
 {
-    if (delta > ACE2K_HEALTH_ENCODER_QUIET_COUNTS) {
-        return true;
-    }
-    return delta < -ACE2K_HEALTH_ENCODER_QUIET_COUNTS;
+    return (bool)(delta > ACE2K_HEALTH_ENCODER_QUIET_COUNTS ||
+                  delta < -ACE2K_HEALTH_ENCODER_QUIET_COUNTS);
 }
 
 uint32_t ace2k_health_evaluate(const struct ace2k_health_inputs *in)
@@ -35,9 +32,7 @@ uint32_t ace2k_health_evaluate(const struct ace2k_health_inputs *in)
     f |= bit_unless(in->cutout_idle, ACE2K_HEALTH_CUTOUT);
     for (unsigned i = 0; i < ACE2K_LANE_COUNT; i++) {
         f |= bit_unless(in->insert_connected[i], ACE2K_HEALTH_INSERT1 + i);
-        if (in->buffer_check_enabled) {
-            f |= bit_unless(in->buffer_consistent[i], ACE2K_HEALTH_BUFFER1 + i);
-        }
+        f |= bit_unless(in->buffer_consistent[i], ACE2K_HEALTH_BUFFER1 + i);
         f |= bit_if(encoder_moved(in->encoder_delta[i]), ACE2K_HEALTH_ENCODER1 + i);
         f |= bit_if(in->fg_delta[i] != 0, ACE2K_HEALTH_FG1 + i);
     }
@@ -50,10 +45,16 @@ uint32_t ace2k_health_evaluate(const struct ace2k_health_inputs *in)
     return f;
 }
 
-void ace2k_health_init(struct ace2k_health *self, uint8_t reset_cause)
+void ace2k_health_init(struct ace2k_health *self, uint8_t reset_cause, uint32_t now_ms)
 {
     *self = (struct ace2k_health){ 0 };
     self->reset_cause = reset_cause;
+    ace2k_catchup_init(&self->catchup, now_ms);
+}
+
+bool ace2k_health_tick_settled(struct ace2k_health *self, uint32_t now_ms, uint32_t period_ms)
+{
+    return ace2k_catchup_settled(&self->catchup, now_ms, period_ms);
 }
 
 void ace2k_health_apply(struct ace2k_health *self, uint32_t mask, uint32_t now_ms, bool full)

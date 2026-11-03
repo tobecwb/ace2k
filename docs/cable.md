@@ -76,6 +76,18 @@ If you see nothing at all in `lsusb`, and nothing in `dmesg -w` while you plug i
 not powered or has no ground. Check that the unit is on, that the 6-pin end is in the host port,
 and check the GND wire.
 
+## After you unplug the unit's end
+
+The converter takes its power from the unit. If you unplug the cable from the unit's rear port, the
+converter loses power and disappears from the host. Klipper reports `Lost communication with MCU`.
+
+Plug the cable back in and wait a few seconds. The converter usually comes back on its own. Then
+run `FIRMWARE_RESTART`. The first one can fail with `Failed automated reset of MCU`, because Klipper
+still tries the old serial connection. Run `FIRMWARE_RESTART` again. The second one connects.
+
+If the converter does not come back (nothing in `lsusb`), unplug the USB end from the host and plug
+it in again.
+
 ## Without Anycubic's cable — not tested
 
 Without the genuine ACE 2 Pro cable for the Kobra 3 / Kobra 3 Max / Kobra S1, a generic
@@ -89,7 +101,7 @@ known:
 - The link is half duplex. The adapter must switch direction on its own (most USB-RS-485 adapters
   do). It must run at 250000 baud for ace2k, and at 230400 for the factory firmware and the
   bootloader, which the flasher uses.
-- In `serial:`, Klipper takes the adapter's own `/dev/serial/by-id/` path. When `ace2k_flash.py`
+- In `serial:`, Klipper takes the adapter's own `/dev/serial/by-id/` path. When `ace2k_flash.pyz`
   cannot find the port, it lists only adapters of the kind in Anycubic's cable. With another
   adapter, give it `--port`, or put the path in Klipper's config first.
 
