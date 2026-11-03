@@ -317,7 +317,10 @@ tidy:
 # The Klipper-facing layer (bindings, board drivers, chip glue) needs Klipper's and the Arm headers,
 # so it is checked from inside the configured Klipper tree with its own, slightly relaxed config.
 ARM_GCC_INC   := $(shell $(CROSS_CC) -print-file-name=include)
-ARM_LIBC_INC  := $(abspath $(dir $(CROSS_CC))../arm-none-eabi/include)
+# The C library's headers: the directory the compiler itself takes inttypes.h from (an Arm GNU
+# Toolchain keeps them beside its bin/, a distribution's package elsewhere, e.g. /usr/lib/arm-none-eabi).
+ARM_LIBC_INC  := $(patsubst %/inttypes.h,%,$(firstword $(filter %/inttypes.h,$(shell \
+    printf '\043include <inttypes.h>\n' | $(CROSS_CC) -xc -M - 2>/dev/null))))
 TIDY_BIND_SRC := $(wildcard src/ace2k/*/*_cmds.c src/ace2k_board/*.c) src/stm32/gd32f30x.c
 # -mfloat-abi=soft: the layer does not use floating point, and the CMSIS headers need no FPU setup.
 # Klipper's src is named by its absolute path. A header of ace2k_board/ is then reached as
