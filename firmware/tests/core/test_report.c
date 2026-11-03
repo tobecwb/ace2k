@@ -9,6 +9,25 @@ TEST(a_zero_period_is_never_due)
     ASSERT_TRUE(!ace2k_report_due(&r, 100000));
 }
 
+/* A period past half the clock's range is capped: the catch-up of ace2k_report_due() moves the
+ * deadline whole periods ahead and ends only for a period under 2^31 ms.  Uncapped, 0xFFFFFFFF
+ * stepped the deadline back by 1 ms per pass, about 2^31 passes in the timer interrupt. */
+TEST(a_period_past_half_the_clock_range_is_capped)
+{
+    struct ace2k_report r;
+    ace2k_report_set(&r, UINT32_MAX, 100, 90);
+    ASSERT_TRUE(r.rest_ms < 0x80000000U);
+    ASSERT_EQ(r.rest_ms, ACE2K_REPORT_REST_MAX_MS); /* the documented cap, half the range */
+    ace2k_report_set(&r, ACE2K_REPORT_REST_MAX_MS, 100, 90); /* the cap itself is kept */
+    ASSERT_EQ(r.rest_ms, ACE2K_REPORT_REST_MAX_MS);
+    ace2k_report_set(&r, UINT32_MAX, 100, 90);
+    /* uncapped, the first deadline wrapped to 189 ms, and this call looped */
+    ASSERT_TRUE(!ace2k_report_due(&r, 190));
+    ASSERT_TRUE(ace2k_time_after(r.next_ms, 190));
+    ace2k_report_set(&r, 1000, 100, 90); /* an ordinary period is kept as asked */
+    ASSERT_EQ(r.rest_ms, 1000);
+}
+
 TEST(due_once_at_the_deadline_then_one_period_later)
 {
     struct ace2k_report r;
@@ -151,6 +170,45 @@ TEST(a_try_clears_the_flag_before_the_send_and_holds_the_report_when_the_send_re
     ace2k_fake_send_ok = false;
     ASSERT_TRUE(!ace2k_report_try(&ace2k_fake_due, fake_send));
     ASSERT_TRUE(ace2k_fake_due);
+}
+
+/* The query's period in timer ticks, to the nearest millisecond: a host whose tick count lands a
+ * hair under a whole millisecond still gets that millisecond, which a truncation would lose and
+ * drift the report through every phase.  No sum that could overflow near 2^32. */
+TEST(a_period_in_ticks_rounds_to_the_nearest_millisecond)
+{
+    const uint32_t per_ms = 120000U; /* 120 MHz */
+    ASSERT_EQ(ace2k_report_rest_ms(0, per_ms), 0U);
+    ASSERT_EQ(ace2k_report_rest_ms(120000000U, per_ms), 1000U);      /* 1 s, exact */
+    ASSERT_EQ(ace2k_report_rest_ms(120000000U - 1U, per_ms), 1000U); /* a tick short */
+    ASSERT_EQ(ace2k_report_rest_ms(59999U, per_ms), 0U);
+    ASSERT_EQ(ace2k_report_rest_ms(180000U, per_ms), 2U);        /* half a millisecond rounds up */
+    ASSERT_EQ(ace2k_report_rest_ms(UINT32_MAX, per_ms), 35791U); /* 35 791.39 ms */
+    ASSERT_EQ(ace2k_report_rest_ms(UINT32_MAX, 72000U), 59652U); /* 72 MHz: 59 652.32 ms */
+    ASSERT_EQ(ace2k_report_rest_ms(UINT32_MAX - 1U, 2U), 2147483647U); /* odd ticks per ms: */
+    ASSERT_EQ(ace2k_report_rest_ms(5U, 3U), 2U);                       /* 1.67 rounds up */
+    ASSERT_EQ(ace2k_report_rest_ms(4U, 3U), 1U);                       /* 1.33 rounds down */
+}
+
+/* A period under 1 ms is 0, which keeps the reports off, as a truncation did.  Rounded, a period
+ * between half a millisecond and one would become 1 ms: a report on every tick.  From 1 ms on, the
+ * period rounds half up as above. */
+TEST(a_period_under_a_millisecond_keeps_the_reports_off)
+{
+    const uint32_t per_ms = 120000U; /* 120 MHz */
+    ASSERT_EQ(ace2k_report_rest_ms(1U, per_ms), 0U);
+    ASSERT_EQ(ace2k_report_rest_ms(60000U, per_ms), 0U);  /* 0.5 ms */
+    ASSERT_EQ(ace2k_report_rest_ms(119999U, per_ms), 0U); /* a tick under 1 ms */
+    ASSERT_EQ(ace2k_report_rest_ms(120000U, per_ms), 1U); /* 1 ms */
+    ASSERT_EQ(ace2k_report_rest_ms(179999U, per_ms), 1U); /* 1.49 ms */
+    ASSERT_EQ(ace2k_report_rest_ms(180000U, per_ms), 2U); /* 1.5 ms */
+    ASSERT_EQ(ace2k_report_rest_ms(2U, 3U), 0U);          /* 0.67 ms, odd ticks per ms */
+    ASSERT_EQ(ace2k_report_rest_ms(3U, 3U), 1U);
+    struct ace2k_report r = { 0 };
+    ace2k_report_set(&r, ace2k_report_rest_ms(119999U, per_ms), 0, 0);
+    for (uint32_t now_ms = 0; now_ms < 1000U; now_ms += 10U) {
+        ASSERT_TRUE(!ace2k_report_due(&r, now_ms));
+    }
 }
 
 // NOLINTNEXTLINE(readability-identifier-naming)

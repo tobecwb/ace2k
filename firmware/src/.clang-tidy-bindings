@@ -1,0 +1,48 @@
+# clang-tidy for the Klipper-facing layer: the bindings (*_cmds.c), the board drivers and the chip
+# glue. Same checks as the core, minus three that fight Klipper's own conventions:
+#  - misc-use-internal-linkage: Klipper finds command handlers and DECL_* objects by global name.
+#  - performance-no-int-to-ptr: peripheral registers are reached through integer addresses.
+#  - readability-non-const-parameter: Klipper declares every handler as void (*)(uint32_t *).
+# The naming and brace rules are switched off for src/stm32/gd32f30x.c alone, by NOLINT markers in
+# that file: it keeps Klipper's style.  Elsewhere a NOLINT names its check and says why.
+# The header filter takes the ace2k and ace2k_board headers only. Klipper's own src/stm32 headers
+# stay out; src/stm32/gd32f30x.c is checked all the same, as a file of the run, not a header.
+InheritParentConfig: false
+Checks: >
+  -*,
+  bugprone-*,
+  misc-*,
+  performance-*,
+  readability-*,
+  -bugprone-easily-swappable-parameters,
+  -misc-include-cleaner,
+  -readability-identifier-length,
+  -readability-avoid-unconditional-preprocessor-if,
+  -misc-use-internal-linkage,
+  -performance-no-int-to-ptr,
+  -readability-non-const-parameter
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*/src/(ace2k|ace2k_board)/.*'
+CheckOptions:
+  readability-function-cognitive-complexity.Threshold: 15
+  readability-function-cognitive-complexity.IgnoreMacros: true
+  readability-magic-numbers.IgnoredIntegerValues: '0;1;2;3;4;8;10;16;32;64;100;255;256;1000'
+  readability-magic-numbers.IgnorePowersOf2IntegerValues: true
+  readability-identifier-naming.FunctionCase: lower_case
+  readability-identifier-naming.GlobalFunctionCase: lower_case
+  readability-identifier-naming.GlobalFunctionPrefix: 'ace2k_'
+  readability-identifier-naming.VariableCase: lower_case
+  readability-identifier-naming.ParameterCase: lower_case
+  readability-identifier-naming.StructCase: lower_case
+  readability-identifier-naming.StructPrefix: 'ace2k_'
+  readability-identifier-naming.EnumCase: lower_case
+  readability-identifier-naming.EnumPrefix: 'ace2k_'
+  readability-identifier-naming.EnumConstantCase: UPPER_CASE
+  readability-identifier-naming.EnumConstantPrefix: 'ACE2K_'
+  readability-identifier-naming.MacroDefinitionCase: UPPER_CASE
+  readability-identifier-naming.GlobalConstantCase: lower_case
+  readability-identifier-naming.GlobalVariableCase: lower_case
+  readability-identifier-naming.GlobalVariablePrefix: 'ace2k_'
+  readability-identifier-naming.StaticConstantCase: lower_case
+  readability-identifier-naming.StaticVariableCase: lower_case
+  readability-identifier-naming.TypedefCase: lower_case

@@ -1,13 +1,11 @@
-/* The dryer's log: the counters, the
- * heating and full-power seconds, the ring of the last eight entries, the boot's interrupted
- * cycle and persisted cutout.  The pure helpers work on the log alone; the dryer-level functions
- * below them mark the log for the binding to store. */
+/* The dryer's log: the counters, the heating and full-power seconds, and the ring of the
+ * last eight entries. At boot it also handles the interrupted cycle and the persisted cutout. The
+ * pure helpers work on the log alone. The dryer-level functions below them mark the log, so that
+ * the binding stores it. */
 #include "dryer/dryer.h"
 #include "dryer/dryer_internal.h"
 
-#define MS_PER_S     1000U
 #define PCT_MS_PER_S 100000U /* 100 % × 1 000 ms: one full-power second */
-#define MC_PER_DC    100
 
 /* ---- the log alone ---- */
 
@@ -28,8 +26,8 @@ void ace2k_dryer_log_cycle_end(struct ace2k_dryer_log *log, bool completed)
 void ace2k_dryer_log_account(struct ace2k_dryer_log *log, uint8_t duty_pct, uint32_t dt_ms)
 {
     log->heat_ms_frac += dt_ms;
-    while (log->heat_ms_frac >= MS_PER_S) {
-        log->heat_ms_frac -= MS_PER_S;
+    while (log->heat_ms_frac >= ACE2K_MS_PER_S) {
+        log->heat_ms_frac -= ACE2K_MS_PER_S;
         log->heat_s++;
     }
     log->full_power_ms_frac += (uint32_t)duty_pct * dt_ms;
@@ -44,11 +42,11 @@ static int16_t to_dc(int32_t mc, bool valid)
     if (!valid) {
         return ACE2K_DRYER_LOG_TEMP_UNKNOWN_DC;
     }
-    int32_t dc = ace2k_clamp_i32(mc / MC_PER_DC, INT16_MIN + 1, INT16_MAX);
+    int32_t dc = ace2k_clamp_i32(mc / ACE2K_DRYER_MC_PER_DC, INT16_MIN + 1, INT16_MAX);
     return (int16_t)dc;
 }
 
-/* The three readings in 0.1 °C; no inputs at all is every reading unknown. */
+/* The three readings in 0.1 °C. With no inputs at all, every reading is unknown. */
 static void entry_temperatures(struct ace2k_dryer_log_entry *e, const struct ace2k_dryer_inputs *in)
 {
     if (in == NULL) {
@@ -71,8 +69,8 @@ void ace2k_dryer_log_record(struct ace2k_dryer_log *log, uint8_t kind, uint8_t r
     struct ace2k_dryer_log_entry *e = &log->entry[0];
     e->kind = kind;
     e->reason = reason;
-    /* the open cycle's number; 0 when none is open (a fault in STARTING before the open mark,
-     * in IDLE or in COOLDOWN), never the previous cycle's */
+    /* The number of the open cycle, never that of the previous cycle. It is 0 when no cycle is
+     * open: a fault in STARTING before the open mark, in IDLE or in COOLDOWN. */
     e->cycle = (log->flags & ACE2K_DRYER_LOG_CYCLE_OPEN) != 0U ? (uint16_t)log->cycles_started : 0U;
     e->heat_s = log->heat_s;
     entry_temperatures(e, in);
@@ -120,7 +118,8 @@ void ace2k_dryer_log_cycle_close(struct ace2k_dryer *self, bool completed)
     ace2k_dryer_log_mark(self);
 }
 
-/* The entry (a fault counts in record; a cutout sets the persisted flag), the open cycle closed. */
+/* Writes the fault entry and closes the open cycle. record counts the fault, and a cutout sets
+ * the persisted flag. */
 void ace2k_dryer_log_fault(struct ace2k_dryer *self, uint8_t reason,
                            const struct ace2k_dryer_inputs *in)
 {
@@ -141,5 +140,5 @@ uint32_t ace2k_dryer_log_generation(const struct ace2k_dryer *self)
 
 void ace2k_dryer_log_stored(struct ace2k_dryer *self, uint32_t generation)
 {
-    self->log_stored_gen = generation; /* a store of an older generation leaves dirty set */
+    self->log_stored_gen = generation; /* a store of an older generation leaves the log dirty */
 }

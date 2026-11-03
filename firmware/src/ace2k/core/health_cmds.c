@@ -1,12 +1,15 @@
-// Binding of the self-test: the boot window (2 s after init: the counters must be quiet, the
-// zero-cross window must have filled), the full evaluation from a task (it probes the readers
-// over SPI and checks the image CRC once), a periodic re-evaluation every second, the run /
-// clear / query commands, and the device identifier.
-// The full evaluation is three task runs, not one: a reader probe busy-waits up to 150 ms
-// (rfid/reader.h), and Klipper's independent watchdog (410–512 ms, fed from a task of its own)
-// is not fed while a task runs — two probes back to back plus the evaluation would come too
-// close to it.  So one task run probes reader A, the next probes reader B, the third gathers
-// and evaluates; each step re-wakes the task for the next.
+// Binding of the self-test. It holds:
+// - the boot window, 2 s after init: the counters must be quiet, and the zero-cross window must
+//   have filled;
+// - the full evaluation from a task, which probes the readers over SPI and checks the image CRC
+//   once;
+// - a periodic re-evaluation every second;
+// - the run, clear and query commands, and the device identifier.
+// The full evaluation is three task runs, not one. A reader probe busy-waits up to 150 ms
+// (rfid/reader.h). Klipper's independent watchdog (273–546 ms, fed from a task of its own) is
+// not fed while a task runs. Two probes back to back plus the evaluation would come too close to
+// it. So one task run probes reader A, the next probes reader B, and the third gathers and
+// evaluates. Each step wakes the task again for the next.
 #include "core/health.h"
 #include "core/config_cmds.h"
 #include "env/env_cmds.h"
@@ -23,17 +26,8 @@
 #include "command.h"   // DECL_COMMAND, sendf, shutdown
 #include "sched.h"     // DECL_INIT, DECL_TASK, sched_wake_task, sched_check_wake
 #if CONFIG_ACE2K_RFID_READ
-#include "rfid/watch_cmds.h" // a reader in use is not probed; a field fault fails its bit
+#include "rfid/watch_cmds.h" // a field fault fails its bit; a run revives a dead reader
 #endif
-
-// Bits 13–16 are on: a bench session on 2026-09-17
-// walked every plunger by hand and, over 134 debounced events on the four lanes,
-// *rest* and *pushed* were never asserted together.
-#define ACE2K_HEALTH_BUFFER_CHECK_ENABLED 1
-// A tick more than two periods after the last one is a catch-up after a stall (the flash write
-// of the link proof is the known one): the ADC passes the stall swallowed leave adc_age_ms
-// inflated for a moment, so a periodic pass waits this long before it may read sensors_fresh.
-#define ACE2K_HEALTH_SETTLE_MS 50U
 
 // The steps of a full evaluation, one per task run (see the top of this file).
 enum ace2k_health_step {
@@ -47,8 +41,6 @@ static struct ace2k_health ace2k_health_instance;
 static struct task_wake ace2k_health_wake;
 static uint32_t ace2k_health_window_end_ms;
 static struct ace2k_report ace2k_health_periodic; // rest ACE2K_HEALTH_PERIOD_MS, no phase
-static uint32_t ace2k_health_last_now_ms;
-static uint32_t ace2k_health_settle_until_ms;
 static uint16_t ace2k_health_snap_encoder[ACE2K_LANE_COUNT];
 static uint32_t ace2k_health_snap_fg[ACE2K_LANE_COUNT];
 static volatile bool ace2k_health_full_due;
@@ -59,10 +51,10 @@ static bool ace2k_health_image_checked;
 static bool ace2k_health_image_ok;
 static bool ace2k_health_ready;
 
-// The board's raw counters, not the lane core's: ACE_COUNTERS_RESET rebases the core's values,
-// and one inside the boot window would read as motion (bits 17–24) on a still unit.  The
-// encoder is the timer's free-running 16-bit count, so its difference is a signed 16-bit
-// quantity; the tach count is a plain uint32_t.
+// The board's raw counters, not those of the lane core. ACEK_COUNTERS_RESET rebases the
+// core's values, and one inside the boot window would read as motion (bits 17–24) on a still
+// unit. The encoder is the timer's free-running 16-bit count, so its difference is a signed
+// 16-bit quantity. The tach count is a plain uint32_t.
 static void snapshot_counters(void)
 {
     for (uint8_t i = 0; i < ACE2K_LANE_COUNT; i++) {
@@ -71,8 +63,8 @@ static void snapshot_counters(void)
     }
 }
 
-// The tick reads the pair in the timer interrupt; both stores in one step, so it never sees
-// the armed flag against a stale deadline.
+// The tick reads the pair in the timer interrupt. Both stores happen in one step, so the tick
+// never sees the armed flag against a stale deadline.
 static void arm(uint32_t now_ms)
 {
     snapshot_counters();
@@ -80,18 +72,6 @@ static void arm(uint32_t now_ms)
     ace2k_health_window_end_ms = now_ms + ACE2K_HEALTH_BOOT_WINDOW_MS;
     ace2k_health_armed = true;
     irq_restore(flag);
-}
-
-// A reader the watch uses (its field on, or a job on it) is left alone: a probe's soft reset
-// would cut its field mid-read.  The last verdict stands until the next full pass finds it idle.
-static void probe_unless_busy(uint8_t reader)
-{
-#if CONFIG_ACE2K_RFID_READ
-    if (ace2k_rfid_binding_reader_busy(reader)) {
-        return;
-    }
-#endif
-    (void)ace2k_rfid_reader_binding_probe(reader);
 }
 
 static bool field_fault(uint8_t reader)
@@ -104,21 +84,23 @@ static bool field_fault(uint8_t reader)
 #endif
 }
 
+_Static_assert(ACE2K_HEALTH_READERS == ACE2K_RFID_READER_COUNT, "a health bit per reader");
+
 static void gather(struct ace2k_health_inputs *in)
 {
     const struct ace2k_sensors *s = ace2k_sensors_binding();
     const struct ace2k_env *e = ace2k_env_binding();
     const struct ace2k_mains *m = ace2k_mains_binding();
     const struct ace2k_rfid_reader *r = ace2k_rfid_reader_binding();
-    in->ntc_left_valid = (e->valid & ACE2K_ENV_VALID_NTC_LEFT) != 0;
-    in->ntc_right_valid = (e->valid & ACE2K_ENV_VALID_NTC_RIGHT) != 0;
-    in->chamber_valid = (e->valid & ACE2K_ENV_VALID_CHAMBER) != 0;
+    in->ntc_left_valid = ace2k_env_valid_bit(e, ACE2K_ENV_VALID_NTC_LEFT);
+    in->ntc_right_valid = ace2k_env_valid_bit(e, ACE2K_ENV_VALID_NTC_RIGHT);
+    in->chamber_valid = ace2k_env_valid_bit(e, ACE2K_ENV_VALID_CHAMBER);
     in->chamber_plausible = ace2k_env_chamber_plausible(e);
-    in->reader_ok[0] = r->version_ok[0] && !field_fault(ACE2K_RFID_READER_A);
-    in->reader_ok[1] = r->version_ok[1] && !field_fault(ACE2K_RFID_READER_B);
+    in->reader_ok[0] = (bool)(r->version_ok[0] && !field_fault(ACE2K_RFID_READER_A));
+    in->reader_ok[1] = (bool)(r->version_ok[1] && !field_fault(ACE2K_RFID_READER_B));
     in->zerocross_present = m->present;
     in->mains_plausible = ace2k_mains_plausible(m);
-    in->cutout_idle = !s->cutout;
+    in->cutout_idle = (bool)!s->cutout;
     for (uint8_t i = 0; i < ACE2K_LANE_COUNT; i++) {
         in->insert_connected[i] = ace2k_sensors_insert_connected(s, i);
         in->buffer_consistent[i] = ace2k_sensors_buffer_consistent(s, i);
@@ -126,18 +108,18 @@ static void gather(struct ace2k_health_inputs *in)
             (int16_t)(uint16_t)(ace2k_encoder_read(i) - ace2k_health_snap_encoder[i]);
         in->fg_delta[i] = ace2k_fg_read(i) - ace2k_health_snap_fg[i];
     }
-    in->buffer_check_enabled = ACE2K_HEALTH_BUFFER_CHECK_ENABLED != 0;
     in->sensors_fresh = ace2k_sensors_fresh(s);
-    in->vdda_ok = (e->valid & ACE2K_ENV_VALID_VDDA) != 0;
+    in->vdda_ok = ace2k_env_valid_bit(e, ACE2K_ENV_VALID_VDDA);
     in->clock_ok = ace2k_sysinfo_clock_pll_hse();
     in->watchdog_ok = ace2k_sysinfo_watchdog_armed();
     in->config_page_ok = ace2k_config_binding()->source != ACE2K_CONFIG_FROM_DEFAULTS_CORRUPT;
     in->image_crc_ok = ace2k_health_image_ok;
 }
 
-// Task context.  A full pass checks the image CRC once, seeds the periodic deadline together
-// with post_done (the tick reads the pair in the timer interrupt: one step, so it never sees
-// post_done against a stale deadline) and supersedes a periodic pass due.
+// Task context. A full pass checks the image CRC once. It seeds the periodic deadline together
+// with post_done, in one step, because the tick reads the pair in the timer interrupt. So the tick
+// never sees post_done against a stale deadline. A full pass also replaces a periodic pass that is
+// due.
 static void evaluate(bool full)
 {
     if (full && !ace2k_health_image_checked) {
@@ -157,35 +139,32 @@ static void evaluate(bool full)
     irq_restore(flag);
 }
 
-// The periodic deadline is a struct ace2k_report: after a stall it catches up on its grid
-// (report.h), the one policy of the tree.  A catch-up tick opens a settle window first, and the
-// deadline is not consulted (so not advanced) until it closes: a pass due inside the window is
-// raised at the first tick after it, on the grid, not skipped.  The settle gates the full pass
-// too: the proof's flash write lands inside the first connect, exactly when the boot window can
-// expire — the window's deadline keeps its time, the pass just starts after the settle.
+// The periodic deadline is a struct ace2k_report. After a stall it catches up on its grid
+// (report.h), which is the one policy of the tree. A catch-up tick opens a settle window first.
+// The deadline is not consulted, so not advanced, until the window closes. So a pass due inside
+// the window is raised at the first tick after it, on the grid, and not skipped. The settle gates
+// the full pass too. The flash write of the link proof lands inside the first connect, exactly
+// when the boot window can expire. The window's deadline keeps its time; the pass just starts
+// after the settle.
 static void tick(void *ctx, uint32_t now_ms)
 {
     (void)ctx;
-    if (ace2k_time_since(now_ms, ace2k_health_last_now_ms) > 2U * ACE2K_TICK_PERIOD_MS) {
-        ace2k_health_settle_until_ms = now_ms + ACE2K_HEALTH_SETTLE_MS;
-    }
-    ace2k_health_last_now_ms = now_ms;
-    if (ace2k_health_armed && ace2k_time_after(now_ms, ace2k_health_window_end_ms) &&
-        ace2k_time_after(now_ms, ace2k_health_settle_until_ms)) {
+    bool settled = ace2k_health_tick_settled(&ace2k_health_instance, now_ms, ACE2K_TICK_PERIOD_MS);
+    if (ace2k_health_armed && ace2k_time_after(now_ms, ace2k_health_window_end_ms) && settled) {
         ace2k_health_armed = false;
         ace2k_health_full_due = true;
         sched_wake_task(&ace2k_health_wake);
     }
-    if (ace2k_health_instance.post_done && ace2k_time_after(now_ms, ace2k_health_settle_until_ms) &&
+    if (ace2k_health_instance.post_done && settled &&
         ace2k_report_due(&ace2k_health_periodic, now_ms)) {
         ace2k_health_periodic_due = true;
         sched_wake_task(&ace2k_health_wake);
     }
 }
 
-// Klipper calls every DECL_TASK target by name from generated code, so it is not static.  A
-// full evaluation due restarts the three-step sequence; while one is in progress a periodic
-// pass waits (the full pass supersedes it).
+// Klipper calls every DECL_TASK target by name from generated code, so it is not static. A full
+// evaluation that is due restarts the three-step sequence. While one is in progress, a periodic
+// pass waits, because the full pass replaces it.
 void ace2k_health_binding_task(void)
 {
     if (!sched_check_wake(&ace2k_health_wake)) {
@@ -197,12 +176,14 @@ void ace2k_health_binding_task(void)
     }
     switch (ace2k_health_step) {
     case ACE2K_HEALTH_PROBE_A:
-        probe_unless_busy(ACE2K_RFID_READER_A);
+        // A reader that the watch uses is not probed (rfid/reader_cmds.h). Its last verdict
+        // stands until the next full pass finds it idle.
+        (void)ace2k_rfid_reader_binding_probe(ACE2K_RFID_READER_A);
         ace2k_health_step = ACE2K_HEALTH_PROBE_B;
         sched_wake_task(&ace2k_health_wake);
         return;
     case ACE2K_HEALTH_PROBE_B:
-        probe_unless_busy(ACE2K_RFID_READER_B);
+        (void)ace2k_rfid_reader_binding_probe(ACE2K_RFID_READER_B);
         ace2k_health_step = ACE2K_HEALTH_EVALUATE;
         sched_wake_task(&ace2k_health_wake);
         return;
@@ -226,13 +207,11 @@ static void ensure_ready(void)
     if (ace2k_health_ready) {
         return;
     }
-    ace2k_health_init(&ace2k_health_instance, ace2k_sysinfo_reset_cause());
     uint32_t now = ace2k_tick_now_ms();
-    ace2k_health_last_now_ms = now; // the first tick is not a catch-up
-    ace2k_health_settle_until_ms = now;
+    ace2k_health_init(&ace2k_health_instance, ace2k_sysinfo_reset_cause(), now);
     arm(now);
-    // A full registry is a programming error; from init context this ends in a fault and a
-    // watchdog reset — loud either way.
+    // A full registry is a programming error. From init context this ends in a fault and a
+    // watchdog reset. Either way it is loud.
     if (ace2k_tick_register(tick, NULL) != 0) {
         shutdown("ace2k: tick slots exhausted");
     }
@@ -256,16 +235,16 @@ void ace2k_health_cmd_query(uint32_t *args)
 }
 DECL_COMMAND(ace2k_health_cmd_query, "ace2k_health_query");
 
-// Re-arms the boot window: the counters are snapshotted now and the full evaluation runs when
-// it expires.  A run arriving while a three-step sequence is in flight re-snapshots the counters
-// under it (that sequence then measures a shorter window); the full pass 2 s later is the one
-// that counts.
+// Arms the boot window again. The counters are snapshotted now, and the full evaluation runs when
+// the window expires. A run that arrives while a three-step sequence is in flight snapshots the
+// counters again under it, so that sequence measures a shorter window. The full pass 2 s later is
+// the one that counts.
 void ace2k_health_cmd_run(uint32_t *args)
 {
     (void)args;
     ensure_ready();
 #if CONFIG_ACE2K_RFID_READ
-    ace2k_rfid_binding_clear_dead(); // a reader given up by the watch is tried again
+    ace2k_rfid_binding_clear_dead(); // a reader the watch gave up on is tried again
 #endif
     arm(ace2k_tick_now_ms());
 }
@@ -279,6 +258,8 @@ void ace2k_health_cmd_clear(uint32_t *args)
 }
 DECL_COMMAND(ace2k_health_cmd_clear, "ace2k_health_clear");
 
+// Read-only, and answered after a Klipper shutdown too, as the version and the link proof are.
+// The host reads it at every connect, and a unit keeps a shutdown across a host restart.
 void ace2k_health_cmd_uid(uint32_t *args)
 {
     (void)args;
@@ -286,4 +267,4 @@ void ace2k_health_cmd_uid(uint32_t *args)
     ace2k_sysinfo_uid(uid);
     sendf("ace2k_uid_response uid=%*s", (uint8_t)sizeof uid, uid);
 }
-DECL_COMMAND(ace2k_health_cmd_uid, "ace2k_uid_query");
+DECL_COMMAND_FLAGS(ace2k_health_cmd_uid, HF_IN_SHUTDOWN, "ace2k_uid_query");

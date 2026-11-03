@@ -1,14 +1,14 @@
 #include "heat/airflow.h"
 
-#define MS_PER_S         1000U
 #define AIRFLOW_POS_BITS 2U /* ace2k_airflow_flaps_report: bits per flap */
 
 _Static_assert(ACE2K_FLAP_PULSE_MS > 0U && ACE2K_FLAP_PULSE_MS <= ACE2K_FLAP_PULSE_MAX_MS,
                "a flap pulse is bounded");
 
-/* The fans are wanted while the owner asks, heat holds them (heat_holds = ace2k_heat_active():
- * a lease, a pending half, an open pulse check, or the gate reading high in any state — rule 2:
- * rule 7's release never drops them then) or rule 7 demands. */
+/* The fans are wanted while the owner asks, while heat holds them, or while the fan rule demands
+ * them. heat_holds is ace2k_heat_active(): a lease, a pending half, an open pulse check, or the
+ * gate reading high in any state. The gate never fires without both fans, so the release of the
+ * fan rule never drops them then. */
 static bool fans_wanted(const struct ace2k_airflow *self)
 {
     if (self->owner_on || self->heat_holds) {
@@ -28,6 +28,11 @@ static void apply_fans(struct ace2k_airflow *self)
     self->ops->fan_write(self->ctx, want);
 }
 
+void ace2k_airflow_set_heat_holds(struct ace2k_airflow *self, bool holds)
+{
+    self->heat_holds = holds;
+}
+
 void ace2k_airflow_init(struct ace2k_airflow *self, const struct ace2k_airflow_ops *ops, void *ctx)
 {
     *self = (struct ace2k_airflow){ 0 };
@@ -41,7 +46,7 @@ void ace2k_airflow_init(struct ace2k_airflow *self, const struct ace2k_airflow_o
     }
 }
 
-/* The fans or the flaps may be driven by who: nobody holds them, the manual owner holds them
+/* True when who may drive the fans or the flaps: nobody holds them, the manual owner holds them
  * (anyone takes over from it), or who holds them. */
 static bool may_drive(const struct ace2k_airflow *self, enum ace2k_airflow_owner who)
 {
@@ -54,7 +59,7 @@ static bool may_drive(const struct ace2k_airflow *self, enum ace2k_airflow_owner
     return self->owner == who;
 }
 
-/* A MANUAL run carries a duration; the dryer's does not. */
+/* A MANUAL run carries a duration; a run of the dryer does not. */
 static bool timed(enum ace2k_airflow_owner who)
 {
     return who == ACE2K_AIRFLOW_OWNER_MANUAL;
@@ -87,7 +92,7 @@ int ace2k_airflow_fans(struct ace2k_airflow *self, enum ace2k_airflow_owner who,
         if (seconds == 0U || seconds > ACE2K_AIRFLOW_FAN_MANUAL_MAX_S) {
             return -ACE2K_EINVAL;
         }
-        self->manual_until_ms = now_ms + (seconds * MS_PER_S);
+        self->manual_until_ms = now_ms + (seconds * ACE2K_MS_PER_S);
     }
     self->owner = who;
     self->owner_on = true;
@@ -95,7 +100,7 @@ int ace2k_airflow_fans(struct ace2k_airflow *self, enum ace2k_airflow_owner who,
     return 0;
 }
 
-/* The ownership goes even while heat holds the fans: fans_wanted() keeps them on for heat. */
+/* The ownership goes even while heat holds the fans. fans_wanted() keeps them on for heat. */
 void ace2k_airflow_release(struct ace2k_airflow *self, enum ace2k_airflow_owner who)
 {
     if (self->owner != who) {
@@ -124,7 +129,7 @@ static enum ace2k_flap other_flap(enum ace2k_flap flap)
     return ACE2K_FLAP_BOTTOM;
 }
 
-/* A stronger owner's pulse runs or waits on the flap: who may not replace it. */
+/* True when a pulse of a stronger owner runs or waits on the flap, so who may not replace it. */
 static bool outranked(const struct ace2k_airflow *self, enum ace2k_flap flap,
                       enum ace2k_airflow_owner who)
 {
@@ -137,7 +142,7 @@ static bool outranked(const struct ace2k_airflow *self, enum ace2k_flap flap,
     return self->flap_wait[flap].who > who;
 }
 
-/* A pulse runs or waits on either flap. */
+/* True when a pulse runs or waits on either flap. */
 static bool flap_busy(const struct ace2k_airflow *self)
 {
     for (uint32_t i = 0U; i < (uint32_t)ACE2K_FLAP_COUNT; i++) {
@@ -148,9 +153,10 @@ static bool flap_busy(const struct ace2k_airflow *self)
     return false;
 }
 
-/* NONE and MANUAL are never queued: their pulse runs now or is refused, so an accepted one is
- * answered for what happens.  Only the dryer queues.  The owners are in the order of
- * precedence (airflow.h), NONE and MANUAL the two lowest: exactly those at or below MANUAL. */
+/* NONE and MANUAL are never queued. Their pulse runs now or is refused, so the answer to an
+ * accepted one says what happens. Only the dryer queues. The owners are in the order of precedence
+ * (airflow.h), and NONE and MANUAL are the two lowest. So these are exactly the owners at or below
+ * MANUAL. */
 static bool never_queued(enum ace2k_airflow_owner who)
 {
     return who <= ACE2K_AIRFLOW_OWNER_MANUAL;
@@ -198,7 +204,7 @@ static bool ntc_cool(int32_t mc, bool valid)
     return mc < ACE2K_AIRFLOW_FAN_OFF_MC;
 }
 
-/* A valid NTC at or above the release threshold. */
+/* True for a valid NTC at or above the release threshold. */
 static bool ntc_measured_warm(int32_t mc, bool valid)
 {
     if (!valid) {
@@ -234,8 +240,8 @@ static void owner_expiry(struct ace2k_airflow *self, uint32_t now_ms)
     give_up(self);
 }
 
-/* A pulse that ran to its end publishes where it left the flap; then the other flap's waiting
- * request starts first (no starving), else this flap's own. */
+/* A pulse that ran to its end publishes where it left the flap. Then the waiting request of the
+ * other flap starts first, so no flap starves. Else this flap's own waiting request starts. */
 static void flap_service(struct ace2k_airflow *self, enum ace2k_flap flap, uint32_t now_ms)
 {
     struct ace2k_flap_request *run = &self->flap_run[flap];
@@ -272,7 +278,7 @@ void ace2k_airflow_shutdown(struct ace2k_airflow *self)
     for (uint32_t i = 0; i < ACE2K_FLAP_COUNT; i++) {
         if (self->flap_run[i].set) {
             self->ops->flap_write(self->ctx, (enum ace2k_flap)i, false, false);
-            self->flap_done[i] = ACE2K_FLAP_UNKNOWN; /* cut mid-travel, perhaps */
+            self->flap_done[i] = ACE2K_FLAP_UNKNOWN; /* perhaps cut mid-travel */
         }
         self->flap_run[i].set = false;
         self->flap_wait[i].set = false;
@@ -314,7 +320,7 @@ bool ace2k_airflow_fans_required(const struct ace2k_airflow *self)
     if (!self->thermal_on) {
         return false;
     }
-    return self->measured_warm; /* rule 7 holds on a reading, not only on an invalid NTC */
+    return self->measured_warm; /* the fan rule holds on a reading, not only on an invalid NTC */
 }
 
 bool ace2k_airflow_fans_commanded(const struct ace2k_airflow *self)

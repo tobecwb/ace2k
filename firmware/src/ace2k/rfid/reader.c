@@ -20,6 +20,9 @@ void ace2k_rfid_reader_init(struct ace2k_rfid_reader *self, const struct ace2k_r
 
 uint8_t ace2k_rfid_reader_read_reg(struct ace2k_rfid_reader *self, uint8_t reader, uint8_t reg)
 {
+    if (reader >= ACE2K_RFID_READER_COUNT) {
+        return 0;
+    }
     uint8_t buf[2] = { addr_byte(reg, true), 0x00 };
     self->ops->nss(self->ctx, reader, true);
     self->ops->spi_xfer(self->ctx, buf, 2U);
@@ -30,6 +33,9 @@ uint8_t ace2k_rfid_reader_read_reg(struct ace2k_rfid_reader *self, uint8_t reade
 void ace2k_rfid_reader_write_reg(struct ace2k_rfid_reader *self, uint8_t reader, uint8_t reg,
                                  uint8_t value)
 {
+    if (reader >= ACE2K_RFID_READER_COUNT) {
+        return;
+    }
     uint8_t buf[2] = { addr_byte(reg, false), value };
     self->ops->nss(self->ctx, reader, true);
     self->ops->spi_xfer(self->ctx, buf, 2U);
@@ -38,6 +44,9 @@ void ace2k_rfid_reader_write_reg(struct ace2k_rfid_reader *self, uint8_t reader,
 
 int ace2k_rfid_reader_soft_reset(struct ace2k_rfid_reader *self, uint8_t reader)
 {
+    if (reader >= ACE2K_RFID_READER_COUNT) {
+        return -ACE2K_EINVAL;
+    }
     self->reset_count[reader]++;
     ace2k_rfid_reader_write_reg(self, reader, ACE2K_RFID_REG_COMMAND, ACE2K_RFID_CMD_SOFT_RESET);
     for (uint8_t poll = 0; poll < ACE2K_RFID_RESET_POLLS; poll++) {

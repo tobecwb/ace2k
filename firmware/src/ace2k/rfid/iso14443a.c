@@ -1,19 +1,8 @@
-#include "rfid/iso14443a.h"
-
-enum ace2k_iso_phase {
-    ACE2K_ISO_PH_IDLE = 0,
-    ACE2K_ISO_PH_WAKE = 1,
-    ACE2K_ISO_PH_ANTICOLL = 2,
-    ACE2K_ISO_PH_SELECT = 3,
-    ACE2K_ISO_PH_HALT = 4,
-    ACE2K_ISO_PH_AUTH = 5,
-    ACE2K_ISO_PH_READ = 6,
-};
+#include "rfid/iso14443a_internal.h"
 
 #define ACE2K_ISO_BYTE_MASK   0xFFU
 #define ACE2K_ISO_CRC_SHIFT_A 4U
 #define ACE2K_ISO_CRC_SHIFT_B 3U
-#define ACE2K_ISO_NAK_BITS    4U
 
 void ace2k_iso14443a_init(struct ace2k_iso14443a *self, const struct ace2k_iso14443a_ops *ops,
                           void *ctx)
@@ -75,19 +64,10 @@ bool ace2k_iso14443a_same_uid(const struct ace2k_iso14443a_tag *a,
     return true;
 }
 
-static uint8_t levels_of(uint8_t uid_len)
-{
-    return (uint8_t)((uid_len - 1U) / (ACE2K_ISO_CL_UID_BYTES - 1U));
-}
-
 static bool uid_len_ok(uint8_t uid_len)
 {
-    /* early returns instead of `a || b`: in C that result is an int, and the lint refuses one
-     * as a bool */
-    if (uid_len == ACE2K_ISO_UID_SINGLE || uid_len == ACE2K_ISO_UID_DOUBLE) {
-        return true;
-    }
-    return uid_len == ACE2K_ISO_UID_MAX;
+    return (bool)(uid_len == ACE2K_ISO_UID_SINGLE || uid_len == ACE2K_ISO_UID_DOUBLE ||
+                  uid_len == ACE2K_ISO_UID_MAX);
 }
 
 static bool read_job_ok(const struct ace2k_iso14443a_job *job)
@@ -146,7 +126,11 @@ int ace2k_iso14443a_begin(struct ace2k_iso14443a *self, uint8_t reader,
     if (e->phase != ACE2K_ISO_PH_IDLE) {
         return -ACE2K_EREFUSED;
     }
-    *e = (struct ace2k_iso14443a_engine){ .job = *job, .phase = ACE2K_ISO_PH_WAKE };
+    /* The job is copied on its own.  A compound literal that carried the job would put a copy of
+     * the MIFARE key in a temporary, which the compiler may build on the stack.  Nothing would wipe
+     * that copy. */
+    *e = (struct ace2k_iso14443a_engine){ .phase = ACE2K_ISO_PH_WAKE };
+    e->job = *job;
     plan_reads(e);
     return 0;
 }
@@ -162,12 +146,15 @@ bool ace2k_iso14443a_busy(const struct ace2k_iso14443a *self, uint8_t reader)
 const struct ace2k_iso14443a_out *ace2k_iso14443a_result(const struct ace2k_iso14443a *self,
                                                          uint8_t reader)
 {
+    if (reader >= ACE2K_RFID_READER_COUNT) {
+        return NULL;
+    }
     return &self->r[reader].out;
 }
 
-/* The job is over: the crypto unit cleared after any MIFARE job (after its HLTA, on success),
- * the job — and its key, if an authentication never started — wiped, the result kept. */
-static void end(struct ace2k_iso14443a *self, uint8_t reader, uint8_t result)
+/* Ends the job.  After any MIFARE job the crypto unit is cleared, after its HLTA on success.  The
+ * job is wiped, and so is its key if an authentication never started.  The result is kept. */
+void ace2k_iso14443a_end(struct ace2k_iso14443a *self, uint8_t reader, uint8_t result)
 {
     struct ace2k_iso14443a_engine *e = &self->r[reader];
     if (e->job.kind == ACE2K_ISO_JOB_MIFARE_READ) {
@@ -179,40 +166,12 @@ static void end(struct ace2k_iso14443a *self, uint8_t reader, uint8_t result)
     e->waiting = false;
 }
 
-static uint8_t sel_code(uint8_t level)
-{
-    return (uint8_t)(ACE2K_ISO_SEL_CL1 + (2U * level));
-}
-
-static uint8_t bcc_of(const uint8_t *cl)
-{
-    return (uint8_t)((uint32_t)cl[0] ^ cl[1] ^ cl[2] ^ cl[3]);
-}
-
-/* The cascade level of a known UID: CT and three bytes, or the last four; then the BCC. */
-static void cl_of_target(struct ace2k_iso14443a_engine *e)
-{
-    const struct ace2k_iso14443a_tag *t = &e->job.target;
-    uint8_t base = (uint8_t)(e->level * (ACE2K_ISO_CL_UID_BYTES - 1U));
-    if (e->level + 1U < levels_of(t->uid_len)) {
-        e->cl[0] = ACE2K_ISO_CT;
-        for (uint8_t i = 1; i < ACE2K_ISO_CL_UID_BYTES; i++) {
-            e->cl[i] = t->uid[base + i - 1U];
-        }
-    } else {
-        for (uint8_t i = 0; i < ACE2K_ISO_CL_UID_BYTES; i++) {
-            e->cl[i] = t->uid[base + i];
-        }
-    }
-    e->cl[ACE2K_ISO_CL_UID_BYTES] = bcc_of(e->cl);
-}
-
 static int send_wake(struct ace2k_iso14443a *self, uint8_t reader)
 {
     struct ace2k_iso14443a_engine *e = &self->r[reader];
-    /* an inventory wakes every tag once (WUPA, the halted ones too), then only the idle ones
-     * (REQA): each tag found is halted, so the next REQA finds the next; a read wakes its target
-     * whatever state an earlier job left it in */
+    /* An inventory wakes every tag once with WUPA, the halted ones too.  Then it wakes only the
+     * idle ones, with REQA.  Each tag found is halted, so the next REQA finds the next tag.  A read
+     * wakes its target whatever state an earlier job left it in. */
     bool wupa = true;
     if (e->job.kind == ACE2K_ISO_JOB_INVENTORY && e->woken) {
         wupa = false;
@@ -221,39 +180,6 @@ static int send_wake(struct ace2k_iso14443a *self, uint8_t reader)
     e->woken = true;
     return ace2k_iso14443a_send(self, reader, ACE2K_RFID_CMD_TRANSCEIVE, tx, 1,
                                 ACE2K_ISO_SHORT_FRAME_BITS);
-}
-
-static int send_anticoll(struct ace2k_iso14443a *self, uint8_t reader)
-{
-    struct ace2k_iso14443a_engine *e = &self->r[reader];
-    uint8_t full = (uint8_t)(e->known_bits / ACE2K_BITS_PER_BYTE);
-    uint8_t part = (uint8_t)(e->known_bits % ACE2K_BITS_PER_BYTE);
-    uint8_t tx[2 + ACE2K_ISO_CL_BYTES];
-    tx[0] = sel_code(e->level);
-    tx[1] = (uint8_t)(((2U + full) << ACE2K_ISO_NVB_BYTES_SHIFT) | part);
-    uint8_t n = (uint8_t)(full + (part != 0 ? 1U : 0U));
-    for (uint8_t i = 0; i < n; i++) {
-        tx[2 + i] = e->cl[i];
-    }
-    return ace2k_iso14443a_send(self, reader, ACE2K_RFID_CMD_TRANSCEIVE, tx, (uint8_t)(2U + n),
-                                part);
-}
-
-static int send_select(struct ace2k_iso14443a *self, uint8_t reader)
-{
-    struct ace2k_iso14443a_engine *e = &self->r[reader];
-    if (e->job.kind != ACE2K_ISO_JOB_INVENTORY) {
-        cl_of_target(e);
-    }
-    uint8_t tx[ACE2K_ISO_SELECT_FRAME];
-    tx[0] = sel_code(e->level);
-    tx[1] = ACE2K_ISO_NVB_SELECT;
-    for (uint8_t i = 0; i < ACE2K_ISO_CL_BYTES; i++) {
-        tx[2 + i] = e->cl[i];
-    }
-    ace2k_iso14443a_crc_a(tx, 2 + ACE2K_ISO_CL_BYTES, &tx[2 + ACE2K_ISO_CL_BYTES]);
-    return ace2k_iso14443a_send(self, reader, ACE2K_RFID_CMD_TRANSCEIVE, tx, ACE2K_ISO_SELECT_FRAME,
-                                0);
 }
 
 static int send_halt(struct ace2k_iso14443a *self, uint8_t reader)
@@ -284,8 +210,8 @@ static int send_auth(struct ace2k_iso14443a *self, uint8_t reader)
     }
     int rc =
         ace2k_iso14443a_send(self, reader, ACE2K_RFID_CMD_MF_AUTHENT, tx, ACE2K_ISO_AUTH_FRAME, 0);
-    wipe_key(e);               /* the reader's FIFO has it now; the engine keeps none (rule 7) */
-    ace2k_wipe(tx, sizeof tx); /* volatile: a plain store to a dying local is dead code */
+    wipe_key(e);               /* the FIFO holds it now; the engine keeps none (rule 7) */
+    ace2k_wipe(tx, sizeof tx); /* volatile, because a plain store to a dying local is dead code */
     return rc;
 }
 
@@ -304,9 +230,9 @@ static int send_phase(struct ace2k_iso14443a *self, uint8_t reader)
     case ACE2K_ISO_PH_WAKE:
         return send_wake(self, reader);
     case ACE2K_ISO_PH_ANTICOLL:
-        return send_anticoll(self, reader);
+        return ace2k_iso14443a_send_anticoll(self, reader);
     case ACE2K_ISO_PH_SELECT:
-        return send_select(self, reader);
+        return ace2k_iso14443a_send_select(self, reader);
     case ACE2K_ISO_PH_HALT:
         return send_halt(self, reader);
     case ACE2K_ISO_PH_AUTH:
@@ -318,7 +244,7 @@ static int send_phase(struct ace2k_iso14443a *self, uint8_t reader)
     }
 }
 
-static bool crc_ok(const struct ace2k_rfid_rx *rx)
+bool ace2k_iso14443a_crc_ok(const struct ace2k_rfid_rx *rx)
 {
     uint8_t c[2];
     ace2k_iso14443a_crc_a(rx->data, (uint8_t)(rx->len - 2U), c);
@@ -328,43 +254,33 @@ static bool crc_ok(const struct ace2k_rfid_rx *rx)
     return c[1] == rx->data[rx->len - 1U];
 }
 
-/* No answer: an inventory has found every tag there is (OK, whatever it holds); a read's
- * target has left. */
-static void on_silence(struct ace2k_iso14443a *self, uint8_t reader)
+/* Handles no answer.  For an inventory, it means every tag there is has been found, and the result
+ * is OK, whatever the inventory holds.  For a read, it means the target has left. */
+void ace2k_iso14443a_on_silence(struct ace2k_iso14443a *self, uint8_t reader)
 {
     bool inventory = self->r[reader].job.kind == ACE2K_ISO_JOB_INVENTORY;
-    end(self, reader, inventory ? ACE2K_ISO_OK : ACE2K_ISO_TAG_GONE);
+    ace2k_iso14443a_end(self, reader, inventory ? ACE2K_ISO_OK : ACE2K_ISO_TAG_GONE);
 }
 
-static void begin_level(struct ace2k_iso14443a_engine *e)
-{
-    for (uint8_t i = 0; i < ACE2K_ISO_CL_BYTES; i++) {
-        e->cl[i] = 0;
-    }
-    e->known_bits = 0;
-    e->iterations = 0;
-    e->phase = e->job.kind == ACE2K_ISO_JOB_INVENTORY ? ACE2K_ISO_PH_ANTICOLL : ACE2K_ISO_PH_SELECT;
-}
-
-/* A read's first silence after its WUPA wakes once more before it says TAG_GONE: a tag an
- * earlier job left ACTIVE or AUTHENTICATED (a job that ended in error sends no HLTA) takes that
- * WUPA as an unexpected command and drops to IDLE or HALT without an answer — the second WUPA
- * wakes it.  The retry is the next step's one exchange (rule 6); an inventory's silence is
- * final. */
+/* The first silence after the WUPA of a read wakes once more before it says TAG_GONE.  An earlier
+ * job may have left the tag ACTIVE or AUTHENTICATED, because a job that ended in error sends no
+ * HLTA.  Such a tag takes that WUPA as an unexpected command and drops to IDLE or HALT without an
+ * answer.  The second WUPA wakes it.  The second WUPA starts in the same step that polled the
+ * silence, as the one start of that step.  The silence of an inventory is final. */
 static void on_wake(struct ace2k_iso14443a *self, uint8_t reader, enum ace2k_rfid_poll p,
                     const struct ace2k_rfid_rx *rx)
 {
     struct ace2k_iso14443a_engine *e = &self->r[reader];
     if (p == ACE2K_RFID_POLL_TIMEOUT) {
         if (e->job.kind != ACE2K_ISO_JOB_INVENTORY && !e->rewoken) {
-            e->rewoken = true; /* the phase stays WAKE: the WUPA again */
+            e->rewoken = true; /* the phase stays WAKE, so the WUPA goes again */
             return;
         }
-        on_silence(self, reader);
+        ace2k_iso14443a_on_silence(self, reader);
         return;
     }
     if (p != ACE2K_RFID_POLL_DONE && p != ACE2K_RFID_POLL_COLLISION) {
-        end(self, reader, ACE2K_ISO_ERROR);
+        ace2k_iso14443a_end(self, reader, ACE2K_ISO_ERROR);
         return;
     }
     e->cur = (struct ace2k_iso14443a_tag){ 0 };
@@ -372,150 +288,38 @@ static void on_wake(struct ace2k_iso14443a *self, uint8_t reader, enum ace2k_rfi
         e->cur.atqa = ace2k_get_u16_le(rx->data);
     }
     e->level = 0;
-    begin_level(e);
+    ace2k_iso14443a_begin_level(e);
 }
 
-/* The received bits land after the known ones: the first byte shares its low `part` bits with
- * the last byte sent (RxAlign). */
-static void merge(struct ace2k_iso14443a_engine *e, const struct ace2k_rfid_rx *rx)
-{
-    uint8_t full = (uint8_t)(e->known_bits / ACE2K_BITS_PER_BYTE);
-    uint8_t part = (uint8_t)(e->known_bits % ACE2K_BITS_PER_BYTE);
-    uint32_t keep = (1U << part) - 1U;
-    for (uint8_t i = 0; i < rx->len && full + i < ACE2K_ISO_CL_BYTES; i++) {
-        uint8_t v = rx->data[i];
-        if (i == 0 && part != 0) {
-            v = (uint8_t)((e->cl[full] & keep) | (v & ~keep));
-        }
-        e->cl[full + i] = v;
-    }
-}
-
-static void on_anticoll_done(struct ace2k_iso14443a *self, uint8_t reader,
-                             const struct ace2k_rfid_rx *rx)
-{
-    struct ace2k_iso14443a_engine *e = &self->r[reader];
-    uint8_t full = (uint8_t)(e->known_bits / ACE2K_BITS_PER_BYTE);
-    merge(e, rx);
-    if (full + rx->len != ACE2K_ISO_CL_BYTES || rx->last_bits != 0 ||
-        bcc_of(e->cl) != e->cl[ACE2K_ISO_CL_UID_BYTES]) {
-        end(self, reader, ACE2K_ISO_ERROR);
-        return;
-    }
-    e->known_bits = ACE2K_ISO_CL_BITS;
-    e->phase = ACE2K_ISO_PH_SELECT;
-}
-
-/* A collision at bit p: the bits before it are shared, p is known from now on and taken as 1 —
- * the tags with a 0 there drop out of this round and are found by a later REQA. */
-static void on_anticoll_collision(struct ace2k_iso14443a *self, uint8_t reader,
-                                  const struct ace2k_rfid_rx *rx)
-{
-    struct ace2k_iso14443a_engine *e = &self->r[reader];
-    uint8_t p = rx->coll_pos;
-    if (p <= e->known_bits || p > ACE2K_ISO_COLL_BITS_MAX ||
-        ++e->iterations > ACE2K_ISO_ANTICOLL_MAX) {
-        end(self, reader, ACE2K_ISO_ERROR);
-        return;
-    }
-    merge(e, rx);
-    uint8_t bit = (uint8_t)(p - 1U);
-    e->cl[bit / ACE2K_BITS_PER_BYTE] |= (uint8_t)(1U << (bit % ACE2K_BITS_PER_BYTE));
-    e->known_bits = p;
-}
-
-static void on_anticoll(struct ace2k_iso14443a *self, uint8_t reader, enum ace2k_rfid_poll p,
-                        const struct ace2k_rfid_rx *rx)
-{
-    if (p == ACE2K_RFID_POLL_DONE) {
-        on_anticoll_done(self, reader, rx);
-    } else if (p == ACE2K_RFID_POLL_COLLISION) {
-        on_anticoll_collision(self, reader, rx);
-    } else if (p == ACE2K_RFID_POLL_TIMEOUT) {
-        on_silence(self, reader);
-    } else {
-        end(self, reader, ACE2K_ISO_ERROR);
-    }
-}
-
-static void append_uid(struct ace2k_iso14443a_engine *e, const uint8_t *src, uint8_t n)
-{
-    for (uint8_t i = 0; i < n && e->cur.uid_len < ACE2K_ISO_UID_MAX; i++) {
-        e->cur.uid[e->cur.uid_len++] = src[i];
-    }
-}
-
-/* The tag answered its selection with a final SAK: an inventory records and halts it, a read
- * goes on to its pages or its authentication. */
-static void on_selected(struct ace2k_iso14443a *self, uint8_t reader)
-{
-    struct ace2k_iso14443a_engine *e = &self->r[reader];
-    if (e->job.kind == ACE2K_ISO_JOB_INVENTORY) {
-        if (e->out.tag_count < ACE2K_ISO_INVENTORY_MAX) {
-            e->out.tags[e->out.tag_count++] = e->cur;
-        }
-        e->phase = ACE2K_ISO_PH_HALT;
-        return;
-    }
-    e->phase = e->job.kind == ACE2K_ISO_JOB_MIFARE_READ ? ACE2K_ISO_PH_AUTH : ACE2K_ISO_PH_READ;
-}
-
-static void on_select(struct ace2k_iso14443a *self, uint8_t reader, enum ace2k_rfid_poll p,
-                      const struct ace2k_rfid_rx *rx)
-{
-    struct ace2k_iso14443a_engine *e = &self->r[reader];
-    if (p == ACE2K_RFID_POLL_TIMEOUT) {
-        on_silence(self, reader);
-        return;
-    }
-    if (p != ACE2K_RFID_POLL_DONE || rx->len != ACE2K_ISO_SAK_FRAME || !crc_ok(rx)) {
-        end(self, reader, ACE2K_ISO_ERROR);
-        return;
-    }
-    uint8_t sak = rx->data[0];
-    if (sak & ACE2K_ISO_SAK_CASCADE) {
-        if (e->cl[0] != ACE2K_ISO_CT || e->level + 1U >= ACE2K_ISO_LEVELS_MAX) {
-            end(self, reader, ACE2K_ISO_ERROR);
-            return;
-        }
-        append_uid(e, &e->cl[1], ACE2K_ISO_CL_UID_BYTES - 1U);
-        e->level++;
-        begin_level(e);
-        return;
-    }
-    append_uid(e, e->cl, ACE2K_ISO_CL_UID_BYTES);
-    e->cur.sak = sak;
-    on_selected(self, reader);
-}
-
-/* HLTA has no answer: the next step moves on without polling it — the next start's Idle ends
- * the reader's wait for one.  A read job's HLTA is its last frame: the job ends OK (end() then
- * clears the crypto unit); an inventory wakes the next tag. */
+/* HLTA has no answer, so the next step moves on without polling it.  The Idle of the next start
+ * ends the reader's wait for an answer.  The HLTA of a read job is its last frame, so the job ends
+ * OK, and ace2k_iso14443a_end() then clears the crypto unit.  An inventory wakes the next tag. */
 static void on_halt(struct ace2k_iso14443a *self, uint8_t reader)
 {
     struct ace2k_iso14443a_engine *e = &self->r[reader];
     if (e->job.kind != ACE2K_ISO_JOB_INVENTORY) {
-        end(self, reader, ACE2K_ISO_OK);
+        ace2k_iso14443a_end(self, reader, ACE2K_ISO_OK);
         return;
     }
-    if (e->out.tag_count >= ACE2K_ISO_INVENTORY_MAX) {
-        end(self, reader, ACE2K_ISO_OK);
+    if (e->selected >= ACE2K_ISO_INVENTORY_MAX) {
+        ace2k_iso14443a_end(self, reader, ACE2K_ISO_OK);
         return;
     }
     e->phase = ACE2K_ISO_PH_WAKE;
 }
 
-/* A silent authentication is a wrong key: a MIFARE Classic tag does not answer an
- * authentication with a key other than the sector's, so the reader's timer ends it; the SELECT
- * just before proved the tag was there (if it left since, the next step's WUPA says TAG_GONE).
- * Any other ending but MFCrypto1On — an error, or the command done without it — is the same. */
+/* A silent authentication means a wrong key.  A MIFARE Classic tag does not answer an
+ * authentication with a key other than the key of the sector, so the reader's timer ends it.  The
+ * SELECT just before proved that the tag was there.  If the tag left since, the WUPA of the next
+ * step says TAG_GONE.  Any other ending without MFCrypto1On counts the same, whether an error or
+ * the command done without it. */
 static void on_auth(struct ace2k_iso14443a *self, uint8_t reader, enum ace2k_rfid_poll p)
 {
     if (p == ACE2K_RFID_POLL_DONE) {
         self->r[reader].phase = ACE2K_ISO_PH_READ;
         return;
     }
-    end(self, reader, ACE2K_ISO_AUTH_FAILED);
+    ace2k_iso14443a_end(self, reader, ACE2K_ISO_AUTH_FAILED);
 }
 
 static void on_read(struct ace2k_iso14443a *self, uint8_t reader, enum ace2k_rfid_poll p,
@@ -523,13 +327,13 @@ static void on_read(struct ace2k_iso14443a *self, uint8_t reader, enum ace2k_rfi
 {
     struct ace2k_iso14443a_engine *e = &self->r[reader];
     if (p == ACE2K_RFID_POLL_TIMEOUT) {
-        on_silence(self, reader);
+        ace2k_iso14443a_on_silence(self, reader);
         return;
     }
-    /* a NAK is four bits; anything but 16 bytes and a good CRC_A is an error */
+    /* A NAK is four bits.  Anything but 16 bytes with a good CRC_A is an error. */
     if (p != ACE2K_RFID_POLL_DONE || rx->len != ACE2K_ISO_READ_FRAME || rx->last_bits != 0 ||
-        !crc_ok(rx)) {
-        end(self, reader, ACE2K_ISO_ERROR);
+        !ace2k_iso14443a_crc_ok(rx)) {
+        ace2k_iso14443a_end(self, reader, ACE2K_ISO_ERROR);
         return;
     }
     uint8_t k = e->reads_done;
@@ -539,8 +343,9 @@ static void on_read(struct ace2k_iso14443a *self, uint8_t reader, enum ace2k_rfi
     e->out.data_first[k] = e->read_addr[k];
     e->out.data_count = ++e->reads_done;
     if (e->reads_done == e->reads_total) {
-        /* halt the tag before the job ends — for MIFARE while Crypto1 is on, so the reader
-         * encrypts the HLTA — or the next job's WUPA finds it still ACTIVE and gets no answer */
+        /* Halt the tag before the job ends.  For MIFARE, do it while Crypto1 is on, so the reader
+         * encrypts the HLTA.  Otherwise the WUPA of the next job finds the tag still ACTIVE and
+         * gets no answer. */
         e->phase = ACE2K_ISO_PH_HALT;
     }
 }
@@ -553,10 +358,10 @@ static void handle(struct ace2k_iso14443a *self, uint8_t reader, enum ace2k_rfid
         on_wake(self, reader, p, rx);
         break;
     case ACE2K_ISO_PH_ANTICOLL:
-        on_anticoll(self, reader, p, rx);
+        ace2k_iso14443a_on_anticoll(self, reader, p, rx);
         break;
     case ACE2K_ISO_PH_SELECT:
-        on_select(self, reader, p, rx);
+        ace2k_iso14443a_on_select(self, reader, p, rx);
         break;
     case ACE2K_ISO_PH_AUTH:
         on_auth(self, reader, p);
@@ -565,13 +370,13 @@ static void handle(struct ace2k_iso14443a *self, uint8_t reader, enum ace2k_rfid
         on_read(self, reader, p, rx);
         break;
     default:
-        end(self, reader, ACE2K_ISO_ERROR);
+        ace2k_iso14443a_end(self, reader, ACE2K_ISO_ERROR);
         break;
     }
 }
 
-/* The exchange running: polled, or given up; HLTA is never polled.  True when the step may go
- * on to start the next exchange. */
+/* Polls the running exchange, or gives it up.  HLTA is never polled.  It returns true when the step
+ * may go on to start the next exchange. */
 static bool poll_running(struct ace2k_iso14443a *self, uint8_t reader)
 {
     struct ace2k_iso14443a_engine *e = &self->r[reader];
@@ -584,7 +389,7 @@ static bool poll_running(struct ace2k_iso14443a *self, uint8_t reader)
     enum ace2k_rfid_poll p = self->ops->poll(self->ctx, reader, &rx);
     if (p == ACE2K_RFID_POLL_BUSY) {
         if (++e->polls >= ACE2K_ISO_POLL_MAX) {
-            end(self, reader, ACE2K_ISO_ERROR);
+            ace2k_iso14443a_end(self, reader, ACE2K_ISO_ERROR);
         }
         return false;
     }
@@ -603,7 +408,7 @@ bool ace2k_iso14443a_step(struct ace2k_iso14443a *self, uint8_t reader)
         return e->phase == ACE2K_ISO_PH_IDLE;
     }
     if (send_phase(self, reader) != 0) {
-        end(self, reader, ACE2K_ISO_ERROR);
+        ace2k_iso14443a_end(self, reader, ACE2K_ISO_ERROR);
         return true;
     }
     e->waiting = true;

@@ -8,6 +8,8 @@ The configuration of this tree declares no macro today; the check guards any tha
 U1's macros live in the ace2k-u1 tree, which carries its own copy of this check.
 """
 
+from __future__ import annotations
+
 import re
 from pathlib import Path
 
@@ -21,16 +23,16 @@ SPLITTERS = {
 SECTION = re.compile(r"^\[gcode_macro\s+([^\]\s]+)\s*\]", re.MULTILINE)
 
 
-def macros():
+def macros() -> list[tuple[str, str]]:
     """(file name, macro name) for every [gcode_macro NAME] section under config/."""
-    found = []
-    for path in sorted(CONFIG.glob("*.cfg")):
-        for name in SECTION.findall(path.read_text(encoding="utf-8")):
-            found.append((path.name, name))
-    return found
+    return [
+        (path.name, name)
+        for path in sorted(CONFIG.glob("*.cfg"))
+        for name in SECTION.findall(path.read_text(encoding="utf-8"))
+    ]
 
 
-def klipper_command(line, splitter):
+def klipper_command(line: str, splitter: re.Pattern[str]) -> str:
     """The command name Klipper's parser reads off a line, as klippy/gcode.py does."""
     parts = splitter.split(line.upper())
     if len(parts) >= 3:
@@ -39,7 +41,7 @@ def klipper_command(line, splitter):
 
 
 @pytest.mark.parametrize("flavour", sorted(SPLITTERS))
-def test_every_macro_name_is_its_own_command(flavour):
+def test_every_macro_name_is_its_own_command(flavour: str) -> None:
     # one test over every macro, not one per macro: with none declared it still runs, not skips
     bad = []
     for cfg, name in macros():
@@ -53,6 +55,6 @@ def test_every_macro_name_is_its_own_command(flavour):
 
 
 @pytest.mark.parametrize("flavour", sorted(SPLITTERS))
-def test_the_check_catches_a_digit_in_a_name(flavour):
+def test_the_check_catches_a_digit_in_a_name(flavour: str) -> None:
     assert klipper_command("_PRINT_START_X2Y", SPLITTERS[flavour]) != "_PRINT_START_X2Y"
-    assert klipper_command("ACE_EJECT", SPLITTERS[flavour]) == "ACE_EJECT"
+    assert klipper_command("ACEK_EJECT", SPLITTERS[flavour]) == "ACEK_EJECT"

@@ -1,14 +1,16 @@
-/* What: the order of the channels in every ADC pass the board delivers, and the raw → mV rule.
- * How: the board scan fills a uint16_t[ACE2K_ADC_COUNT] in this order; sensors and env index
- * it with these names.  Twelve channels: the ten external inputs of docs/hardware.md "Analogue
- * inputs", the auxiliary, and the internal reference.  ADC1, 12-bit, 3.3 V reference.  The MCU's
- * own temperature sensor is left to Klipper's temperature_mcu, which reads it through Klipper's
- * analog_in, so the two users of the ADC never share a channel (measured 2026-09-17: sharing it
- * with a back-to-back scan stalled the host link).
- * Depends on: <stdint.h>. */
+/* What: the order of the channels in every ADC pass that the board delivers, and the rule from raw
+ * to mV.  The pass's period and staleness bound are in core/adc_timing.h.
+ * How: the board scan fills a uint16_t[ACE2K_ADC_COUNT] in this order, and sensors and env index it
+ * with these names.  There are twelve channels: the ten external inputs of docs/hardware.md
+ * "Analogue inputs", the auxiliary, and the internal reference.  ADC1, 12-bit, 3.3 V reference.
+ * The temperature sensor of the MCU itself is left to Klipper's temperature_mcu, which reads it
+ * through Klipper's analog_in.  So the two users of the ADC never share a channel.  Sharing it with
+ * a back-to-back scan stalled the host link, as measured on the unit.
+ * Depends on: <stdint.h>, core/adc_timing.h. */
 #ifndef ACE2K_ADC_MAP_H
 #define ACE2K_ADC_MAP_H
 #include <stdint.h>
+#include "core/adc_timing.h" /* ACE2K_ADC_PASS_PERIOD_MS, ACE2K_ADC_STALE_MS */
 
 enum ace2k_adc_index {
     ACE2K_ADC_NTC_LEFT,  /* PA5, ch 5 */

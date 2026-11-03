@@ -4,7 +4,7 @@ One patch, applied to the pinned Klipper commit (`../klipper.pin`) by `make buil
 commit that the build removes again. It never leaves this repository and must stay small
 (target: under 100 added lines — the `+` lines of the diff, not its length).
 
-`0001-gd32f303-and-ace2k-hooks.patch` (83 lines added, 17 replaced, 10 files — the count is
+`0001-gd32f303-and-ace2k-hooks.patch` (99 lines added, 19 replaced, 10 files — the count is
 `git apply --numstat`'s, blank lines included):
 
 - `src/generic/armcm_timer.c`: `timer_note_stall(grace_us)`, next to `timer_repeat_until`. A
@@ -15,9 +15,13 @@ commit that the build removes again. It never leaves this repository and must st
   the grace window instead.
 - `src/stm32/Kconfig`: the `MACH_GD32F303` processor entry (selects the STM32F1 family:
   register-compatible), its CMSIS header (`stm32f103xe`), the clock defaults — `CLOCK_FREQ`
-  120000000 when `ACE2K_CLOCK_120M` is set, else 72000000 — flash 256 KB, RAM 48 KB; the serial
+  120000000 when `ACE2K_CLOCK_120M` is set, else 72000000 — flash 256 KB, RAM 48 KB; the clock
+  reference choice offers the part only the 24 MHz crystal, the one its clock setup supports
+  (`gd32f30x.c` stops the build for any other); the serial
   choice `STM32_SERIAL_UART4_PC11_PC10_RS485` (UART4 PC11/PC10 with the RS-485 driver-enable on
-  PA11, `depends on MACH_GD32F303`, selects `SERIAL`); `source "src/ace2k/Kconfig"`.
+  PA11, `depends on MACH_GD32F303`, selects `SERIAL`); `source "src/ace2k/Kconfig"`; and
+  `HAVE_LIMITED_CODE_SIZE` is also selected for the part (the one replaced line there), which is
+  what lets `config/ace2k.config` switch off the generic features the unit has no device for.
 - `src/stm32/Makefile`: `-mcpu=cortex-m4` for the part; `src-$(CONFIG_MACH_GD32F303) +=
   stm32/gd32f30x.c`, our clock file (`make build` symlinks it into `klipper/src/stm32/`);
   `serial-src-$(CONFIG_STM32_SERIAL_UART4_PC11_PC10_RS485) := ace2k_board/serial.c`, which
@@ -47,6 +51,11 @@ commit that the build removes again. It never leaves this repository and must st
   variant (`src/ace2k/tx.[ch]`, where the varargs wrapper lives so that Klipper's generic
   `command.c` stays untouched and a tree with another console still links) and hold a frame
   that did not fit for their next tick, keeping room for a command response behind theirs.
+- `src/generic/serial_irq.c`, `src/generic/misc.h`: `console_frames_received`, a count of the
+  frames `console_task()` accepted (CRC and sequence checked), raised before the frame is
+  dispatched (the one replaced line there). The ace2k serial driver reads it to know that the
+  host is there: bytes alone are not a host, since noise on the line is bytes too
+  (`src/ace2k_board/serial.c`, `ace2k_serial_link_ok()`).
 
 ## Regenerating it
 

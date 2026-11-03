@@ -9,9 +9,18 @@
 #   make flag-check  build the release and prove what it must and must not carry (made from
 #                  config/ace2k.config, the version constant, PC9 never drivable, the dryer, no
 #                  bench commands)
-#   make test      host tests of the core (cc) and of the tools (pytest)
+#   make flasher-pyz  the flasher (tools/ace2k_flash/) as one runnable file,
+#                  build/ace2k_flash.pyz; the same source always gives the same bytes
+#   make host-bundle  the host files of a release as one tarball for ace2k-u1's installer:
+#                  build/ace2k-host-<version>.tar.gz (host modules, the two .cfg files, the
+#                  flasher's .pyz)
+#   make test      host tests of the core (cc, under the address and undefined-behaviour
+#                  sanitizers) and of the tools (pytest)
 #   make coverage  line coverage of the core under the host tests (built with clang)
-#   make lint      formatter check, clang-tidy, cppcheck, ruff
+#   make lint      formatter check, clang-tidy (the core and, after make build, the Klipper-facing
+#                  layer), cppcheck, ruff, no C line over 100 characters
+#   make quality   the quality gate of the host code and the tools (complexity, size, dead code,
+#                  coverage, types) and of the C core (size, coverage floor)
 #   make lint-selftest  clang-tidy on a fixture written to fail, proving the rules bite
 #   make doctor    the toolchain check
 #   make hooks     install the pre-commit hook (format-check on the staged tree) in the
@@ -111,6 +120,27 @@ image:
 	cp $(KLIPPER)/out/klipper.dict $(BUILD)/ace2k-$(ACE2K_VERSION).dict
 	$(ACE2K_CROSS)size $(KLIPPER)/out/klipper.elf
 
+.PHONY: flasher-pyz host-bundle
+FLASHER_PYZ := $(BUILD)/ace2k_flash.pyz
+HOST_STAGE  := $(BUILD)/host-stage
+HOST_BUNDLE := $(BUILD)/ace2k-host-$(ACE2K_VERSION).tar.gz
+
+flasher-pyz:
+	$(PYTHON) scripts/build_pyz.py tools/ace2k_flash $(FLASHER_PYZ)
+
+host-bundle: flasher-pyz
+	rm -rf $(HOST_STAGE)
+	mkdir -p $(HOST_STAGE)/klippy/extras $(HOST_STAGE)/config $(HOST_STAGE)/firmware/tools
+	cp $(ACE2K_ROOT)/klippy/extras/ace2k*.py $(HOST_STAGE)/klippy/extras/
+	cp -R $(ACE2K_ROOT)/klippy/extras/ace2k_tags $(HOST_STAGE)/klippy/extras/
+	cp $(ACE2K_ROOT)/config/ace2k.cfg $(ACE2K_ROOT)/config/ace2k_tags.cfg $(HOST_STAGE)/config/
+	cp $(FLASHER_PYZ) $(HOST_STAGE)/firmware/tools/
+	cp $(ACE2K_ROOT)/LICENSE $(HOST_STAGE)/
+	find $(HOST_STAGE) \( -name __pycache__ -o -name .DS_Store -o -name '._*' \) -prune -exec rm -rf {} +
+	COPYFILE_DISABLE=1 tar -czf $(HOST_BUNDLE) -C $(HOST_STAGE) klippy config firmware LICENSE
+	rm -rf $(HOST_STAGE)
+	@echo "host-bundle: $(HOST_BUNDLE)"
+
 .PHONY: flag-check
 FLAG_ELF     := $(BUILD)/ace2k-$(ACE2K_VERSION).elf
 FLAG_DICT    := $(BUILD)/ace2k-$(ACE2K_VERSION).dict
@@ -122,13 +152,13 @@ FLAG_RELEASE := $(abspath config/ace2k.config)
 # the dictionary must carry the ACE2K_VERSION constant with that same value — the constant is
 # present and matches the image's name.  By the dryer's safety rules, PC9 (the cutout's
 # latch reset) appears in the dictionary only inside the value of a RESERVE_PINS_* constant —
-# reserved at most once, so the host cannot drive it — and in no source under src/ outside such a
-# pin-list string (comments stripped by the compiler's preprocessor, which keeps every #define of
-# both arms of an #if and would warn of a redefinition: -w); the gate's header and pin are
-# confined to the gate and its binding.  Then: ace2k_flap_pulse is the two-argument command (the
-# pulse length is the compiled one), the dryer is present, and no retired bench command is in the
-# dictionary (no ace2k_heat_* name, no ace2k_lane_ move/stop/speed_set/duty/motion, no
-# ace2k_rfid_trace).
+# reserved exactly once, so the host cannot drive it — and in no source under src/ outside such
+# a pin-list string (comments stripped by the compiler's preprocessor, which keeps every #define
+# of both arms of an #if and would warn of a redefinition: -w).  The triac gate PC8 is reserved
+# exactly once too, and the gate's header and pin are confined to the gate and its binding.
+# Then: ace2k_flap_pulse is the two-argument command (the pulse length is the compiled one), the
+# dryer is present, and no retired bench command is in the dictionary (no ace2k_heat_* name, no
+# ace2k_lane_ move/stop/speed_set/duty/motion, no ace2k_rfid_trace).
 flag-check: build
 	@test -f $(FLAG_ELF) && test -f $(FLAG_DICT) || \
 	    { echo "flag-check: the build left no $(FLAG_ELF) or $(FLAG_DICT)"; exit 1; }
@@ -144,7 +174,9 @@ flag-check: build
 	    if sed -E 's/"RESERVE_PINS_[A-Za-z0-9_]*": *"[^"]*"//g' $$d | grep -E -q 'PC9([^0-9]|$$)'; then \
 	        echo "flag-check: PC9 outside a pin reservation in the release dictionary"; exit 1; fi; \
 	    n=$$(grep -E -o '"RESERVE_PINS_[A-Za-z0-9_]*": *"[^"]*"' $$d | grep -E -c 'PC9([^0-9]|$$)' || true); \
-	    if [ "$$n" -gt 1 ]; then echo "flag-check: PC9 reserved $$n times in the release dictionary"; exit 1; fi; \
+	    if [ "$$n" -ne 1 ]; then echo "flag-check: PC9 reserved $$n times in the release dictionary"; exit 1; fi; \
+	    n=$$(grep -E -o '"RESERVE_PINS_[A-Za-z0-9_]*": *"[^"]*"' $$d | grep -E -c 'PC8([^0-9]|$$)' || true); \
+	    if [ "$$n" -ne 1 ]; then echo "flag-check: PC8 reserved $$n times in the release dictionary"; exit 1; fi; \
 	    for f in $$(find src -name '*.[ch]' | LC_ALL=C sort); do \
 	        code=$$($(CROSS_CC) -w -fpreprocessed -dD -E -P -x c $$f) || exit 1; \
 	        if printf '%s\n' "$$code" | grep -E -q "(ACE2K_PIN|GPIO)\( *'C' *, *9 *\)"; then \
@@ -167,6 +199,8 @@ flag-check: build
 	        { echo "flag-check: the release's ace2k_flap_pulse is not the two-argument command"; exit 1; }; \
 	    grep -q '"ace2k_dryer_start target_c=%c minutes=%hu"' $$d || \
 	        { echo "flag-check: the release lacks the dryer"; exit 1; }; \
+	    grep -q '"ace2k_dryer_auto_mode mode=%c"' $$d || \
+	        { echo "flag-check: the release lacks the dryer's modes"; exit 1; }; \
 	    retired='"ace2k_(heat_[a-z_]*|lane_(move|stop|speed_set|duty|motion)[a-z_]*|rfid_trace)[" ]'; \
 	    names=$$(grep -E -o "$$retired" $$d || true); \
 	    if [ -n "$$names" ]; then \
@@ -195,13 +229,15 @@ clean:
 	rm -rf $(KLIPPER)/out $(KLIPPER)/.config $(KLIPPER)/.config.old
 
 TESTDIR   := tests/build
-# core/tx.c is the binding layer's (it calls Klipper's console), not the core's: kept off the host build
-CORE_SRC  := $(filter-out %_cmds.c src/ace2k/core/tx.c, $(wildcard src/ace2k/*/*.c))
+CORE_SRC  := $(filter-out %_cmds.c, $(wildcard src/ace2k/*/*.c))
 TEST_SRC  := $(wildcard tests/*/test_*.c)
 TEST_BIN  := $(patsubst tests/%.c,$(TESTDIR)/%,$(TEST_SRC))
 HOSTCC    ?= cc
 HOSTFLAGS := -std=c11 -g -O0 -Wall -Wextra -Werror -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
              -Wdouble-promotion -Wundef -Wvla -Isrc -Isrc/ace2k -Itests
+# The C tests run under AddressSanitizer and UndefinedBehaviorSanitizer; any report aborts the
+# test.  The coverage build does not use them.
+SANFLAGS  := -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
 
 .PHONY: test test-c
 
@@ -209,9 +245,9 @@ $(TESTDIR):
 	mkdir -p $@
 
 $(TESTDIR)/%: tests/%.c $(CORE_SRC) $(wildcard src/ace2k/*/*.h src/ace2k_board/*.h) \
-              $(wildcard tests/*.h) | $(TESTDIR)
+              $(wildcard tests/*.h) Makefile | $(TESTDIR)
 	@mkdir -p $(@D)
-	$(HOSTCC) $(HOSTFLAGS) $< $(CORE_SRC) -o $@ -lm
+	$(HOSTCC) $(HOSTFLAGS) $(SANFLAGS) $< $(CORE_SRC) -o $@ -lm
 
 test-c: $(TEST_BIN)
 	@for t in $(TEST_BIN); do ./$$t || exit 1; done
@@ -242,7 +278,7 @@ LLVM_BIN     := $(shell brew --prefix llvm 2>/dev/null)/bin
 CLANG_FORMAT ?= $(shell command -v clang-format 2>/dev/null || echo $(LLVM_BIN)/clang-format)
 FORMAT_SRC   := $(filter-out tests/lint-fixtures/%, $(wildcard src/ace2k/*/*.c src/ace2k/*/*.h \
                   src/ace2k_board/*.c src/ace2k_board/*.h src/stm32/*.c tests/*/*.c tests/*.h))
-PY_SRC       := firmware/tools firmware/tests/python klippy scripts
+PY_SRC       := firmware/scripts firmware/tools firmware/tests/python klippy scripts
 
 .PHONY: format format-check
 
@@ -260,13 +296,15 @@ TIDY_SRC     := $(CORE_SRC) $(TEST_SRC)
 # The board headers are pure declarations (standard headers only) that tests/lane/test_pins.c
 # includes, so they are checked the same way; a header that needs a Klipper header cannot be
 # listed here — serial.h includes autoconf.h for the link_ok helper, tx.h command.h for the
-# encoder — and the cross build and cppcheck check those.
-TIDY_HDR     := $(filter-out src/ace2k_board/serial.h src/ace2k/core/tx.h, \
+# encoder, args.h and lane/lane_args.h command.h and sched.h for the shutdown — and the cross
+# build and cppcheck check those.
+TIDY_HDR     := $(filter-out src/ace2k_board/serial.h src/ace2k_board/tx.h src/ace2k_board/args.h \
+                src/ace2k/lane/lane_args.h, \
                   $(wildcard src/ace2k/*/*.h src/ace2k_board/*.h))
 TIDY_FLAGS   := -- -std=c11 -I$(abspath src) -I$(abspath src/ace2k) -I$(abspath tests)
 CPPCHECK_SRC := $(wildcard src/ace2k/*/*.c src/ace2k_board/*.c src/stm32/*.c)
 
-.PHONY: lint tidy cppcheck ruff lint-selftest
+.PHONY: lint tidy cppcheck ruff lint-selftest line-length
 
 # A translation unit carries its own directory's configuration into every header it includes, so
 # the core headers are also checked on their own: reached only from tests/, they would otherwise
@@ -275,6 +313,40 @@ tidy:
 	$(CLANG_TIDY) --quiet $(TIDY_SRC) $(TIDY_FLAGS)
 	$(CLANG_TIDY) --quiet $(TIDY_HDR) $(TIDY_FLAGS) -x c
 	@echo "clang-tidy: OK"
+
+# The Klipper-facing layer (bindings, board drivers, chip glue) needs Klipper's and the Arm headers,
+# so it is checked from inside the configured Klipper tree with its own, slightly relaxed config.
+ARM_GCC_INC   := $(shell $(CROSS_CC) -print-file-name=include)
+# The C library's headers: the directory the compiler itself takes inttypes.h from (an Arm GNU
+# Toolchain keeps them beside its bin/, a distribution's package elsewhere, e.g. /usr/lib/arm-none-eabi).
+ARM_LIBC_INC  := $(patsubst %/inttypes.h,%,$(firstword $(filter %/inttypes.h,$(shell \
+    printf '\043include <inttypes.h>\n' | $(CROSS_CC) -xc -M - 2>/dev/null))))
+TIDY_BIND_SRC := $(wildcard src/ace2k/*/*_cmds.c src/ace2k_board/*.c) src/stm32/gd32f30x.c
+# -mfloat-abi=soft: the layer does not use floating point, and the CMSIS headers need no FPU setup.
+# Klipper's src is named by its absolute path. A header of ace2k_board/ is then reached as
+# .../klipper/src/ace2k_board/x.h, which the header filter of src/.clang-tidy-bindings matches; a
+# relative src/ace2k_board/x.h would not match it, and the header would go unchecked.
+TIDY_BIND_FLAGS := -- -std=gnu11 --target=arm-none-eabi -mcpu=cortex-m4 -mthumb -mfloat-abi=soft \
+    -DSTM32F103xE -nostdinc -isystem $(ARM_GCC_INC) -isystem $(ARM_LIBC_INC) \
+    -iquote out -iquote $(abspath $(KLIPPER))/src -iquote out/board-generic/ -Ilib/stm32f1/include \
+    -Ilib/cmsis-core -Ilib/fast-hash -Isrc/stm32 -I$(abspath src) -I$(abspath src/ace2k) \
+    -DACE2K_VERSION=\"tidy\" -include out/autoconf.h
+
+# The Klipper tree rests at its pin between builds; the declarations the layer uses from the
+# patches (timer_note_stall, i2c_software_setup, ...) exist only while the patches are applied, so
+# they are applied for the run and taken out again, whatever its result.
+.PHONY: tidy-bind
+tidy-bind:
+	@test -f $(KLIPPER)/out/autoconf.h || { echo "tidy-bind: run make build first"; exit 1; }
+	@mkdir -p $(TESTDIR)
+	@test -z "$$(git -C $(KLIPPER) status --porcelain)" \
+	    || { echo "tidy-bind: klipper/ has uncommitted or untracked changes; run make klipper-reset first"; exit 1; }
+	@trap 'git -C $(KLIPPER) reset -q --hard $(KLIPPER_PIN)' EXIT INT TERM; \
+	    for p in $(PATCHES); do git -C $(KLIPPER) apply $$p || { echo "tidy-bind: cannot apply $$p"; exit 1; }; done; \
+	    cd $(KLIPPER) && $(CLANG_TIDY) --quiet --config-file=$(abspath src/.clang-tidy-bindings) \
+	        $(addprefix $(abspath .)/,$(TIDY_BIND_SRC)) $(TIDY_BIND_FLAGS) > $(abspath $(TESTDIR))/tidy-bind.txt 2>&1; \
+	    status=$$?; \
+	    $(PYTHON) $(abspath scripts/tidy_ratchet.py) $(abspath scripts/tidy-ratchet.txt) $(abspath $(TESTDIR))/tidy-bind.txt $$status $(CURDIR)
 
 cppcheck:
 	cppcheck --quiet --error-exitcode=1 --enable=warning,style,performance,portability \
@@ -286,8 +358,69 @@ ruff:
 	cd .. && ruff check $(PY_SRC)
 	@echo "ruff: OK"
 
-lint: format-check tidy cppcheck ruff
+# clang-format wraps code at 100 columns but does not reflow comments, so every C line under src/
+# and tests/ is held to 100 characters here (characters, not bytes: "°" and "µ" are one each).
+# The generated tables are left out; their generators write them.
+LINE_MAX       := 100
+LINE_GENERATED := env_table.h thermal_params.h thermal_runs.h
+line-length:
+	@$(PYTHON) scripts/check_line_length.py --max $(LINE_MAX) \
+	    $(addprefix --exclude ,$(LINE_GENERATED)) src tests
+
+lint: format-check tidy tidy-bind cppcheck ruff line-length
 	@echo "lint: OK"
+
+# The quality gate of the host code: run when a plan closes, not on every commit (the coverage
+# needs the whole suite).  The limits are at their final values (complexity 15, modules of 1000
+# lines of code, coverage 98.5 %) and are never relaxed; see CONTRIBUTING.md.  MODULE_MAX_CODE
+# counts lines of code only (blank lines, comments and docstrings do not count); a module over
+# MODULE_TARGET lines in total only prints a warning.
+QUALITY_PY      := ../klippy/extras ../scripts
+XENON_LIMITS    := --max-absolute C --max-modules A --max-average A
+MODULE_MAX_CODE := 1000
+MODULE_TARGET   := 1000
+COVERAGE_MIN    := 98.5
+VULTURE_RATCHET :=
+# The firmware tools (tools/, the flasher's package included) get the same gate: complexity C,
+# modules of 1000 lines of code, vulture, mypy --strict, every module and the average at A.  One
+# limit differs from the host's: the coverage floor is the tools' own measurement
+# (97.03 % when it was set).  The floors are separate so the tools neither lower nor hide behind
+# the host's.
+TOOLS_PY             := tools
+TOOLS_XENON          := --max-absolute C --max-modules A --max-average A
+TOOLS_COVERAGE_MIN   := 97.0
+# The C core's floors are the last measurement of `make coverage` rounded down to 0.1 (lines
+# 98.46 %, branches 95.64 %).  Raise them when tests add coverage; never lower them.
+C_COVERAGE_LINES    := 98.4
+C_COVERAGE_BRANCHES := 95.6
+
+.PHONY: quality
+quality:
+	$(PYTHON) -m xenon $(XENON_LIMITS) $(QUALITY_PY)
+	$(PYTHON) -m xenon $(TOOLS_XENON) $(TOOLS_PY)
+	$(PYTHON) ../scripts/check_module_size.py \
+	    --max-code-lines $(MODULE_MAX_CODE) --target-lines $(MODULE_TARGET) $(QUALITY_PY)
+	$(PYTHON) ../scripts/check_module_size.py \
+	    --max-code-lines $(MODULE_MAX_CODE) --target-lines $(MODULE_TARGET) $(TOOLS_PY)
+	cd .. && $(PYTHON) -m vulture klippy/extras scripts firmware/tools \
+	    vulture-whitelist.py --min-confidence 60 \
+	    --exclude klippy/extras/ace2k_klipper_types.py \
+	    --ignore-names '$(VULTURE_RATCHET)'
+	mkdir -p $(BUILD)
+	COVERAGE_FILE=$(BUILD)/.coverage $(PYTHON) -m pytest -q -p no:cacheprovider \
+	    tests/python --cov=../klippy/extras --cov=../scripts --cov=tools \
+	    --cov-config=../.coveragerc --cov-report=
+	COVERAGE_FILE=$(BUILD)/.coverage $(PYTHON) -m coverage report --rcfile=../.coveragerc \
+	    --include='*/klippy/extras/*,*/scripts/*' --skip-covered --fail-under=$(COVERAGE_MIN)
+	COVERAGE_FILE=$(BUILD)/.coverage $(PYTHON) -m coverage report --rcfile=../.coveragerc \
+	    --include='*/firmware/tools/*' --skip-covered --fail-under=$(TOOLS_COVERAGE_MIN)
+	cd .. && $(PYTHON) -m mypy
+	$(PYTHON) ../scripts/check_module_size.py \
+	    --max-code-lines $(MODULE_MAX_CODE) --target-lines $(MODULE_TARGET) src
+	$(MAKE) --no-print-directory coverage > $(BUILD)/coverage-report.txt
+	$(PYTHON) scripts/check_c_coverage.py \
+	    --lines $(C_COVERAGE_LINES) --branches $(C_COVERAGE_BRANCHES) < $(BUILD)/coverage-report.txt
+	@echo "quality: OK"
 
 # The tidy configuration must actually bite: run it on the fixture and require the three
 # findings the fixture was written for.  The project config is named explicitly because the

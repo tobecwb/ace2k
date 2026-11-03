@@ -31,7 +31,7 @@ static void fake_span(void *ctx, struct ace2k_mains_span *out)
     ace2k_mains_edge_filter_take(&F, out);
 }
 
-static const struct ace2k_mains_ops ace2k_fake_ops = {
+static const struct ace2k_mains_ops fake_ops = {
     .zerocross_count = fake_count,
     .zerocross_rejects = fake_rejects,
     .span = fake_span,
@@ -127,7 +127,7 @@ static void train_start(struct ace2k_mains *m, uint32_t half_us, uint32_t clock0
     ace2k_fake_edges = 0;
     ace2k_fake_rejects = 0;
     ace2k_mains_edge_filter_init(&F, ACE2K_ZEROCROSS_LOCKOUT_US, 0U);
-    ace2k_mains_init(m, &ace2k_fake_ops, 0, 0, US_PER_MS);
+    ace2k_mains_init(m, &fake_ops, 0, 0, US_PER_MS);
 }
 
 /* The regular ticks after from_ms up to to_ms, each after the edges up to its own time. */
@@ -275,7 +275,7 @@ TEST(a_doubled_edge_train_at_sixty_hertz_reads_sixty_and_counts_the_doubles)
 {
     struct ace2k_mains m;
     /* 60 Hz, each edge followed by a second one 200 µs later — the slow edge crossing the input's
-     * threshold twice, the v0.3.0 limitation's hypothesis */
+     * threshold twice, the suspected cause of the v0.3.0 limitation */
     train_start(&m, HALF_US_60, 0);
     T.bounce_us = 200U;
     ticks(&m, 0, 1000);
@@ -321,15 +321,15 @@ static bool gate_low(void *ctx)
     return false;
 }
 
-static const struct ace2k_heat_ops ace2k_nop_gate = {
+static const struct ace2k_heat_ops nop_gate = {
     .gate_fire = gate_nop,
     .gate_off = gate_nop,
     .gate_read = gate_low,
 };
 
-/* The bench's dip, replayed: a 50 ms store in mid-window loses 6 edges but the late one, whose
- * lockout swallows the next real edge — counted over the window, 58 Hz.  The late edge ends the
- * span and the next starts at the first edge accepted after it, so no span holds a lost edge:
+/* The dip seen on the unit, replayed: a 50 ms store in mid-window loses 6 edges but the late one,
+ * whose lockout swallows the next real edge — counted over the window, 58 Hz.  The late edge ends
+ * the span and the next starts at the first edge accepted after it, so no span holds a lost edge:
  * hz10 keeps 599 while no span is long enough, the heater never reads the mains implausible, its
  * bucket stays empty, and the next published value is exact. */
 TEST(a_stall_with_a_late_edge_leaves_hz10_exact)
@@ -337,7 +337,7 @@ TEST(a_stall_with_a_late_edge_leaves_hz10_exact)
     struct ace2k_mains m;
     struct ace2k_heat h;
     train_start(&m, HALF_US_59_9, 0);
-    ace2k_heat_init(&h, &ace2k_nop_gate, 0);
+    ace2k_heat_init(&h, &nop_gate, 0);
     uint32_t now = ticks(&m, 0, 1000);
     ASSERT_EQ(m.hz10, 599);
     now = ticks(&m, now, 1400);
@@ -621,7 +621,7 @@ TEST(a_stall_in_a_clean_train_counts_no_reject)
     ASSERT_TRUE(f.span.bridge <= 2U * 8333U); /* a period: no edge missed outside the stall */
 }
 
-/* Round 3's scenarios.  A dip (7 edges missing, the mains still present) and then a store 40 ms
+/* A dip (7 edges missing, the mains still present) and then a store 40 ms
  * later: the late edge closes the span that holds the dip, and the next span is clean and longer —
  * the dip's gap is a bridge: the publication is MISSED, not the longest span. */
 TEST(a_dip_then_a_store_publishes_off_band)
@@ -629,7 +629,7 @@ TEST(a_dip_then_a_store_publishes_off_band)
     struct ace2k_mains m;
     struct ace2k_heat h;
     train_start(&m, HALF_US_60, 0);
-    ace2k_heat_init(&h, &ace2k_nop_gate, 0);
+    ace2k_heat_init(&h, &nop_gate, 0);
     uint32_t now = ticks(&m, 0, 1000);
     ASSERT_EQ(m.hz10, 600);
     T.off_us = 1300000U;
@@ -660,7 +660,7 @@ TEST(a_dip_a_stall_ends_publishes_the_missed_marker)
     struct ace2k_mains m;
     struct ace2k_heat h;
     train_start(&m, HALF_US_60, 0);
-    ace2k_heat_init(&h, &ace2k_nop_gate, 0);
+    ace2k_heat_init(&h, &nop_gate, 0);
     uint32_t now = ticks(&m, 0, 1000);
     T.off_us = 1400000U;
     T.on_us = 1470000U;
@@ -765,7 +765,7 @@ TEST(stalls_that_never_let_a_span_grow_publish_the_stale_marker_and_fill_the_buc
     struct ace2k_mains m;
     struct ace2k_heat h;
     train_start(&m, HALF_US_60, 0);
-    ace2k_heat_init(&h, &ace2k_nop_gate, 0);
+    ace2k_heat_init(&h, &nop_gate, 0);
     uint32_t now = ticks(&m, 0, 1000);
     ASSERT_EQ(m.hz10, 600);
     uint32_t stale_at = 0U;
@@ -925,11 +925,11 @@ TEST(a_bounce_does_not_shorten_a_bridge)
 }
 
 /* The zero-cross detector's two half-cycles may differ (its threshold off the mains' zero): at
- * 50 Hz up to ±3 ms, as far as the lockout admits (the short half at least ACE2K_ZEROCROSS_LOCKOUT_US);
- * at 60 Hz ±1 ms (±2.5 would put the short half inside the lockout: refused whatever the check).
- * Clean mains at the bands' edges, with a write every ~310 ms at a moving phase: never MISSED, and
- * every publication exact — a same-polarity interval (two consecutive gaps) is a full period
- * whatever the asymmetry. */
+ * 50 Hz up to ±3 ms, as far as the lockout admits (the short half at least
+ * ACE2K_ZEROCROSS_LOCKOUT_US); at 60 Hz ±1 ms (±2.5 would put the short half inside the lockout:
+ * refused whatever the check).  Clean mains at the bands' edges, with a write every ~310 ms at
+ * a moving phase: never MISSED, and every publication exact — a same-polarity interval (two
+ * consecutive gaps) is a full period whatever the asymmetry. */
 TEST(clean_mains_with_an_asymmetric_detector_never_reads_missed)
 {
     const uint32_t halves[] = { 10204U, HALF_US_50, 9803U, 8474U, HALF_US_60, 8196U };
@@ -1110,7 +1110,7 @@ static void boot_window(uint32_t half, uint32_t phase_us)
 {
     struct ace2k_mains m;
     struct ace2k_heat h;
-    ace2k_heat_init(&h, &ace2k_nop_gate, 0);
+    ace2k_heat_init(&h, &nop_gate, 0);
     train_start(&m, half, 0);
     T.next_us += phase_us;
     for (uint32_t t = 10U; t <= 1000U; t += 10U) {
@@ -1174,7 +1174,7 @@ static void outage_return_run(uint32_t half, uint32_t end_us, uint32_t phase_us)
     uint16_t nominal = half == HALF_US_60 ? 600U : 500U;
     struct ace2k_mains m;
     struct ace2k_heat h;
-    ace2k_heat_init(&h, &ace2k_nop_gate, 0);
+    ace2k_heat_init(&h, &nop_gate, 0);
     train_start(&m, half, 0);
     T.next_us += phase_us;
     T.off_us = 2500000U;
@@ -1233,7 +1233,7 @@ static void dip_run(uint32_t half, uint32_t len_ms, uint32_t end_us)
     uint16_t nominal = half == HALF_US_60 ? 600U : 500U;
     struct ace2k_mains m;
     struct ace2k_heat h;
-    ace2k_heat_init(&h, &ace2k_nop_gate, 0);
+    ace2k_heat_init(&h, &nop_gate, 0);
     train_start(&m, half, 0);
     T.off_us = end_us - (len_ms * US_PER_MS);
     T.on_us = end_us;

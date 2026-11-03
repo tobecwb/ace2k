@@ -43,7 +43,7 @@ static void preempt_point(void);
 #define DUTY_HALF 50U
 #define DUTY_MOST 90U
 #define PHASES    24U /* release ticks tried: they walk the 10 ms tick across the 8.3 ms edges */
-#define BARRIERS  4U  /* more than any stop has */
+#define BARRIERS  8U  /* more than any stop or tick reaches: the test asserts it */
 #define AFTER_US  100000U
 
 // NOLINTBEGIN(readability-identifier-naming)
@@ -69,6 +69,11 @@ struct prig {
     bool armed;
     uint32_t barrier, inject_at;
     bool injected;
+    /* at the nested_at-th barrier, nested() runs in place of an edge: interrupts that preempt
+     * the caller, and may preempt each other in turn */
+    void (*nested)(void);
+    uint32_t nested_at;
+    uint32_t nested_fired; /* fired when nested() began */
     /* the gate: high from a fire until TIM7's 6 ms end; a gate_off before that cuts a pulse */
     bool gate_high;
     uint32_t fire_us, cuts;
@@ -105,10 +110,12 @@ static void p_off(void *ctx)
     P.gate_high = false;
 }
 
+/* The gate as modelled: high from a fire until TIM7 ends the pulse. */
 static bool p_read(void *ctx)
 {
     (void)ctx;
-    return false;
+    pulse_end();
+    return P.gate_high;
 }
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -127,13 +134,21 @@ static void run_edge(void)
     P.next_edge_us += HALF_US;
 }
 
-/* The interrupt arrives at the inject_at-th barrier of the stop in progress. */
+/* The interrupt arrives at the inject_at-th barrier of the stop in progress, or nested() runs at
+ * the nested_at-th. */
 static void preempt_point(void)
 {
     if (!P.armed) {
         return;
     }
     P.barrier++;
+    if (P.nested != NULL && P.barrier == P.nested_at) {
+        void (*nested)(void) = P.nested;
+        P.nested = NULL;
+        P.armed = false;
+        nested(); /* it may arm the rig again, for its own barriers */
+        return;
+    }
     if (P.barrier == P.inject_at) {
         P.armed = false;
         P.injected = true;
@@ -294,8 +309,10 @@ static uint32_t fires_from(uint32_t edge)
     return n;
 }
 
-/* The operation with an edge at its k-th barrier, then 100 ms of mains and ticks. */
-static bool scenario(uint8_t duty, uint32_t phase, bool pending, enum way way, uint32_t k)
+/* The operation with an edge at its k-th barrier, then 100 ms of mains and ticks.  *reached
+ * keeps the most barriers one operation went through. */
+static bool scenario(uint8_t duty, uint32_t phase, bool pending, enum way way, uint32_t k,
+                     uint32_t *reached)
 {
     if (!set_up(duty, phase, pending, way)) {
         return false;
@@ -308,6 +325,9 @@ static bool scenario(uint8_t duty, uint32_t phase, bool pending, enum way way, u
     P.inject_at = k;
     stop_by(way, duty);
     P.armed = false;
+    if (P.barrier > *reached) {
+        *reached = P.barrier;
+    }
     if (!P.injected) {
         return false;
     }
@@ -342,12 +362,12 @@ static bool scenario(uint8_t duty, uint32_t phase, bool pending, enum way way, u
 }
 
 /* Every way, every barrier, with and without a pending half, at one duty and phase. */
-static void every_way(uint8_t duty, uint32_t phase, uint32_t *tried)
+static void every_way(uint8_t duty, uint32_t phase, uint32_t *tried, uint32_t *reached)
 {
     for (uint32_t way = 0; way < (uint32_t)WAY_COUNT; way++) {
         for (uint32_t k = 1U; k <= BARRIERS; k++) {
-            tried[way] += scenario(duty, phase, false, (enum way)way, k) ? 1U : 0U;
-            tried[way] += scenario(duty, phase, true, (enum way)way, k) ? 1U : 0U;
+            tried[way] += scenario(duty, phase, false, (enum way)way, k, reached) ? 1U : 0U;
+            tried[way] += scenario(duty, phase, true, (enum way)way, k, reached) ? 1U : 0U;
         }
     }
 }
@@ -356,13 +376,114 @@ TEST(an_edge_preempting_any_stop_at_any_barrier_fires_nothing_after_it_and_orpha
 {
     static const uint8_t duties[] = { DUTY_HALF, DUTY_MOST };
     uint32_t tried[WAY_COUNT] = { 0U };
+    uint32_t reached = 0U;
     for (size_t d = 0; d < ACE2K_ARRAY_SIZE(duties); d++) {
         for (uint32_t phase = 0; phase < PHASES; phase++) {
-            every_way(duties[d], phase, tried);
+            every_way(duties[d], phase, tried, &reached);
         }
     }
     for (uint32_t way = 0; way < (uint32_t)WAY_COUNT; way++) {
         ASSERT_TRUE(tried[way] >= ACE2K_ARRAY_SIZE(duties) * PHASES); /* every way exercised */
+    }
+    /* below BARRIERS, or a barrier past the last one tried would never get its edge */
+    ASSERT_TRUE(reached > 0U);
+    ASSERT_TRUE(reached < BARRIERS);
+}
+
+/* A release leaves the odd half of a fired cycle pending.  A tick comes just past the even
+ * pulse's stuck window, before the odd edge, so its gate check finds the even fire long over and
+ * marks it so.  The odd edge fires inside that check: at each of its barriers in turn, between
+ * its reads and after them.  Its pulse is high, so heat must stay busy (the flash stays shut)
+ * until the pulse is over, and then be busy no more.  The mark shows where the edge landed: only
+ * after the last read does the check mark the even fire over. */
+#define GATE_CHECK_MARGIN_US 100U /* the tick, this far past the even fire's stuck window */
+#define GATE_CHECK_BARRIERS  3U   /* the gate check's barriers: the first three of a tick */
+
+TEST(an_odd_half_fired_inside_the_gate_check_keeps_heat_busy_while_its_pulse_is_high)
+{
+    for (uint32_t k = 1U; k <= GATE_CHECK_BARRIERS; k++) {
+        p_reset();
+        run_tick();
+        ASSERT_EQ(ace2k_heat_lease(&P.h, DUTY_MOST, ACE2K_HEAT_LEASE_MAX_MS, P.now_us / 1000U), 0);
+        run_to(P.now_us + 200000U);
+        ASSERT_TRUE(until_even_fired(40U));
+        ace2k_heat_release(&P.h);
+        ASSERT_TRUE(heat_pending());
+        uint32_t tick_us = P.h.even_us + ACE2K_HEAT_GATE_STUCK_US + GATE_CHECK_MARGIN_US;
+        ASSERT_TRUE(tick_us < P.next_edge_us); /* the odd edge has not come yet */
+        run_to(tick_us - 1U);
+        P.next_tick_us = tick_us;
+        uint32_t fired = P.h.fired;
+        uint32_t mark = P.h.fired_seen_over;
+        ASSERT_TRUE(mark != fired); /* the even fire is open */
+        P.armed = true;
+        P.inject_at = k; /* the verdict is ok, so the tick's first barriers are the check's */
+        run_tick();
+        P.armed = false;
+        ASSERT_TRUE(P.injected);
+        ASSERT_EQ(P.h.fired, fired + 1U); /* the odd half fired inside the check */
+        if (k == GATE_CHECK_BARRIERS) {
+            ASSERT_EQ(P.h.fired_seen_over, fired); /* after the reads: the even fire marked over */
+        } else {
+            ASSERT_EQ(P.h.fired_seen_over, mark); /* between the reads: no mark */
+        }
+        ASSERT_TRUE(P.gate_high); /* its pulse running */
+        if (!ace2k_heat_busy(&P.h)) {
+            printf("  barrier %u: heat not busy with the odd pulse high\n", (unsigned)k);
+        }
+        ASSERT_TRUE(ace2k_heat_busy(&P.h));
+        run_to(P.now_us + AFTER_US);
+        ASSERT_TRUE(!P.gate_high);
+        ASSERT_TRUE(!ace2k_heat_busy(&P.h)); /* a later tick saw the odd pulse over */
+        ASSERT_EQ(P.h.state, ACE2K_HEAT_IDLE);
+    }
+}
+
+#define NESTED_EDGES_MAX 40U /* edges the nested interrupts run, at most, before one fires */
+
+/* The dryer's tick leases again, then the edges and ticks run until an edge fires. */
+static void lease_and_fire(void)
+{
+    P.nested_fired = P.h.fired;
+    ASSERT_EQ(ace2k_heat_lease(&P.h, DUTY_MOST, ACE2K_HEAT_LEASE_MAX_MS, P.now_us / 1000U), 0);
+    for (uint32_t i = 0; i < NESTED_EDGES_MAX && P.h.fired == P.nested_fired; i++) {
+        run_to(P.next_edge_us);
+    }
+}
+
+#define BUSY_LEASE_MS 100U /* the first lease, long over when busy is asked */
+
+/* A caller asks ace2k_heat_busy() without a mask, with nothing open.  Between its two reads the
+ * interrupts run: the dryer's tick leases again, ticks run, and edges fire.  A PENDING fire mode
+ * or a live lease makes busy return at once, so the lease comes after busy's first tests.  The
+ * mark must not move in that time: the fires are too young for a tick to see them over.  That
+ * is the case that tells the two read orders apart.  With the mark read first, the newer fired
+ * differs from it.  With fired read first, the old fired equals the old mark, and busy would
+ * answer no.  The answer must be busy: a fire is open. */
+TEST(a_fire_between_the_two_reads_of_busy_keeps_the_answer_busy)
+{
+    for (uint32_t phase = 0; phase < PHASES; phase++) {
+        p_reset();
+        run_tick();
+        ASSERT_EQ(ace2k_heat_lease(&P.h, DUTY_MOST, BUSY_LEASE_MS, P.now_us / 1000U), 0);
+        run_to(P.now_us + AFTER_US + (phase * TICK_US) + 200000U);
+        ASSERT_EQ(P.h.state, ACE2K_HEAT_IDLE);
+        ASSERT_TRUE(P.h.fired != 0U);
+        ASSERT_TRUE(!ace2k_heat_busy(&P.h)); /* every fire seen over */
+        uint32_t mark = P.h.fired_seen_over;
+        P.nested = lease_and_fire;
+        P.nested_at = 1U; /* busy's barrier, between its two reads */
+        P.barrier = 0U;
+        P.armed = true;
+        bool busy = ace2k_heat_busy(&P.h);
+        P.armed = false;
+        ASSERT_TRUE(P.nested == NULL);            /* the nested interrupts ran */
+        ASSERT_TRUE(P.h.fired != P.nested_fired); /* and fired */
+        ASSERT_EQ(P.h.fired_seen_over, mark);     /* with the mark where it was */
+        if (!busy) {
+            printf("  phase %u: busy answered no with a fire open\n", (unsigned)phase);
+        }
+        ASSERT_TRUE(busy);
     }
 }
 

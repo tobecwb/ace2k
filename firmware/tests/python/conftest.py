@@ -3,6 +3,8 @@ stand in for klippy's msgproto: the extras import it for the message parser's er
 mcu.lookup_command raises for a format the dictionary lacks or carries differently), and the fake
 MCU raises the same class."""
 
+from __future__ import annotations
+
 import sys
 import types
 from pathlib import Path

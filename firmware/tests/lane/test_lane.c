@@ -5,6 +5,7 @@ struct ace2k_fake_counters {
     uint16_t enc[ACE2K_LANE_COUNT];
     uint32_t fg[ACE2K_LANE_COUNT];
     uint8_t duty[ACE2K_LANE_COUNT];
+    int pwm_writes[ACE2K_LANE_COUNT]; /* every pwm_set, counted per lane */
     bool run[ACE2K_LANE_COUNT];
     bool reverse[ACE2K_LANE_COUNT];
     char order[32]; /* 'd' dir, 'r' run, 'p' pwm, in call order; NUL-terminated */
@@ -33,6 +34,7 @@ static void fake_pwm(void *ctx, uint8_t lane, uint8_t duty_pct)
 {
     struct ace2k_fake_counters *f = ctx;
     f->duty[lane] = duty_pct;
+    f->pwm_writes[lane]++;
     note(f, 'p');
 }
 
@@ -50,7 +52,7 @@ static void fake_dir(void *ctx, uint8_t lane, bool reverse)
     note(f, 'd');
 }
 
-static const struct ace2k_lane_ops ace2k_fake_ops = {
+static const struct ace2k_lane_ops fake_ops = {
     .encoder_read = fake_enc,
     .fg_read = fake_fg,
     .pwm_set = fake_pwm,
@@ -62,7 +64,7 @@ static const struct ace2k_lane_ops ace2k_fake_ops = {
 static void primed(struct ace2k_lane *l, struct ace2k_fake_counters *f)
 {
     *f = (struct ace2k_fake_counters){ 0 };
-    ace2k_lane_init(l, &ace2k_fake_ops, f);
+    ace2k_lane_init(l, &fake_ops, f);
     ace2k_lane_tick(l, 10, true);
 }
 
@@ -96,7 +98,7 @@ TEST(encoder_extends_across_the_sixteen_bit_wrap_in_both_directions)
 {
     struct ace2k_fake_counters f = { .enc = { 65530, 5, 100, 0 }, .fg = { 0 } };
     struct ace2k_lane l;
-    ace2k_lane_init(&l, &ace2k_fake_ops, &f);
+    ace2k_lane_init(&l, &fake_ops, &f);
     ace2k_lane_tick(&l, 10, true); /* primes: no delta */
     ASSERT_EQ(ace2k_lane_encoder_count(&l, 0), 0);
     f.enc[0] = 5;
@@ -116,7 +118,7 @@ TEST(fg_counts_from_the_base_taken_at_init_or_reset)
 {
     struct ace2k_fake_counters f = { .enc = { 0 }, .fg = { 1000, 0, 0, 0 } };
     struct ace2k_lane l;
-    ace2k_lane_init(&l, &ace2k_fake_ops, &f);
+    ace2k_lane_init(&l, &fake_ops, &f);
     ace2k_lane_tick(&l, 10, true);
     ASSERT_EQ(ace2k_lane_fg(&l, 0), 0);
     f.fg[0] = 1250;
@@ -131,11 +133,27 @@ TEST(fg_counts_from_the_base_taken_at_init_or_reset)
     ASSERT_EQ(ace2k_lane_fg(&l, 0), 10);
 }
 
+TEST(fg_raw_is_never_rebased_so_a_difference_survives_a_reset_and_the_wrap)
+{
+    struct ace2k_fake_counters f = { .enc = { 0 }, .fg = { UINT32_MAX - 5U, 0, 0, 0 } };
+    struct ace2k_lane l;
+    ace2k_lane_init(&l, &fake_ops, &f);
+    ace2k_lane_tick(&l, 10, true);
+    uint32_t base = ace2k_lane_fg_raw(&l, 0);
+    ASSERT_EQ(base, UINT32_MAX - 5U);
+    ASSERT_EQ(ace2k_lane_reset(&l, 0), 0);
+    f.fg[0] = 20; /* across the wrap: 26 pulses */
+    ace2k_lane_tick(&l, 20, true);
+    ASSERT_EQ(ace2k_lane_fg(&l, 0), 0);                    /* the reset moved fg's base */
+    ASSERT_EQ(ace2k_lane_fg_raw(&l, 0) - base, 26U);       /* and not the raw count */
+    ASSERT_EQ(ace2k_lane_fg_raw(&l, ACE2K_LANE_COUNT), 0); /* a lane out of range */
+}
+
 TEST(encoder_um_saturates_instead_of_wrapping)
 {
     struct ace2k_fake_counters f = { .enc = { 0 }, .fg = { 0 } };
     struct ace2k_lane l;
-    ace2k_lane_init(&l, &ace2k_fake_ops, &f);
+    ace2k_lane_init(&l, &fake_ops, &f);
     ace2k_lane_tick(&l, 10, true);
     l.lane[0].encoder_count = 1800000; /* × 1234.2 µm = 2.22e9 > INT32_MAX */
     l.lane[1].encoder_count = -1800000;
@@ -145,11 +163,29 @@ TEST(encoder_um_saturates_instead_of_wrapping)
     ASSERT_EQ(ace2k_lane_encoder_um(&l, 0), 1234200);
 }
 
+TEST(counts_since_a_base_read_at_the_scale_as_it_is_now)
+{
+    struct ace2k_fake_counters f = { .enc = { 0 }, .fg = { 0 } };
+    struct ace2k_lane l;
+    ace2k_lane_init(&l, &fake_ops, &f);
+    ace2k_lane_tick(&l, 10, true);
+    l.lane[0].encoder_count = 100;
+    int32_t base = ace2k_lane_encoder_count(&l, 0);
+    l.lane[0].encoder_count = 117;
+    ASSERT_EQ(ace2k_lane_counts_since_um(&l, 0, base), 17 * 12342 / 10);
+    /* a scale set after the base applies to the whole travel */
+    ASSERT_EQ(ace2k_lane_scale_set(&l, 0, 12500), 0);
+    ASSERT_EQ(ace2k_lane_counts_since_um(&l, 0, base), 17 * 1250);
+    l.lane[0].encoder_count = 90; /* back past the base: signed */
+    ASSERT_EQ(ace2k_lane_counts_since_um(&l, 0, base), -10 * 1250);
+    ASSERT_EQ(ace2k_lane_counts_since_um(&l, ACE2K_LANE_COUNT, base), 0);
+}
+
 TEST(fg_is_one_published_value_equal_to_raw_minus_base_after_a_reset_tick)
 {
     struct ace2k_fake_counters f = { .enc = { 0 }, .fg = { 500, 0, 0, 0 } };
     struct ace2k_lane l;
-    ace2k_lane_init(&l, &ace2k_fake_ops, &f);
+    ace2k_lane_init(&l, &fake_ops, &f);
     ace2k_lane_tick(&l, 10, true);
     f.fg[0] = 900;
     ace2k_lane_tick(&l, 20, true);
@@ -169,7 +205,7 @@ TEST(reset_all_and_refusals_and_once_only)
 {
     struct ace2k_fake_counters f = { .enc = { 10, 20, 30, 40 }, .fg = { 0 } };
     struct ace2k_lane l;
-    ace2k_lane_init(&l, &ace2k_fake_ops, &f);
+    ace2k_lane_init(&l, &fake_ops, &f);
     ace2k_lane_tick(&l, 10, true);
     for (uint8_t i = 0; i < ACE2K_LANE_COUNT; i++) {
         f.enc[i] += 7;
@@ -244,7 +280,7 @@ TEST(move_writes_direction_then_run_then_pwm_inside_the_duty_bounds)
 
 TEST(feed_forward_interpolates_the_table_and_clamps)
 {
-    /* the table measured on the bench: 15 384, 24 858, 34 251, 43 562, 52 550, 61 700, 71 255,
+    /* the table measured on the unit: 15 384, 24 858, 34 251, 43 562, 52 550, 61 700, 71 255,
      * 80 323, 91 173 µm/s at 20, 30 … 100 % */
     ASSERT_EQ(ace2k_lane_feed_forward_pct(15384), 20); /* the first entry: the floor duty */
     ASSERT_EQ(ace2k_lane_feed_forward_pct(1000), 20);
@@ -295,28 +331,224 @@ TEST(a_move_ends_done_at_the_target_with_the_lines_at_stop_and_a_result)
     ASSERT_TRUE(!ace2k_lane_pop_result(&l, 0, &r)); /* popped once */
 }
 
-TEST(the_landing_drops_the_setpoint_to_the_floor_for_the_last_ten_millimetres)
+TEST(the_landing_writes_the_floor_duty_on_the_tick_it_begins)
 {
     struct ace2k_lane l;
     struct ace2k_fake_counters f;
     primed(&l, &f);
     uint32_t now = 10;
-    /* the ceiling, 70 mm/s, is 865 pulses/s; the fake runs 8 per tick (≈ 65 mm/s) with a count
-     * every two ticks (≈ 62 mm/s: the strand 5 % behind).  100 mm is 81 counts, and the landing
-     * is decided on the encoder: it begins once 8 counts (9 874 µm ≤ 10 mm) remain — on the
-     * 73rd count, tick 146 */
+    /* The ceiling, 70 mm/s, is 865 pulses/s.  The fake runs 8 pulses a tick (≈ 65 mm/s) with a
+     * count every two ticks (≈ 62 mm/s: the strand 5 % behind).  100 mm is 81 counts.  The
+     * landing is decided on the encoder: it begins once 8 counts (9 874 µm ≤ 10 mm) remain, on
+     * the 73rd count, at tick 146. */
     ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, 100000, ACE2K_LANE_SPEED_MAX_UM_S, now),
               0);
     ASSERT_TRUE(!l.lane[0].move.landing);
     run_paced(&l, &f, &now, 145, 8, 2, 1); /* 72 counts: 9 remain, 11 107 µm > 10 mm */
     ASSERT_TRUE(!l.lane[0].move.landing);
-    run_ticks(&l, &f, &now, 1, 8, 1); /* the 73rd: 8 remain */
+    /* 14 loops so far, each measuring 64 777 µm/s: the error 5 223, P 3 on the table's 78.  The
+     * integral is 14 × 5 223 = 73 122, worth 12, so the duty is 93. */
+    ASSERT_EQ(l.lane[0].move.integ_um_s, 14 * 5223);
+    ASSERT_EQ(f.duty[0], 93);
+    int writes = f.pwm_writes[0];
+    run_ticks(&l, &f, &now, 1, 8, 1); /* the 73rd count: 8 remain */
     ASSERT_TRUE(l.lane[0].move.landing);
-    /* tick 150: the loop runs with the floor setpoint against 64 777 µm/s measured — the
-     * error's P term alone (−37 %) puts the duty at the floor */
-    run_paced(&l, &f, &now, 4, 8, 2, 1);
-    ASSERT_TRUE(f.duty[0] < ace2k_lane_feed_forward_pct(ACE2K_LANE_SPEED_MAX_UM_S));
+    /* The floor setpoint applies on this tick, four ticks before the next loop.  The duty is the
+     * floor's feed-forward, 20, plus P at the last loop's speed, (9 000 − 64 777) / 1500 = −37,
+     * plus the integral, 12: −5, clamped to the floor.  The integral and the loop's count of
+     * ticks stay as they were. */
     ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
+    ASSERT_EQ(f.pwm_writes[0], writes + 1);
+    ASSERT_EQ(ace2k_lane_setpoint_um_s(&l, 0), ACE2K_LANE_SPEED_MIN_UM_S);
+    ASSERT_EQ(l.lane[0].move.integ_um_s, 14 * 5223);
+    ASSERT_EQ(l.lane[0].move.loop_ticks, 6);
+    /* Ticks 147 to 149 write nothing.  Tick 150 runs the loop at its usual time, with the floor
+     * setpoint against 64 777 µm/s.  The applied duty 20 − 37 + 12 is under the floor with the
+     * error negative, so the integral stays out and the duty stays on the floor. */
+    run_paced(&l, &f, &now, 3, 8, 2, 1);
+    ASSERT_EQ(f.pwm_writes[0], writes + 1);
+    run_ticks(&l, &f, &now, 1, 8, 0);
+    ASSERT_EQ(f.pwm_writes[0], writes + 2);
+    ASSERT_EQ(l.lane[0].move.loop_ticks, 0);
+    ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
+    ASSERT_EQ(l.lane[0].move.integ_um_s, 14 * 5223);
+}
+
+TEST(a_landing_that_begins_on_a_loop_tick_is_written_once_by_the_loop)
+{
+    struct ace2k_lane l;
+    struct ace2k_fake_counters f;
+    primed(&l, &f);
+    uint32_t now = 10;
+    /* 20 mm at 30 mm/s is 16 counts; the strand a count every ten ticks.  The 8th count, on tick
+     * 80, leaves 8 (9 874 µm): the landing begins on a loop's tick, and the loop writes it. */
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, 20000, 30000, now), 0);
+    run_paced(&l, &f, &now, 79, 4, 10, 1); /* 7 counts, 7 loops */
+    ASSERT_TRUE(!l.lane[0].move.landing);
+    ASSERT_EQ(f.pwm_writes[0], 1 + 7);
+    run_ticks(&l, &f, &now, 1, 4, 1);
+    ASSERT_TRUE(l.lane[0].move.landing);
+    ASSERT_EQ(f.pwm_writes[0], 1 + 8);
+    ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
+    ASSERT_EQ(ace2k_lane_setpoint_um_s(&l, 0), ACE2K_LANE_SPEED_MIN_UM_S);
+    ace2k_lane_stop(&l, 0, now);
+}
+
+TEST(a_move_no_longer_than_the_landing_runs_at_the_floor_duty_from_its_start)
+{
+    struct ace2k_lane l;
+    struct ace2k_fake_counters f;
+    primed(&l, &f);
+    uint32_t now = 10;
+    /* 5 mm at the ceiling is 4 counts (4.05, rounded), 4 937 µm: all of it is landing.  The
+     * first duty is the floor's, not the 78 % the table gives the ceiling. */
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, 5000, ACE2K_LANE_SPEED_MAX_UM_S, now), 0);
+    ASSERT_STR_EQ(f.order, "drp");
+    ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
+    ASSERT_TRUE(l.lane[0].move.landing);
+    ASSERT_EQ(ace2k_lane_setpoint_um_s(&l, 0), ACE2K_LANE_SPEED_MIN_UM_S);
+    /* The motor at 4 pulses a tick (≈ 32 mm/s), a count every four ticks.  The ticks before the
+     * first loop write nothing: the move began in its landing, so no tick starts one. */
+    run_paced(&l, &f, &now, 9, 4, 4, 1); /* 2 counts, on ticks 4 and 8 */
+    ASSERT_STR_EQ(f.order, "drp");
+    /* The loop at tick 10 measures 32 388 against the floor: P −15, so the applied duty 5 is under
+     * the floor with the error negative.  The integral stays at 0 and the duty on the floor. */
+    run_ticks(&l, &f, &now, 1, 4, 0);
+    ASSERT_EQ(f.pwm_writes[0], 2);
+    ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
+    ASSERT_EQ(l.lane[0].move.integ_um_s, 0);
+    run_paced(&l, &f, &now, 6, 4, 3, 1); /* the 3rd and 4th counts, the 4th on tick 16: done */
+    struct ace2k_lane_result r;
+    ASSERT_TRUE(ace2k_lane_pop_result(&l, 0, &r));
+    ASSERT_EQ(r.outcome, ACE2K_LANE_DONE);
+    ASSERT_EQ(r.filament_um, 4 * 12342 / 10);
+    /* The same in reverse, as the snag's touch in a feed runs: the floor from the start. */
+    f.order[0] = '\0';
+    f.calls = 0;
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_REVERSE, 5000, ACE2K_LANE_SPEED_MAX_UM_S, now), 0);
+    ASSERT_STR_EQ(f.order, "drp");
+    ASSERT_TRUE(f.reverse[0]);
+    ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
+    ASSERT_TRUE(l.lane[0].move.landing);
+    ASSERT_EQ(ace2k_lane_setpoint_um_s(&l, 0), ACE2K_LANE_SPEED_MIN_UM_S);
+    ace2k_lane_stop(&l, 0, now);
+}
+
+TEST(the_landing_at_the_start_is_decided_on_the_encoder_as_the_tick_decides_it)
+{
+    struct ace2k_lane l;
+    struct ace2k_fake_counters f;
+    primed(&l, &f);
+    uint32_t now = 10;
+    /* Exactly the landing's length, 10 mm, is 8 counts, 9 874 µm: the floor from the start. */
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, ACE2K_LANE_LANDING_UM, 30000, now), 0);
+    ASSERT_TRUE(l.lane[0].move.landing);
+    ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
+    ace2k_lane_stop(&l, 0, now);
+    /* 11 mm is 9 counts, 11 107 µm: the commanded speed's duty, 35 %, until 8 counts remain. */
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, 11000, 30000, now), 0);
+    ASSERT_TRUE(!l.lane[0].move.landing);
+    ASSERT_EQ(f.duty[0], 35);
+    ASSERT_EQ(ace2k_lane_setpoint_um_s(&l, 0), 30000);
+    ace2k_lane_stop(&l, 0, now);
+    /* At the widest scale, 1481.0 µm a count, 10 mm is 7 counts (6.75, rounded), 10 367 µm of
+     * strand: longer than the landing, so not in it.  The first count leaves 6, 8 886 µm, and
+     * the floor applies on that tick.  No loop has measured the motor yet, so P is 0 and the
+     * duty is the floor's feed-forward alone. */
+    ASSERT_EQ(ace2k_lane_scale_set(&l, 0, ACE2K_LANE_SCALE_MAX_X10), 0);
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, ACE2K_LANE_LANDING_UM, 30000, now), 0);
+    ASSERT_TRUE(!l.lane[0].move.landing);
+    ASSERT_EQ(f.duty[0], 35);
+    run_ticks(&l, &f, &now, 3, 4, 0);
+    ASSERT_TRUE(!l.lane[0].move.landing);
+    run_ticks(&l, &f, &now, 1, 4, 1);
+    ASSERT_TRUE(l.lane[0].move.landing);
+    ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
+    ASSERT_EQ(ace2k_lane_setpoint_um_s(&l, 0), ACE2K_LANE_SPEED_MIN_UM_S);
+    ace2k_lane_stop(&l, 0, now);
+}
+
+/* The bound is inclusive, and the span in micrometres is rounded down, at the start as on the
+ * tick. */
+TEST(a_move_of_exactly_the_landing_on_the_encoder_starts_in_it)
+{
+    struct ace2k_lane l;
+    struct ace2k_fake_counters f;
+    primed(&l, &f);
+    uint32_t now = 10;
+    /* At 1250.0 µm a count, 10 mm is exactly 8 counts, 10 000 µm: in the landing. */
+    ASSERT_EQ(ace2k_lane_scale_set(&l, 0, 12500), 0);
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, ACE2K_LANE_LANDING_UM, 30000, now), 0);
+    ASSERT_EQ(l.lane[0].move.target_counts, 8);
+    ASSERT_TRUE(l.lane[0].move.landing);
+    ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
+    ace2k_lane_stop(&l, 0, now);
+    /* At 1428.7 µm a count, 10 mm is 7 counts (6.9995, rounded), 10 000.9 µm, which rounds down
+     * to 10 000 µm: in the landing too. */
+    ASSERT_EQ(ace2k_lane_scale_set(&l, 0, 14287), 0);
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, ACE2K_LANE_LANDING_UM, 30000, now), 0);
+    ASSERT_EQ(l.lane[0].move.target_counts, 7);
+    ASSERT_TRUE(l.lane[0].move.landing);
+    ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
+    ace2k_lane_stop(&l, 0, now);
+}
+
+/* A move started without a landing, as a reverse dose of the feed-forward is: its commanded
+ * speed from the first write to the end, however little remains. */
+TEST(a_move_without_a_landing_keeps_its_speed_to_its_end)
+{
+    struct ace2k_lane l;
+    struct ace2k_fake_counters f;
+    primed(&l, &f);
+    uint32_t now = 10;
+    uint8_t ff = ace2k_lane_feed_forward_pct(49300);
+    ASSERT_EQ(ff, 56);
+    /* 3 mm back at 49.3 mm/s is 2 counts.  Started in the usual way, it runs at the floor. */
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_REVERSE, 3000, 49300, now), 0);
+    ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
+    ASSERT_TRUE(l.lane[0].move.landing);
+    ace2k_lane_stop(&l, 0, now);
+    /* Without a landing: the table's 56 % for 49.3 mm/s.  The motor at 6 pulses a tick (≈ 49 mm/s)
+     * and a count every three ticks: the move ends on tick 6, before any loop, and no tick writes
+     * the duty again. */
+    int writes = f.pwm_writes[0];
+    ASSERT_EQ(ace2k_lane_move_unlanded(&l, 0, ACE2K_LANE_REVERSE, 3000, 49300, now), 0);
+    ASSERT_EQ(f.pwm_writes[0], writes + 1);
+    ASSERT_EQ(f.duty[0], ff);
+    ASSERT_TRUE(!l.lane[0].move.landing);
+    ASSERT_EQ(ace2k_lane_setpoint_um_s(&l, 0), 49300);
+    for (int i = 0; i < 5; i++) {
+        run_ticks(&l, &f, &now, 1, 6, (i == 2) ? -1 : 0); /* the first count on tick 3 */
+        ASSERT_TRUE(ace2k_lane_is_moving(&l, 0));
+        ASSERT_TRUE(!l.lane[0].move.landing);
+        ASSERT_EQ(f.duty[0], ff);
+        ASSERT_EQ(ace2k_lane_setpoint_um_s(&l, 0), 49300);
+    }
+    ASSERT_EQ(f.pwm_writes[0], writes + 1);
+    run_ticks(&l, &f, &now, 1, 6, -1);
+    struct ace2k_lane_result r;
+    ASSERT_TRUE(ace2k_lane_pop_result(&l, 0, &r));
+    ASSERT_EQ(r.outcome, ACE2K_LANE_DONE);
+    ASSERT_EQ(r.filament_um, -2 * 12342 / 10);
+    ASSERT_EQ(f.pwm_writes[0], writes + 2); /* the stop's write */
+    /* A longer one, 20 mm at 30 mm/s (16 counts, a count every four ticks), passes the last
+     * 10 mm and its loops keep the commanded setpoint to the end. */
+    ASSERT_EQ(ace2k_lane_move_unlanded(&l, 0, ACE2K_LANE_FORWARD, 20000, 30000, now), 0);
+    run_paced(&l, &f, &now, 63, 4, 4, 1); /* 15 counts, 6 loops */
+    ASSERT_TRUE(ace2k_lane_is_moving(&l, 0));
+    ASSERT_TRUE(!l.lane[0].move.landing);
+    ASSERT_EQ(ace2k_lane_setpoint_um_s(&l, 0), 30000);
+    run_ticks(&l, &f, &now, 1, 4, 1);
+    ASSERT_TRUE(ace2k_lane_pop_result(&l, 0, &r));
+    ASSERT_EQ(r.outcome, ACE2K_LANE_DONE);
+    /* The next move started the usual way lands again: the flag is the move's, not the lane's. */
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_REVERSE, 3000, 49300, now), 0);
+    ASSERT_TRUE(l.lane[0].move.landing);
+    ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
+    ace2k_lane_stop(&l, 0, now);
+    /* The bounds are the same as a move's. */
+    ASSERT_EQ(ace2k_lane_move_unlanded(&l, 0, ACE2K_LANE_REVERSE, 0, 49300, now), -ACE2K_EINVAL);
+    ASSERT_EQ(ace2k_lane_move_unlanded(&l, 0, ACE2K_LANE_REVERSE, 3000, 1000, now), -ACE2K_EINVAL);
 }
 
 TEST(the_result_carries_the_filament_travel_at_the_lane_scale_and_its_sign)
@@ -684,6 +916,9 @@ TEST(a_short_move_at_the_ceiling_whose_landing_crawls_ends_before_its_deadline)
     ASSERT_TRUE(!l.lane[0].move.landing);
     run_ticks(&l, &f, &now, 1, 8, 1); /* the 4th: 8 remain, 9 874 µm — the landing begins */
     ASSERT_TRUE(l.lane[0].move.landing);
+    /* tick 8, before the first loop: no loop has measured the motor, so the duty is the floor's
+     * feed-forward with no P term — the floor, not the ceiling's 78 % */
+    ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
     /* a heavy spool: the landing crawls at 3 pulses per 4 ticks, ≈ 6 mm/s, under the floor
      * speed, the strand a count every 20 ticks (≈ 6.2 mm/s); the 8 counts take 160 ticks —
      * 1.68 s in all, past the old budget, well within the new one */
@@ -755,9 +990,10 @@ TEST(a_landing_from_a_cruise_holds_the_floor_while_the_motor_is_still_above_the_
     ASSERT_EQ(ace2k_lane_encoder_count(&l, 0), 72);
     ASSERT_EQ(l.lane[0].move.integ_um_s, 29 * 41);
     ASSERT_EQ(f.duty[0], 35);
-    /* the 73rd count lands on the fourth tick of the 30th window (8 remain: the landing), so the
-     * 30th loop is the first with the floor setpoint, 9 000, whose table entry is the floor duty.
-     * The motor still at 29 959: the error −20 959, P −13, the applied duty 20 − 13 + 0 = 7 is
+    /* the 73rd count lands on the fourth tick of the 30th window (8 remain: the landing).  That
+     * tick writes the floor setpoint's duty at the last loop's speed: 20 − 13 + 0, the floor.  The
+     * 30th loop is the first to measure against the floor setpoint, 9 000, whose table entry is
+     * the floor duty.  The motor still at 29 959: the error −20 959, P −13, the applied duty 7 is
      * past the floor with the error negative, so the error stays out and the integral keeps the
      * cruise's 1 189 (inside the floor's window, 0..300 000); the duty is the floor.  Then
      * 20 242 (P −7, applied 13) and 12 145 (P −2, applied 18): frozen, on the floor.  The P term
@@ -783,6 +1019,80 @@ TEST(a_landing_from_a_cruise_holds_the_floor_while_the_motor_is_still_above_the_
     ASSERT_EQ(f.duty[0], 24);
     ASSERT_EQ(l.lane[0].move.integ_um_s, (29 * 41) + 903 + 4952);
     ASSERT_TRUE(ace2k_lane_is_moving(&l, 0)); /* 79 of 81 counts */
+}
+
+TEST(a_landing_under_load_keeps_the_integral_and_steps_the_duty_toward_the_next_loop)
+{
+    struct ace2k_lane l;
+    struct ace2k_fake_counters f;
+    primed(&l, &f);
+    uint32_t now = 10;
+    /* 100 mm at 30 mm/s (the table: 35 %) under a load: the tach at 25 pulses a loop is 20 242
+     * µm/s, an error of 9 758 and P 6.  The applied duty 35 + 6 + integral / 6000 stays under the
+     * ceiling, so the integral climbs 9 758 a loop to its ±INTEG_MAX clamp, 300 000, on the 31st
+     * loop; the duty is 35 + 6 + 50 = 91.  The strand at two and one counts a loop in turn: 72
+     * counts after 48 loops, 9 remain — no landing yet. */
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, 100000, 30000, now), 0);
+    for (int i = 0; i < 48; i++) {
+        run_loop_with(&l, &f, &now, 25, (i % 2) ? 1U : 2U);
+    }
+    ASSERT_TRUE(!l.lane[0].move.landing);
+    ASSERT_EQ(ace2k_lane_encoder_count(&l, 0), 72);
+    ASSERT_EQ(l.lane[0].move.integ_um_s, ACE2K_LANE_INTEG_MAX_PCT * ACE2K_LANE_KI_DIV);
+    ASSERT_EQ(f.duty[0], 91);
+    /* The 49th window's two counts land on its 5th and 10th ticks.  On the 5th, the 73rd count,
+     * the landing begins.  The duty is the floor's feed-forward, 20, plus P at the last loop's
+     * speed, (9 000 − 20 242) / 1500 = −7, plus the integral, 50 (inside the floor's window,
+     * 0..300 000): 63.  The integral does not move. */
+    run_ticks(&l, &f, &now, 4, 3, 0);
+    ASSERT_EQ(f.duty[0], 91);
+    run_ticks(&l, &f, &now, 1, 2, 1);
+    ASSERT_TRUE(l.lane[0].move.landing);
+    ASSERT_EQ(f.duty[0], 63);
+    ASSERT_EQ(l.lane[0].move.integ_um_s, ACE2K_LANE_INTEG_MAX_PCT * ACE2K_LANE_KI_DIV);
+    /* The loop on the 10th tick measures 20 242 again: the error −11 242, P −7, and the applied
+     * duty 63 is inside the bounds, so the error integrates: 288 758, worth 48.  The duty is
+     * 20 − 7 + 48 = 61, two points under the landing tick's. */
+    run_ticks(&l, &f, &now, 4, 2, 0);
+    run_ticks(&l, &f, &now, 1, 3, 1);
+    ASSERT_EQ(l.lane[0].move.integ_um_s, (ACE2K_LANE_INTEG_MAX_PCT * ACE2K_LANE_KI_DIV) - 11242);
+    ASSERT_EQ(f.duty[0], 61);
+}
+
+/* A negative cruise integral is outside the floor's window (0 and up), and the landing tick
+ * writes it clamped into that window, as the next loop will store it. */
+TEST(the_landing_tick_clamps_a_negative_integral_into_the_floors_window)
+{
+    struct ace2k_lane l;
+    struct ace2k_fake_counters f;
+    primed(&l, &f);
+    uint32_t now = 10;
+    /* 100 mm at 30 mm/s (the table: 35 %), the motor light: 50 pulses a loop is 40 485 µm/s,
+     * an error of −10 485 and P −6.  The integral falls 10 485 a loop until the applied duty
+     * 35 − 6 + integral / 6000 is at the floor: six loops, −62 910, duty 35 − 6 − 10 = 19, on
+     * the floor.  From the 7th loop the error stays out.  72 counts after 48 loops. */
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, 100000, 30000, now), 0);
+    for (int i = 0; i < 48; i++) {
+        run_loop_with(&l, &f, &now, 50, (i % 2) ? 1U : 2U);
+    }
+    ASSERT_EQ(ace2k_lane_encoder_count(&l, 0), 72);
+    ASSERT_EQ(l.lane[0].move.integ_um_s, -6 * 10485);
+    ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
+    /* A load stops the motor for one loop: the error 30 000, P 20, the applied duty 45, so the
+     * error integrates: −32 910, still negative and inside the 35 % window (−90 000 and up).
+     * The duty is 35 + 20 − 5 = 50. */
+    run_loop_with(&l, &f, &now, 0, 0);
+    ASSERT_EQ(l.lane[0].move.integ_um_s, (-6 * 10485) + 30000);
+    ASSERT_EQ(f.duty[0], 50);
+    /* The 73rd count on the 5th tick of the next window begins the landing.  The floor's window
+     * starts at 0, so the integral counts as 0 there: 20 + P at the last loop's speed,
+     * (9 000 − 0) / 1500 = 6, is 26.  Without the window it would be 20 + 6 − 5 = 21.  The
+     * stored integral does not move. */
+    run_ticks(&l, &f, &now, 4, 0, 0);
+    run_ticks(&l, &f, &now, 1, 0, 1);
+    ASSERT_TRUE(l.lane[0].move.landing);
+    ASSERT_EQ(f.duty[0], 26);
+    ASSERT_EQ(l.lane[0].move.integ_um_s, (-6 * 10485) + 30000);
 }
 
 TEST(the_integral_stops_at_its_clamp_while_the_duty_stays_under_the_ceiling)
@@ -987,6 +1297,64 @@ TEST(an_unpopped_result_is_overwritten_and_counted)
     struct ace2k_lane_result r;
     ASSERT_TRUE(ace2k_lane_pop_result(&l, 0, &r));
     ASSERT_TRUE(!ace2k_lane_pop_result(&l, 0, &r));
+}
+
+TEST(motor_travel_splits_the_tach_by_the_direction_last_driven)
+{
+    struct ace2k_lane l;
+    struct ace2k_fake_counters f;
+    primed(&l, &f);
+    uint32_t now = 10;
+    /* before any move: the tach counts forward */
+    run_ticks(&l, &f, &now, 1, 1235, 0);
+    ASSERT_EQ(ace2k_lane_motor_fwd_um(&l, 0), 100000);
+    ASSERT_EQ(ace2k_lane_motor_back_um(&l, 0), 0);
+    /* a reverse move: its pulses go back, and so do the ones that coast after its stop */
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_REVERSE, 100000, 30000, now), 0);
+    run_ticks(&l, &f, &now, 2, 1235, 0);
+    ace2k_lane_stop(&l, 0, now);
+    run_ticks(&l, &f, &now, 1, 247, 0);
+    ASSERT_EQ(ace2k_lane_motor_fwd_um(&l, 0), 100000);
+    ASSERT_EQ(ace2k_lane_motor_back_um(&l, 0), 220000);
+    /* a forward move counts forward again; a reset of the counters changes neither */
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, 100000, 30000, now), 0);
+    run_ticks(&l, &f, &now, 1, 1235, 0);
+    ace2k_lane_stop(&l, 0, now);
+    ASSERT_EQ(ace2k_lane_reset(&l, 0), 0);
+    ace2k_lane_tick(&l, now + 10, true);
+    ASSERT_EQ(ace2k_lane_motor_fwd_um(&l, 0), 200000);
+    ASSERT_EQ(ace2k_lane_motor_back_um(&l, 0), 220000);
+    ASSERT_EQ(ace2k_lane_motor_fwd_um(&l, 1), 0);
+    ASSERT_EQ(ace2k_lane_motor_back_um(&l, 4), 0); /* out of range */
+}
+
+TEST(motor_travel_credits_the_coast_before_a_start_to_the_move_that_stopped)
+{
+    struct ace2k_lane l;
+    struct ace2k_fake_counters f;
+    primed(&l, &f);
+    uint32_t now = 10;
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_REVERSE, 100000, 30000, now), 0);
+    run_ticks(&l, &f, &now, 2, 1235, 0);
+    ace2k_lane_stop(&l, 0, now);
+    /* the reverse move coasts 247 pulses, and a forward move starts before the next tick */
+    f.fg[0] += 247U;
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, 100000, 30000, now + 5), 0);
+    run_ticks(&l, &f, &now, 1, 1235, 0);
+    ASSERT_EQ(ace2k_lane_motor_back_um(&l, 0), 220000);
+    ASSERT_EQ(ace2k_lane_motor_fwd_um(&l, 0), 100000);
+}
+
+TEST(motor_travel_counts_across_the_tach_wrap_and_wraps_its_micrometres)
+{
+    struct ace2k_fake_counters f = { .enc = { 0 }, .fg = { UINT32_MAX - 4U, 0, 0, 0 } };
+    struct ace2k_lane l;
+    ace2k_lane_init(&l, &fake_ops, &f);
+    ace2k_lane_tick(&l, 10, true); /* primes: no travel */
+    ASSERT_EQ(ace2k_lane_motor_fwd_um(&l, 0), 0);
+    f.fg[0] = 1230U; /* 1235 pulses across the wrap */
+    ace2k_lane_tick(&l, 20, true);
+    ASSERT_EQ(ace2k_lane_motor_fwd_um(&l, 0), 100000);
 }
 
 // NOLINTNEXTLINE(readability-identifier-naming)

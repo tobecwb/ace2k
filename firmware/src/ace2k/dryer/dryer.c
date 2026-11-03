@@ -1,123 +1,10 @@
-/* The dryer's states: IDLE → STARTING → HEATING →
- * COOLDOWN → IDLE, FAULT from any.  One function per state; the heat latch and the cutout are
- * checked in every state before the state's own work. */
+/* The dryer's states: IDLE → STARTING → HEATING → COOLDOWN → IDLE, and FAULT from any of
+ * them. There is one function per state. The heat latch and the cutout are checked in every state,
+ * before the work of the state itself. */
 #include "dryer/dryer.h"
 #include "dryer/dryer_internal.h"
 
-#define DRYER_DC_PER_MC 100
-
-/* ---- events and helpers ---- */
-
-#define DRYER_SEQ_HALF 128U /* an acknowledgement covers an event at most this far behind it */
-
-static uint8_t ring_next(uint8_t i)
-{
-    return (uint8_t)((i + 1U) % ACE2K_DRYER_EVENT_RING);
-}
-
-void ace2k_dryer_emit(struct ace2k_dryer *self, uint8_t kind, uint8_t arg)
-{
-    uint8_t head = self->ring_head;
-    uint8_t next = ring_next(head);
-    if (next == self->ring_tail) {
-        self->events_lost++;
-        return;
-    }
-    self->ring[head] = (struct ace2k_dryer_event){ .kind = kind, .arg = arg, .seq = self->ev_seq };
-    self->ev_seq++;
-    ACE2K_COMPILER_BARRIER();
-    self->ring_head = next;
-}
-
-bool ace2k_dryer_event_next(const struct ace2k_dryer *self, struct ace2k_dryer_event *out)
-{
-    uint8_t i = self->ring_sent;
-    if (i == self->ring_head) {
-        return false;
-    }
-    ACE2K_COMPILER_BARRIER();
-    *out = self->ring[i];
-    return true;
-}
-
-void ace2k_dryer_event_sent(struct ace2k_dryer *self)
-{
-    uint8_t i = self->ring_sent;
-    if (i == self->ring_head) {
-        return;
-    }
-    if (i == self->ring_sent_hi) {
-        self->ring_sent_hi = ring_next(i); /* a first send: the high-water mark moves */
-    }
-    self->ring_sent = ring_next(i);
-}
-
-static uint8_t ring_prev(uint8_t i)
-{
-    return (uint8_t)((i + ACE2K_DRYER_EVENT_RING - 1U) % ACE2K_DRYER_EVENT_RING);
-}
-
-/* True when seq is after the newest event ever sent (a resend does not lower the mark: an ack for
- * an event sent before it, landing after it, is honoured), or no unacknowledged event was ever
- * sent: an acknowledgement of an event the host cannot have seen. */
-static bool ack_beyond_sent(const struct ace2k_dryer *self, uint8_t seq)
-{
-    if (self->ring_sent_hi == self->ring_tail) {
-        return true;
-    }
-    uint8_t newest = self->ring[ring_prev(self->ring_sent_hi)].seq;
-    uint8_t ahead = (uint8_t)(seq - newest);
-    if (ahead == 0U) {
-        return false;
-    }
-    return ahead < DRYER_SEQ_HALF;
-}
-
-void ace2k_dryer_event_ack(struct ace2k_dryer *self, uint8_t seq)
-{
-    if (ack_beyond_sent(self, seq)) {
-        return; /* ignored whole: never-sent events would leave uncounted */
-    }
-    while (self->ring_tail != self->ring_sent_hi) {
-        uint8_t tail = self->ring_tail;
-        if ((uint8_t)(seq - self->ring[tail].seq) >= DRYER_SEQ_HALF) {
-            return; /* the oldest is after seq */
-        }
-        if (self->ring_sent == tail) {
-            self->ring_sent = ring_next(tail); /* a resend's cursor not past it yet */
-        }
-        self->ring_tail = ring_next(tail);
-    }
-}
-
-void ace2k_dryer_event_resend(struct ace2k_dryer *self)
-{
-    self->ring_sent = self->ring_tail;
-}
-
-bool ace2k_dryer_event_resend_due(const struct ace2k_dryer *self, bool subscribed,
-                                  uint32_t last_send_ms, uint32_t now_ms)
-{
-    if (!subscribed || !ace2k_dryer_event_unacked(self)) {
-        return false;
-    }
-    return ace2k_time_since(now_ms, last_send_ms) >= ACE2K_DRYER_EVENT_RESEND_MS;
-}
-
-uint8_t ace2k_dryer_event_oldest(const struct ace2k_dryer *self)
-{
-    uint8_t tail = self->ring_tail;
-    if (tail == self->ring_head) {
-        return self->ev_seq; /* none held: the next one's */
-    }
-    ACE2K_COMPILER_BARRIER();
-    return self->ring[tail].seq;
-}
-
-bool ace2k_dryer_event_unacked(const struct ace2k_dryer *self)
-{
-    return self->ring_tail != self->ring_head;
-}
+/* ---- helpers ---- */
 
 int32_t ace2k_dryer_hotter_mc(const struct ace2k_dryer_inputs *in)
 {
@@ -127,8 +14,8 @@ int32_t ace2k_dryer_hotter_mc(const struct ace2k_dryer_inputs *in)
     return in->ntc_right_mc;
 }
 
-/* The vent's view of a reading: a chamber reading older than ACE2K_DRYER_CHAMBER_STALE_MS is no
- * reading, and its RH goes with it. */
+/* A reading as the vent sees it. A chamber reading older than ACE2K_DRYER_CHAMBER_STALE_MS counts
+ * as no reading, and its RH goes with it. */
 static struct ace2k_dryer_vent_sample vent_sample(const struct ace2k_dryer_inputs *in)
 {
     struct ace2k_dryer_vent_sample s = {
@@ -137,7 +24,7 @@ static struct ace2k_dryer_vent_sample vent_sample(const struct ace2k_dryer_input
         .chamber_valid = false,
         .rh_valid = false,
     };
-    if (in->chamber_valid && in->chamber_age_ms <= ACE2K_DRYER_CHAMBER_STALE_MS) {
+    if (ace2k_dryer_chamber_fresh(in)) {
         s.chamber_valid = true;
         s.rh_valid = in->rh_valid;
     }
@@ -155,10 +42,11 @@ static void set_state(struct ace2k_dryer *self, uint8_t state, uint32_t now_ms)
 _Static_assert(3U * ACE2K_FLAP_PULSE_MAX_MS <= ACE2K_DRYER_FLAPS_TIMEOUT_MS,
                "a sequence's pulses, and one already running, fit in its bound");
 
-/* Both flaps pulsed the same way, the bottom asked first: airflow runs one flap at a time, so the
- * two never pulse together.  It closes them at boot, at the start and at a cool-down's end, and
- * opens them at the vent and at a cool-down's entry.  No position cache: a flap already in place
- * is pulsed again.  A new sequence replaces the one in flight. */
+/* Begins a sequence that pulses both flaps the same way, the bottom one asked first. Airflow runs
+ * one flap at a time, so the two never pulse together. The dryer closes the flaps at boot, at the
+ * start and at the end of a cool-down. It opens them at the vent and at the entry into a
+ * cool-down. There is no position cache, so a flap already in place is pulsed again. A new
+ * sequence replaces the one in flight. */
 static void flaps_begin(struct ace2k_dryer *self, bool open, uint32_t now_ms)
 {
     self->flaps = (struct ace2k_dryer_flaps){
@@ -169,10 +57,10 @@ static void flaps_begin(struct ace2k_dryer *self, bool open, uint32_t now_ms)
     };
 }
 
-/* Asks the flaps not asked yet, in order; false while one is refused.  No owner outranks the
- * dryer today (NONE and MANUAL yield to it), so a refusal cannot happen; the retry is kept as
- * defence against a future stronger owner: a refusal is asked again every tick, within the
- * sequence's bound (ACE2K_DRYER_FLAPS_TIMEOUT_MS). */
+/* Asks for the flaps not asked yet, in order. Returns false while one is refused. Today no owner
+ * outranks the dryer, because NONE and MANUAL yield to it. So a refusal cannot happen. The retry
+ * is kept as a defence against a stronger owner in the future. A refused flap is asked again
+ * every tick, within the sequence's bound (ACE2K_DRYER_FLAPS_TIMEOUT_MS). */
 static bool flaps_ask(struct ace2k_dryer *self, uint32_t now_ms)
 {
     struct ace2k_dryer_flaps *seq = &self->flaps;
@@ -186,7 +74,8 @@ static bool flaps_ask(struct ace2k_dryer *self, uint32_t now_ms)
     return true;
 }
 
-/* A request of the dryer's still runs or waits on a flap — other owners' traffic not counted. */
+/* True while a request of the dryer still runs or waits on a flap. Requests of other owners do
+ * not count. */
 static bool flaps_own_pending(const struct ace2k_dryer *self)
 {
     if (ace2k_airflow_flap_pending(self->airflow, ACE2K_FLAP_BOTTOM, ACE2K_AIRFLOW_OWNER_DRYER)) {
@@ -195,8 +84,9 @@ static bool flaps_own_pending(const struct ace2k_dryer *self)
     return ace2k_airflow_flap_pending(self->airflow, ACE2K_FLAP_REAR, ACE2K_AIRFLOW_OWNER_DRYER);
 }
 
-/* Every tick, in every state: the sequence in flight asked, then over once both of the dryer's
- * pulses have ended, or timed out after ACE2K_DRYER_FLAPS_TIMEOUT_MS. */
+/* Runs every tick, in every state. It asks for the flaps of the sequence in flight. The sequence
+ * is over once both of the dryer's pulses have ended. It times out after
+ * ACE2K_DRYER_FLAPS_TIMEOUT_MS. */
 static void flaps_step(struct ace2k_dryer *self, uint32_t now_ms)
 {
     struct ace2k_dryer_flaps *seq = &self->flaps;
@@ -235,7 +125,7 @@ static uint8_t map_heat_reason(uint8_t reason)
     }
 }
 
-/* ---- cooling, shared by COOLDOWN and FAULT ---- */
+/* ---- the cooling, shared by COOLDOWN and FAULT ---- */
 
 static bool both_valid(const struct ace2k_dryer_inputs *in)
 {
@@ -245,8 +135,8 @@ static bool both_valid(const struct ace2k_dryer_inputs *in)
     return in->right_valid;
 }
 
-/* A window starts: both NTCs taken as its references.  With either side invalid there is no
- * reference to take — the window restarts on the first tick both read valid (cool_window()). */
+/* Starts a window, with both NTCs as its references. When either side is invalid, there is no
+ * reference to take. Then the window restarts on the first tick both read valid (cool_window()). */
 static void cool_arm(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in, uint32_t now_ms)
 {
     self->cool_ref_mc[0] = in->ntc_left_mc;
@@ -261,8 +151,8 @@ static void cool_arm(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *
 static void cool_begin(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in,
                        uint32_t now_ms)
 {
-    /* the flaps opened only on a unit the heater ran in this cycle: a fault on a cold unit (a
-     * cutout glitch or a heat latch at IDLE) only closes them, at its end */
+    /* The flaps open only when the heater ran in this cycle. A fault on a cold unit, such as a
+     * cutout glitch or a heat latch at IDLE, only closes them, at its end. */
     self->cool = ACE2K_DRYER_COOL_WAITING;
     if (self->heated) {
         self->cool = ACE2K_DRYER_COOL_OPENING;
@@ -271,8 +161,9 @@ static void cool_begin(struct ace2k_dryer *self, const struct ace2k_dryer_inputs
     cool_arm(self, in, now_ms);
 }
 
-/* One side over the window: at or below 45 °C, risen no more than ACE2K_DRYER_COOL_RISE_MC (the
- * NTC's noise), fallen less than ACE2K_DRYER_COOL_FALL_MC — steady or falling slowly. */
+/* True when one side is cool over the window. It is at or below 45 °C. It rose no more than
+ * ACE2K_DRYER_COOL_RISE_MC, which is the NTC's noise. It fell less than
+ * ACE2K_DRYER_COOL_FALL_MC. So it is steady, or falling slowly. */
 static bool side_cool(int32_t now_mc, int32_t ref_mc)
 {
     if (now_mc > ACE2K_DRYER_COOL_MC) {
@@ -280,16 +171,16 @@ static bool side_cool(int32_t now_mc, int32_t ref_mc)
     }
     int32_t fell = ref_mc - now_mc;
     if (fell < -ACE2K_DRYER_COOL_RISE_MC) {
-        return false; /* it rose: the overshoot after the heater stops */
+        return false; /* it rose: this is the overshoot after the heater stops */
     }
     return fell < ACE2K_DRYER_COOL_FALL_MC;
 }
 
-/* True when a 30 s window just closed with both NTCs valid and both cool by side_cool().  The
- * first window closes 30 s after cool_begin().  A window that closes with either side invalid
- * rolls nothing: its references would be pre-outage values, and the first window after the side
- * came back would judge a rising outlet against them.  The window restarts instead, from fresh
- * references, on the first tick both sides read valid again. */
+/* True when a 30 s window just closed with both NTCs valid, and both cool by side_cool(). The
+ * first window closes 30 s after cool_begin(). A window that closes with either side invalid does
+ * not roll over. Its references would be values from before the outage. The first window after
+ * the side came back would then judge a rising outlet against them. Instead, the window restarts
+ * from fresh references on the first tick both sides read valid again. */
 static bool cool_window(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in,
                         uint32_t now_ms)
 {
@@ -315,7 +206,8 @@ static bool cool_window(struct ace2k_dryer *self, const struct ace2k_dryer_input
     return side_cool(in->ntc_right_mc, ref_r);
 }
 
-/* The cool rule, or 10 min in a hot ambient (the notice, in COOLDOWN only): true when over. */
+/* True when the cooling is over: by the cool rule, or after 10 min in a hot ambient. The hot
+ * ambient raises its notice in COOLDOWN only. */
 static bool cool_over(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in,
                       uint32_t now_ms)
 {
@@ -332,10 +224,11 @@ static bool cool_over(struct ace2k_dryer *self, const struct ace2k_dryer_inputs 
     return true;
 }
 
-/* COOLDOWN and FAULT: the flaps opened (after heating: the fans draw room air across the
- * still-hot heater and push the humid air out — decided 2026-09-27; the factory
- * firmware closes them at the stop), then the cool rule, or 10 min in a hot ambient; then the
- * flaps closed and the fans handed to rule 7.  True once released. */
+/* COOLDOWN and FAULT. First the flaps open, after heating. The fans then draw room air across the
+ * heater, which is still hot, and push the humid air out. The factory firmware closes the flaps
+ * at the stop instead. Then the dryer waits for the cool rule, or 10 min in a hot ambient. Then
+ * the flaps close, and the fans go to airflow's fan rule (a fan never off above 45 °C).
+ * Returns true once the fans are released. */
 static bool tick_cooling(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in,
                          uint32_t now_ms)
 {
@@ -385,6 +278,8 @@ static void enter_fault(struct ace2k_dryer *self, uint8_t reason,
     ace2k_heat_abort(self->heat); /* a fault: no half-cycle after it, not even a pending one */
     self->ctl.duty_cpct = 0U;
     self->fault = reason;
+    /* This cannot fail. The dryer outranks every other owner, and a fan-on is never refused for
+     * heat. */
     (void)ace2k_airflow_fans(self->airflow, ACE2K_AIRFLOW_OWNER_DRYER, true, 0U, now_ms);
     ace2k_dryer_log_fault(self, reason, in);
     ace2k_dryer_emit(self, ACE2K_DRYER_EV_FAULT, reason);
@@ -406,9 +301,10 @@ static void begin_heating(struct ace2k_dryer *self, const struct ace2k_dryer_inp
 
 /* ---- states ---- */
 
-/* The flaps closed and both fans reading high.  The timeout runs over the whole of it: flaps not
- * closed within ACE2K_DRYER_START_TIMEOUT_MS (their sequence timed out or still running) fault
- * FLAPS, fans not both reading high fault FANS — the fans first. */
+/* STARTING waits for the flaps to close and for both fans to read high. One timeout covers both.
+ * After ACE2K_DRYER_START_TIMEOUT_MS, fans that do not both read high fault FANS. Otherwise,
+ * flaps not closed fault FLAPS: their sequence timed out or is still running. The fans are
+ * checked first. */
 static void tick_starting(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in,
                           uint32_t now_ms)
 {
@@ -426,22 +322,24 @@ static void tick_starting(struct ace2k_dryer *self, const struct ace2k_dryer_inp
         ace2k_dryer_log_cycle_open(self);
         self->start_logged = true;
     }
-    /* The open mark reaches the flash before the first lease; a flash that never takes it does
-     * not hold the cycle back past the timeout — the log is a record, not a safety function. */
+    /* The open mark reaches the flash before the first lease. A flash that never takes it does
+     * not hold the cycle back past the timeout. The log is a record, not a safety function. */
     if (ace2k_dryer_log_dirty(self) && age < ACE2K_DRYER_START_TIMEOUT_MS) {
         return;
     }
     begin_heating(self, in, now_ms);
 }
 
-/* A refused lease, named by heat; OK (a store in progress only) maps to the generic heat fault. */
+/* The reason of a refused lease, as heat names it. OK, which means only a store in progress,
+ * maps to the generic heat fault. */
 static uint8_t refused_reason(const struct ace2k_heat *heat)
 {
     return map_heat_reason(ace2k_heat_refusal_reason(heat));
 }
 
-/* -ACE2K_EAGAIN waits and is asked again next tick; anything else faults with heat's reason; a
- * wait past ACE2K_DRYER_NO_LEASE_MAX_MS faults with the reason heat names then. */
+/* Renews the lease. On -ACE2K_EAGAIN the dryer waits and asks again next tick. Any other refusal
+ * faults with heat's reason. A wait past ACE2K_DRYER_NO_LEASE_MAX_MS faults with the reason
+ * that heat names at that moment. */
 static void renew_lease(struct ace2k_dryer *self, uint8_t duty_pct,
                         const struct ace2k_dryer_inputs *in, uint32_t now_ms)
 {
@@ -450,7 +348,7 @@ static void renew_lease(struct ace2k_dryer *self, uint8_t duty_pct,
     }
     self->ctl.renew_next_ms = now_ms + ACE2K_DRYER_LEASE_RENEW_MS;
     if (duty_pct == 0U) {
-        self->ctl.leaseless = false; /* no lease wanted: not a wait */
+        self->ctl.leaseless = false; /* no lease is wanted, so this is not a wait */
         ace2k_heat_release(self->heat);
         return;
     }
@@ -475,8 +373,8 @@ static void renew_lease(struct ace2k_dryer *self, uint8_t duty_pct,
     }
 }
 
-/* dryer_vent decides; the first opening is the cycle's vent (its event), the guard's moves are
- * silent. */
+/* dryer_vent decides. The first opening is the cycle's vent, and it sends its event. The
+ * guard's moves are silent. */
 static void tick_vent(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in,
                       uint32_t now_ms)
 {
@@ -526,7 +424,7 @@ static void tick_cooldown(struct ace2k_dryer *self, const struct ace2k_dryer_inp
     }
 }
 
-/* The cutout and the heat latch, in every state. */
+/* The reason of the cutout or of the heat latch, checked in every state. */
 static uint8_t latch_reason(const struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in)
 {
     if (in->cutout) {
@@ -538,8 +436,8 @@ static uint8_t latch_reason(const struct ace2k_dryer *self, const struct ace2k_d
     return ACE2K_DRYER_FAULT_NONE;
 }
 
-/* Rule 10 across a reset: the cutout seen, in any state and whatever fault came first, reaches
- * the page at once. */
+/* A tripped cutout clears only on a power cycle, also across a reset. So a cutout seen in any
+ * state, whatever fault came first, reaches the page at once. */
 static void persist_cutout(struct ace2k_dryer *self)
 {
     self->cutout_seen = true;
@@ -549,9 +447,10 @@ static void persist_cutout(struct ace2k_dryer *self)
     }
 }
 
-/* Rule 9: a cycle open at the reset is logged interrupted and never resumed.  Rule 10: a
- * persisted cutout holds the dryer in FAULT until a power-on reset clears it.  The log is marked
- * only when the boot changed it — never on every power cycle, so no page erase per power-on. */
+/* A reset never resumes a cycle: a cycle open at the reset is logged as interrupted. A tripped
+ * cutout clears only on a power cycle: a persisted cutout holds the dryer in FAULT until a
+ * power-on reset clears it. The log is marked only when the boot changed it. It is not marked on
+ * every power cycle, so there is no page erase at each power-on. */
 static void boot_log(struct ace2k_dryer *self, bool power_on_reset)
 {
     uint32_t boot = ace2k_dryer_log_boot(self->log, power_on_reset);
@@ -559,9 +458,14 @@ static void boot_log(struct ace2k_dryer *self, bool power_on_reset)
         self->state = ACE2K_DRYER_FAULT;
         self->fault = ACE2K_DRYER_FAULT_CUTOUT;
         self->cutout_seen = true;
-        self->cool = ACE2K_DRYER_COOL_WAITING; /* no heating here: nothing to open */
-        /* the fans follow rule 7 from the first tick: a unit reset hot keeps them on */
-        /* the condition the unit booted in, first in the ring */
+        self->cool = ACE2K_DRYER_COOL_WAITING; /* no heating here, so nothing to open */
+        /* There are no inputs yet. The first window starts on the first tick both NTCs read
+         * valid. So it is timed from the boot, and judged against what the unit reads, not
+         * against zeros. */
+        self->cool_rearm = true;
+        /* The fans follow airflow's fan rule from the first tick. So a unit reset while hot
+         * keeps them on. */
+        /* The condition the unit booted in goes first in the ring. */
         ace2k_dryer_emit(self, ACE2K_DRYER_EV_FAULT, ACE2K_DRYER_FAULT_CUTOUT);
     }
     if ((boot & ACE2K_DRYER_LOG_BOOT_INTERRUPTED) != 0U) {
@@ -584,14 +488,14 @@ void ace2k_dryer_init(struct ace2k_dryer *self, struct ace2k_heat *heat,
     self->airflow = airflow;
     self->log = log;
     set_state(self, ACE2K_DRYER_IDLE, now_ms);
-    /* The flaps hold their position unpowered, and a cool-down cut short by a reset leaves them
-     * open: the boot closes both (nothing on the page says where they are), from the first tick,
-     * in any state. */
+    /* The flaps hold their position when unpowered. A cool-down cut short by a reset leaves them
+     * open, and nothing on the page says where they are. So the boot closes both from the first
+     * tick, in any state. */
     flaps_begin(self, false, now_ms);
     boot_log(self, power_on_reset);
 }
 
-/* The mains present but off-band: a dip in progress. */
+/* True when the mains is present but off-band: a dip in progress. */
 static bool mains_dipping(const struct ace2k_dryer_inputs *in)
 {
     if (!in->mains_present) {
@@ -603,10 +507,11 @@ static bool mains_dipping(const struct ace2k_dryer_inputs *in)
     return true;
 }
 
-/* The mains, for a start and for the clear of a mains fault: absent at once; present but with no
- * window measured since it came back, transient (MEASURING); implausible while heat's bucket is
- * above its restart level — a dip alone is ridden out, and a new cycle always begins with some
- * tolerance left. */
+/* Judges the mains for a start, and for the clear of a mains fault:
+ * - absent: NO_MAINS at once;
+ * - present, but no window measured since it came back: MEASURING, a transient refusal;
+ * - implausible while heat's bucket is above its restart level: NO_MAINS.
+ * A dip alone is ridden out, and a new cycle always begins with some tolerance left. */
 static enum ace2k_dryer_refusal mains_refusal(const struct ace2k_dryer *self)
 {
     if (!self->last.mains_present) {
@@ -624,8 +529,8 @@ static enum ace2k_dryer_refusal start_inputs_refusal(const struct ace2k_dryer *s
     if (in->cutout || self->cutout_seen || (self->log->flags & ACE2K_DRYER_LOG_CUTOUT) != 0U) {
         return ACE2K_DRYER_CUTOUT;
     }
-    if (!self->have_inputs || !in->left_valid || !in->right_valid || !in->chamber_valid ||
-        in->chamber_age_ms > ACE2K_DRYER_CHAMBER_STALE_MS) {
+    if (!self->have_inputs || !in->left_valid || !in->right_valid ||
+        !ace2k_dryer_chamber_fresh(in)) {
         return ACE2K_DRYER_SENSORS;
     }
     enum ace2k_dryer_refusal mains = mains_refusal(self);
@@ -654,13 +559,7 @@ static enum ace2k_dryer_refusal start_state_refusal(const struct ace2k_dryer *se
     if (self->state != ACE2K_DRYER_IDLE) {
         return ACE2K_DRYER_BUSY;
     }
-    if (target_c < ACE2K_DRYER_TARGET_MIN_C || target_c > ACE2K_DRYER_TARGET_MAX_C) {
-        return ACE2K_DRYER_RANGE;
-    }
-    if (minutes == 0U || minutes > ACE2K_DRYER_MINUTES_MAX) {
-        return ACE2K_DRYER_RANGE;
-    }
-    return ACE2K_DRYER_OK;
+    return ace2k_dryer_request_range_refusal(target_c, minutes);
 }
 
 enum ace2k_dryer_refusal ace2k_dryer_start(struct ace2k_dryer *self, uint8_t target_c,
@@ -677,15 +576,16 @@ enum ace2k_dryer_refusal ace2k_dryer_start(struct ace2k_dryer *self, uint8_t tar
     self->highest_target_c = target_c;
     self->end_ms = now_ms + ((uint32_t)minutes * ACE2K_DRYER_MS_PER_MIN);
     self->notices = 0U;
-    /* valid: start_inputs_refusal checked it; the ticks lower it from here (track_start_chamber) */
+    /* Valid, because start_inputs_refusal checked it. The ticks lower it from here
+     * (track_start_chamber). */
     self->start_chamber_mc = self->last.chamber_mc;
-    /* judged once, here: the chamber started above the target */
+    /* Judged once, here: the chamber started above the target. */
     if (self->start_chamber_mc > (int32_t)target_c * ACE2K_DRYER_MC_PER_C) {
         self->notices |= ACE2K_DRYER_NOTICE_AMBIENT_ABOVE;
     }
     self->mains_dips = 0U;
     self->phase_rejects_start = self->heat->phase_rejects;
-    /* a dip already in progress at the start counts once it is ridden out */
+    /* A dip already in progress at the start counts once it is ridden out. */
     self->mains_dip_open = mains_dipping(&self->last);
     self->fault = ACE2K_DRYER_FAULT_NONE;
     struct ace2k_dryer_vent_sample room = vent_sample(&self->last);
@@ -694,9 +594,11 @@ enum ace2k_dryer_refusal ace2k_dryer_start(struct ace2k_dryer *self, uint8_t tar
     ace2k_dryer_vent_begin_cg(&self->vent, room_cg, now_ms);
     self->start_logged = false;
     self->heated = false;
-    flaps_begin(self, false, now_ms); /* in place of a boot close still in flight */
+    flaps_begin(self, false, now_ms); /* replaces a boot close still in flight */
     self->prot.insert_prev = self->last.insert_mask;
     ace2k_dryer_ctl_reset(self, now_ms);
+    /* This cannot fail. The dryer outranks every other owner, and the start refused any owner
+     * other than NONE. A fan-on is never refused for heat. */
     (void)ace2k_airflow_fans(self->airflow, ACE2K_AIRFLOW_OWNER_DRYER, true, 0U, now_ms);
     set_state(self, ACE2K_DRYER_STARTING, now_ms);
     return ACE2K_DRYER_OK;
@@ -707,11 +609,11 @@ enum ace2k_dryer_refusal ace2k_dryer_stop(struct ace2k_dryer *self, uint32_t now
     if (self->state == ACE2K_DRYER_FAULT) {
         return ACE2K_DRYER_FAULTED;
     }
-    if (self->state != ACE2K_DRYER_STARTING && self->state != ACE2K_DRYER_HEATING) {
-        return ACE2K_DRYER_OK; /* nothing to stop: idempotent */
+    if (!ace2k_dryer_running_state(self->state)) {
+        return ACE2K_DRYER_OK; /* nothing to stop: a repeated stop does nothing */
     }
-    /* STARTING opens the cycle once the flaps and fans are ready: stopped before that, there is
-     * nothing to close and nothing for the page (no erase for a cycle that never began). */
+    /* STARTING opens the cycle once the flaps and fans are ready. A stop before that has nothing
+     * to close and nothing to write to the page. So a cycle that never began costs no erase. */
     if (self->state == ACE2K_DRYER_HEATING || self->start_logged) {
         ace2k_dryer_log_cycle_close(self, false);
     }
@@ -719,7 +621,36 @@ enum ace2k_dryer_refusal ace2k_dryer_stop(struct ace2k_dryer *self, uint32_t now
     return ACE2K_DRYER_OK;
 }
 
-/* The fault's cause, read on the last inputs. */
+enum ace2k_dryer_refusal ace2k_dryer_retarget(struct ace2k_dryer *self, uint8_t target_c,
+                                              uint16_t minutes, uint32_t now_ms)
+{
+    if (self->state == ACE2K_DRYER_FAULT) {
+        return ACE2K_DRYER_FAULTED;
+    }
+    if (!ace2k_dryer_running_state(self->state)) {
+        return ACE2K_DRYER_BUSY;
+    }
+    enum ace2k_dryer_refusal res = ace2k_dryer_request_range_refusal(target_c, minutes);
+    if (res != ACE2K_DRYER_OK) {
+        return res;
+    }
+    self->target_c = target_c;
+    if (target_c > self->highest_target_c) {
+        self->highest_target_c = target_c;
+    }
+    self->end_ms = now_ms + ((uint32_t)minutes * ACE2K_DRYER_MS_PER_MIN);
+    self->notices &= (uint8_t)~ACE2K_DRYER_NOTICE_LOWERED;
+    return ACE2K_DRYER_OK;
+}
+
+void ace2k_dryer_lower_target(struct ace2k_dryer *self, uint8_t target_c)
+{
+    if (ace2k_dryer_running_state(self->state) && target_c < self->target_c) {
+        self->target_c = target_c;
+    }
+}
+
+/* Whether the fault's cause is still present, read on the last inputs. */
 static enum ace2k_dryer_refusal cause_refusal(const struct ace2k_dryer *self)
 {
     const struct ace2k_dryer_inputs *in = &self->last;
@@ -730,9 +661,7 @@ static enum ace2k_dryer_refusal cause_refusal(const struct ace2k_dryer *self)
     case ACE2K_DRYER_FAULT_MAINS:
         return mains_refusal(self);
     case ACE2K_DRYER_FAULT_CHAMBER_STALE:
-        return (in->chamber_valid && in->chamber_age_ms <= ACE2K_DRYER_CHAMBER_STALE_MS)
-                   ? ACE2K_DRYER_OK
-                   : ACE2K_DRYER_SENSORS;
+        return ace2k_dryer_chamber_fresh(in) ? ACE2K_DRYER_OK : ACE2K_DRYER_SENSORS;
     case ACE2K_DRYER_FAULT_CHAMBER_OVER:
         return in->chamber_mc < ceiling ? ACE2K_DRYER_OK : ACE2K_DRYER_NOT_COOL;
     default:
@@ -740,9 +669,10 @@ static enum ace2k_dryer_refusal cause_refusal(const struct ace2k_dryer *self)
     }
 }
 
-/* Heat kept its latch: what holds it names the refusal (ace2k_heat_clear_blocker: the cutout,
- * a hard limit, the gate reading high, then the mains bucket — in that order), so the host is
- * told the cause, not to clear again. */
+/* Heat kept its latch. What holds the latch names the refusal. ace2k_heat_clear_blocker checks,
+ * in this order: the gate reading high, the cutout, a hard limit or an invalid NTC, then the mains
+ * bucket. A gate reading high answers FAULTED. So the host is told the cause, not just to clear
+ * again. */
 static enum ace2k_dryer_refusal heat_clear_refusal(const struct ace2k_heat *heat)
 {
     switch (ace2k_heat_clear_blocker(heat)) {
@@ -762,14 +692,18 @@ static enum ace2k_dryer_refusal heat_clear_refusal(const struct ace2k_heat *heat
 
 enum ace2k_dryer_refusal ace2k_dryer_clear(struct ace2k_dryer *self, uint32_t now_ms)
 {
+    if (self->shut) {
+        /* The tick no longer runs, so nothing that a clear judges is current. */
+        return ACE2K_DRYER_SHUTDOWN;
+    }
     if ((self->log->flags & ACE2K_DRYER_LOG_CUTOUT) != 0U) {
-        return ACE2K_DRYER_CUTOUT; /* rule 10: only a power-on reset clears it */
+        return ACE2K_DRYER_CUTOUT; /* only a power-on reset clears a tripped cutout */
     }
     if (self->state != ACE2K_DRYER_FAULT) {
         return ACE2K_DRYER_OK;
     }
     if (self->fault == ACE2K_DRYER_FAULT_CUTOUT || self->last.cutout || self->cutout_seen) {
-        return ACE2K_DRYER_CUTOUT; /* rule 10: a power cycle only */
+        return ACE2K_DRYER_CUTOUT; /* only a power cycle clears a tripped cutout */
     }
     if (self->cool != ACE2K_DRYER_COOL_RELEASED) {
         return ACE2K_DRYER_NOT_COOL;
@@ -788,9 +722,10 @@ enum ace2k_dryer_refusal ace2k_dryer_clear(struct ace2k_dryer *self, uint32_t no
     return ACE2K_DRYER_OK;
 }
 
-/* A dip that did not fault the cycle: the mains read off-band (present) in STARTING or HEATING — or
- * already at the start — and plausible again with the cycle still there, no fault.  Counted, and
- * the notice raised, on its end.  The mains absent is never a dip (it faults at once). */
+/* Counts a dip that did not fault the cycle. The mains read off-band, but present, in STARTING or
+ * HEATING, or already at the start. Then it read plausible again, with the cycle still running
+ * and no fault. The dip is counted, and the notice raised, when it ends. An absent mains is never
+ * a dip, because it faults at once. */
 static void dip_ridden_out(struct ace2k_dryer *self)
 {
     self->mains_dip_open = false;
@@ -802,9 +737,9 @@ static void dip_ridden_out(struct ace2k_dryer *self)
 
 static void track_mains_dip(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in)
 {
-    if (self->state != ACE2K_DRYER_STARTING && self->state != ACE2K_DRYER_HEATING) {
-        /* the cycle left STARTING or HEATING with a dip still open: ridden out unless a fault
-         * ended it (the time up, a stop) */
+    if (!ace2k_dryer_running_state(self->state)) {
+        /* The cycle left STARTING or HEATING with a dip still open. The dip counts as ridden out,
+         * unless a fault ended the cycle. An end without a fault is the time up, or a stop. */
         if (self->mains_dip_open && self->state != ACE2K_DRYER_FAULT) {
             dip_ridden_out(self);
         }
@@ -824,10 +759,11 @@ static void track_mains_dip(struct ace2k_dryer *self, const struct ace2k_dryer_i
     }
 }
 
-/* The edges heat judged out of phase since the start, past the notice's count. */
+/* In STARTING and HEATING, raises ACE2K_DRYER_NOTICE_EDGES_OFF_PHASE once heat has judged at
+ * least ACE2K_DRYER_PHASE_REJECTS_NOTICE edges out of phase since the start. */
 static void track_phase_rejects(struct ace2k_dryer *self)
 {
-    if (self->state != ACE2K_DRYER_STARTING && self->state != ACE2K_DRYER_HEATING) {
+    if (!ace2k_dryer_running_state(self->state)) {
         return;
     }
     uint32_t rejects = self->heat->phase_rejects - self->phase_rejects_start;
@@ -836,12 +772,12 @@ static void track_phase_rejects(struct ace2k_dryer *self)
     }
 }
 
-/* STARTING and HEATING: start_chamber_mc follows the chamber's lowest valid reading since the
- * start, so chamber_over's ceiling only ever moves down — a warm restart that began above the
- * target closes the ceiling as the chamber cools. */
+/* STARTING and HEATING: start_chamber_mc follows the lowest valid chamber reading since the start.
+ * So chamber_over's ceiling only ever moves down. After a warm restart that began above the
+ * target, the ceiling closes in as the chamber cools. */
 static void track_start_chamber(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in)
 {
-    if (!in->chamber_valid || in->chamber_age_ms > ACE2K_DRYER_CHAMBER_STALE_MS) {
+    if (!ace2k_dryer_chamber_fresh(in)) {
         return;
     }
     if (in->chamber_mc < self->start_chamber_mc) {
@@ -849,14 +785,34 @@ static void track_start_chamber(struct ace2k_dryer *self, const struct ace2k_dry
     }
 }
 
-void ace2k_dryer_tick(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in,
+/* An invalid side reads as its last valid value. The binding holds it too, but the core does not
+ * rely on that. A 0 passed for one invalid tick would reach the controller as a fall. It would
+ * reach the response window as a rise back from 0, 30 s later. The valid bits stay as they came,
+ * so the sensor check still counts the invalid ticks. */
+static void hold_ntcs(struct ace2k_dryer *self, struct ace2k_dryer_inputs *in)
+{
+    if (in->left_valid) {
+        self->ntc_held_mc[0] = in->ntc_left_mc;
+    } else {
+        in->ntc_left_mc = self->ntc_held_mc[0];
+    }
+    if (in->right_valid) {
+        self->ntc_held_mc[1] = in->ntc_right_mc;
+    } else {
+        in->ntc_right_mc = self->ntc_held_mc[1];
+    }
+}
+
+void ace2k_dryer_tick(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *raw,
                       uint32_t now_ms)
 {
-    self->last = *in;
+    self->last = *raw;
+    hold_ntcs(self, &self->last);
     self->have_inputs = true;
+    const struct ace2k_dryer_inputs *in = &self->last;
     ace2k_dryer_vent_room_expire(&self->room, now_ms);
     if (in->cutout) {
-        persist_cutout(self); /* sticky, and on the page: rule 10 */
+        persist_cutout(self); /* sticky and on the page: only a power cycle clears it */
     }
     if (self->shut) {
         return;
@@ -865,7 +821,7 @@ void ace2k_dryer_tick(struct ace2k_dryer *self, const struct ace2k_dryer_inputs 
     if (latch != ACE2K_DRYER_FAULT_NONE) {
         enter_fault(self, latch, in, now_ms);
     }
-    if (self->state == ACE2K_DRYER_STARTING || self->state == ACE2K_DRYER_HEATING) {
+    if (ace2k_dryer_running_state(self->state)) {
         ace2k_dryer_protect_spool(self, in);
         track_start_chamber(self, in); /* before the protections read the ceiling */
     }
@@ -885,12 +841,12 @@ void ace2k_dryer_tick(struct ace2k_dryer *self, const struct ace2k_dryer_inputs 
     default:
         break;
     }
-    flaps_step(self, now_ms);  /* a sequence begun by this tick's state is asked in it */
+    flaps_step(self, now_ms);  /* a sequence begun by the state in this tick is asked now */
     track_mains_dip(self, in); /* after the states: a dip that ended in a fault is not counted */
     track_phase_rejects(self);
-    /* No mark: the counters reach the page with the cycle's end.  Only the ticks heat may fire
-     * on count as heating: a lease silenced by a debounced excursion (a mains dip, an NTC glitch)
-     * heats nothing. */
+    /* No mark here: the counters reach the page at the cycle's end. Only the ticks on which
+     * heat may fire count as heating. A lease silenced by a debounced excursion, such as a mains
+     * dip or an NTC glitch, heats nothing. */
     if (ace2k_heat_firing(self->heat)) {
         ace2k_dryer_log_account(self->log, self->heat->duty_pct, ACE2K_DRYER_TICK_MS);
     }
@@ -898,14 +854,19 @@ void ace2k_dryer_tick(struct ace2k_dryer *self, const struct ace2k_dryer_inputs 
 
 void ace2k_dryer_shutdown(struct ace2k_dryer *self)
 {
-    ace2k_heat_shutdown(self->heat); /* immediate: no pending half (heat.h) */
-    /* no flap pulse from here on (the tick returns first): airflow's shutdown cut the running one
-     * (its flap published unknown); the flaps stay where they are until the next boot's close */
+    ace2k_heat_shutdown(self->heat); /* immediate: no pending half-cycle (heat.h) */
+    /* No flap pulse from here on, because the tick returns first. Airflow's shutdown cut the
+     * running pulse, and its flap is published as unknown. The flaps stay where they are until
+     * the close at the next boot. */
     self->ctl.duty_cpct = 0U;
     self->shut = true;
-    /* the dryer's claim goes; the fans follow rule 7, and heat's hold while it may conduct */
+    /* The dryer's claim goes. The fans follow airflow's fan rule, and heat's hold
+     * while the heater may still conduct. */
     ace2k_airflow_release(self->airflow, ACE2K_AIRFLOW_OWNER_DRYER);
-    self->state = ACE2K_DRYER_IDLE;
+    /* A fault stays a fault, with its reason. The status never reads idle with a fault code. */
+    if (self->state != ACE2K_DRYER_FAULT) {
+        self->state = ACE2K_DRYER_IDLE;
+    }
 }
 
 void ace2k_dryer_status(const struct ace2k_dryer *self, struct ace2k_dryer_status *out,
@@ -920,11 +881,11 @@ void ace2k_dryer_status(const struct ace2k_dryer *self, struct ace2k_dryer_statu
     out->flaps = ace2k_airflow_flaps_report(self->airflow);
     out->events_lost = self->events_lost > UINT16_MAX ? UINT16_MAX : (uint16_t)self->events_lost;
     out->oldest = ace2k_dryer_event_oldest(self);
-    if (self->state != ACE2K_DRYER_STARTING && self->state != ACE2K_DRYER_HEATING) {
+    if (!ace2k_dryer_running_state(self->state)) {
         return;
     }
-    out->duty_pct = (uint8_t)(self->ctl.duty_cpct / ACE2K_DRYER_CPCT_PER_PCT);
-    out->drive_dc = (uint16_t)(ace2k_dryer_drive_mc(self) / DRYER_DC_PER_MC);
+    out->duty_pct = ace2k_dryer_duty_pct(self->ctl.duty_cpct);
+    out->drive_dc = (uint16_t)(ace2k_dryer_drive_mc(self) / ACE2K_DRYER_MC_PER_DC);
     if (!ace2k_time_after(now_ms, self->end_ms)) {
         out->remaining_min =
             (uint16_t)(ace2k_time_since(self->end_ms, now_ms) / ACE2K_DRYER_MS_PER_MIN);

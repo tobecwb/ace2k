@@ -150,24 +150,24 @@ TEST(a_silence_just_below_the_signed_horizon_is_quiet)
     ASSERT_EQ(t.deferred, 0);
 }
 
-TEST(link_ok_is_false_before_the_first_byte_and_true_while_bytes_keep_coming)
+TEST(link_ok_is_false_before_the_first_frame_and_true_while_frames_keep_coming)
 {
     struct ace2k_link_turnaround t;
     ace2k_link_turnaround_init(&t, IDLE);
     ASSERT_TRUE(!ace2k_link_turnaround_link_ok(&t, 5000, LOST));
-    ace2k_link_turnaround_rx(&t, 1000);
+    ace2k_link_turnaround_frame(&t, 1000);
     ASSERT_TRUE(ace2k_link_turnaround_link_ok(&t, 1000, LOST));
     ASSERT_TRUE(ace2k_link_turnaround_link_ok(&t, 1000 + LOST - 1, LOST));
-    ace2k_link_turnaround_rx(&t, 1000 + LOST - 1); /* the host's next query, just in time */
+    ace2k_link_turnaround_frame(&t, 1000 + LOST - 1); /* the host's next query, just in time */
     ASSERT_TRUE(ace2k_link_turnaround_link_ok(&t, 1000 + (2 * LOST) - 2, LOST));
     ASSERT_TRUE(!t.lost);
 }
 
-TEST(a_silence_of_lost_ticks_latches_the_loss_through_a_counter_wrap_until_the_next_byte)
+TEST(a_silence_of_lost_ticks_latches_the_loss_through_a_counter_wrap_until_the_next_frame)
 {
     struct ace2k_link_turnaround t;
     ace2k_link_turnaround_init(&t, IDLE);
-    ace2k_link_turnaround_rx(&t, 1000);
+    ace2k_link_turnaround_frame(&t, 1000);
     ASSERT_TRUE(ace2k_link_turnaround_link_ok(&t, 1000 + LOST - 1, LOST));
     ASSERT_TRUE(!ace2k_link_turnaround_link_ok(&t, 1000 + LOST, LOST)); /* exactly lost_ticks */
     ASSERT_TRUE(t.lost);
@@ -177,20 +177,115 @@ TEST(a_silence_of_lost_ticks_latches_the_loss_through_a_counter_wrap_until_the_n
     ASSERT_EQ((uint32_t)wrapped - 1000U, 10U);
     ASSERT_TRUE(!ace2k_link_turnaround_link_ok(&t, (uint32_t)wrapped, LOST));
     ASSERT_TRUE(t.lost);
-    ace2k_link_turnaround_rx(&t, 9000); /* the host is back */
+    ace2k_link_turnaround_frame(&t, 9000); /* the host is back */
     ASSERT_TRUE(!t.lost);
     ASSERT_TRUE(ace2k_link_turnaround_link_ok(&t, 9010, LOST));
 }
 
-TEST(a_loss_that_was_never_evaluated_is_not_latched_by_a_later_byte)
+TEST(a_loss_that_was_never_evaluated_is_not_latched_by_a_later_frame)
 {
-    /* the latch is set by a call, not by time: the bindings call every 10 ms, and a byte before
+    /* the latch is set by a call, not by time: the bindings call every 10 ms, and a frame before
      * the next call means the host was heard from */
     struct ace2k_link_turnaround t;
     ace2k_link_turnaround_init(&t, IDLE);
-    ace2k_link_turnaround_rx(&t, 1000);
-    ace2k_link_turnaround_rx(&t, 1000 + (2 * LOST));
+    ace2k_link_turnaround_frame(&t, 1000);
+    ace2k_link_turnaround_frame(&t, 1000 + (2 * LOST));
     ASSERT_TRUE(ace2k_link_turnaround_link_ok(&t, 1000 + (2 * LOST) + 5, LOST));
+}
+
+/* Bytes are the line, frames are the host: a converter that keeps sending noise after the host
+ * died keeps the line busy, but never the link up.  A byte alone never makes the link ok, and
+ * never ends a latched loss. */
+TEST(bytes_without_a_valid_frame_keep_the_line_busy_but_never_the_link_up)
+{
+    struct ace2k_link_turnaround t;
+    ace2k_link_turnaround_init(&t, IDLE);
+    ace2k_link_turnaround_rx(&t, 1000);
+    ASSERT_TRUE(!ace2k_link_turnaround_link_ok(&t, 1001, LOST)); /* bytes, no frame yet */
+    uint32_t wait = 0;
+    ASSERT_EQ(ace2k_link_turnaround_tx_request(&t, 1001, &wait), ACE2K_LINK_WAIT);
+    ace2k_link_turnaround_frame(&t, 2000);
+    ASSERT_TRUE(ace2k_link_turnaround_link_ok(&t, 2000, LOST));
+    for (uint32_t now = 2000; now < 2000 + (3 * LOST); now += IDLE) {
+        ace2k_link_turnaround_rx(&t, now); /* noise, and no frame */
+    }
+    ASSERT_TRUE(!ace2k_link_turnaround_link_ok(&t, 2000 + (3 * LOST), LOST));
+    ASSERT_TRUE(t.lost);
+    ace2k_link_turnaround_rx(&t, 2000 + (3 * LOST) + 1);
+    ASSERT_TRUE(!ace2k_link_turnaround_link_ok(&t, 2000 + (3 * LOST) + 2, LOST));
+    /* one counter wrap after the last frame its age reads small again: a byte there must still
+     * not end the latch */
+    uint32_t wrapped = (uint32_t)(2000ULL + 10ULL + (1ULL << 32U));
+    ace2k_link_turnaround_rx(&t, wrapped);
+    ASSERT_TRUE(!ace2k_link_turnaround_link_ok(&t, wrapped, LOST));
+    ace2k_link_turnaround_frame(&t, 2000 + (3 * LOST) + 3); /* a valid frame: the host is back */
+    ASSERT_TRUE(ace2k_link_turnaround_link_ok(&t, 2000 + (3 * LOST) + 4, LOST));
+}
+
+/* The longest silence between two valid frames, the quantity that the lost window judges. */
+TEST(the_longest_gap_is_the_largest_interval_between_two_frames)
+{
+    struct ace2k_link_turnaround t;
+    ace2k_link_turnaround_init(&t, IDLE);
+    ASSERT_EQ(t.max_gap, 0);
+    ace2k_link_turnaround_frame(&t, 1000); /* the first frame ends no interval */
+    ASSERT_EQ(t.max_gap, 0);
+    ace2k_link_turnaround_frame(&t, 1980);
+    ASSERT_EQ(t.max_gap, 980);
+    ace2k_link_turnaround_frame(&t, 4950); /* a stall of the host */
+    ASSERT_EQ(t.max_gap, 2970);
+    ace2k_link_turnaround_frame(&t, 5930); /* shorter: the maximum stays */
+    ASSERT_EQ(t.max_gap, 2970);
+    ASSERT_TRUE(ace2k_link_turnaround_link_ok(&t, 5940, LOST));
+}
+
+/* Bytes are not frames: noise between two frames does not split the interval. */
+TEST(bytes_between_frames_do_not_shorten_the_gap)
+{
+    struct ace2k_link_turnaround t;
+    ace2k_link_turnaround_init(&t, IDLE);
+    ace2k_link_turnaround_frame(&t, 1000);
+    ace2k_link_turnaround_rx(&t, 2000);
+    ace2k_link_turnaround_frame(&t, 3500);
+    ASSERT_EQ(t.max_gap, 2500);
+}
+
+TEST(the_gap_survives_a_counter_wrap_between_two_frames)
+{
+    struct ace2k_link_turnaround t;
+    ace2k_link_turnaround_init(&t, IDLE);
+    ace2k_link_turnaround_frame(&t, 0xFFFFFF00U);
+    ace2k_link_turnaround_frame(&t, 0x00000200U);
+    ASSERT_EQ(t.max_gap, 0x300);
+}
+
+/* A gap that ended a lost link never reads below the window, however long it was: one counter
+ * wrap after the loss its unsigned age reads small again. */
+TEST(a_gap_that_ended_a_loss_never_reads_below_the_window)
+{
+    struct ace2k_link_turnaround t;
+    ace2k_link_turnaround_init(&t, IDLE);
+    ace2k_link_turnaround_frame(&t, 1000);
+    ASSERT_TRUE(!ace2k_link_turnaround_link_ok(&t, 1000 + LOST + 7, LOST));
+    ASSERT_EQ(t.max_gap, LOST + 7);
+    uint32_t wrapped = (uint32_t)(1000ULL + 10ULL + (1ULL << 32U));
+    ace2k_link_turnaround_frame(&t, wrapped); /* the host is back, one wrap later */
+    ASSERT_EQ(t.max_gap, LOST + 7);
+}
+
+TEST(a_clear_starts_the_maximum_again_from_the_next_frame)
+{
+    struct ace2k_link_turnaround t;
+    ace2k_link_turnaround_init(&t, IDLE);
+    ace2k_link_turnaround_frame(&t, 1000);
+    ace2k_link_turnaround_frame(&t, 3000);
+    ASSERT_EQ(t.max_gap, 2000);
+    ace2k_link_turnaround_gap_clear(&t);
+    ASSERT_EQ(t.max_gap, 0);
+    /* the interval that a frame after the clear ends counts, though it began before the clear */
+    ace2k_link_turnaround_frame(&t, 3400);
+    ASSERT_EQ(t.max_gap, 400);
+    ASSERT_TRUE(ace2k_link_turnaround_link_ok(&t, 3400, LOST)); /* the link is untouched */
 }
 
 // NOLINTNEXTLINE(readability-identifier-naming)

@@ -14,7 +14,8 @@ static void push_event(struct ace2k_sensors *self, uint8_t lane, uint8_t kind, b
     self->head = next;
 }
 
-/* Two identical samples move the state.  Returns true on a change.  Unprimed: seeds silently. */
+/* Two identical samples move the state.  It returns true on a change.  Before priming, it seeds the
+ * state without an event. */
 static bool debounce(bool *state, bool *last, bool level, bool primed)
 {
     bool changed = false;
@@ -28,18 +29,11 @@ static bool debounce(bool *state, bool *last, bool level, bool primed)
     return changed;
 }
 
-/* The two readers widen to uint32_t first: a uint16_t operand promotes to int, and the lint
- * refuses a bitwise operator on a signed operand.  In C a `!` or `&&` result is an int too, so
- * the active-low inputs get their own reader instead of a negated level_of(). */
+/* The level of the input.  It is widened to uint32_t first, because a uint16_t operand promotes to
+ * int, and the lint refuses a bitwise operator on a signed operand. */
 static bool level_of(const struct ace2k_sensors_inputs *in, unsigned bit)
 {
     return (((uint32_t)in->levels >> bit) & 1U) != 0;
-}
-
-/* True when the pin reads low: the buffer Hall switches are active low. */
-static bool low_of(const struct ace2k_sensors_inputs *in, unsigned bit)
-{
-    return (((uint32_t)in->levels >> bit) & 1U) == 0;
 }
 
 void ace2k_sensors_init(struct ace2k_sensors *self,
@@ -71,24 +65,11 @@ const struct ace2k_insert_band *ace2k_sensors_band(const struct ace2k_sensors *s
     return &self->lane[lane].band;
 }
 
-/* At either end of the scale — the one test behind the insert filter's rail gate and
- * ace2k_sensors_insert_connected().  An early return instead of `a || b`: in C that result is
- * an int, and the lint refuses one as a bool. */
+/* True at either end of the scale.  This is the one test behind the rail gate of the insert filter
+ * and behind ace2k_sensors_insert_connected(). */
 static bool at_rail(uint16_t mv)
 {
-    if (mv <= ACE2K_SENSORS_RAIL_LOW_MV) {
-        return true;
-    }
-    return mv >= ACE2K_SENSORS_RAIL_HIGH_MV;
-}
-
-/* Both asserted.  An early return instead of `a && b`, for the same reason. */
-static bool both(bool a, bool b)
-{
-    if (!a) {
-        return false;
-    }
-    return b;
+    return (bool)(mv <= ACE2K_SENSORS_RAIL_LOW_MV || mv >= ACE2K_SENSORS_RAIL_HIGH_MV);
 }
 
 static void tick_insert(struct ace2k_sensors *self, uint8_t i,
@@ -100,14 +81,14 @@ static void tick_insert(struct ace2k_sensors *self, uint8_t i,
     bool rail = at_rail(mv);
     l->insert_mv = mv;
     l->empty_mv = in->mv[ACE2K_ADC_EMPTY1 + i];
-    /* A sample at a rail is not filament: a disconnected lever board reads at one end of the
-     * scale, a shorted one at the other, and the low rail is inside every band's "present"
-     * region.  Such a lane reads absent for the tick (which is how the health mask says why),
-     * and the filter is reseeded rather than stepped — at the rail, and once more on the first
-     * sample back between the rails — so the hysteresis restarts from the real value.  A
-     * filter left integrating at the low rail would climb through the "present" band on the
-     * way back and report a strand that is not there. */
-    if (!self->adc_primed || rail || l->insert_at_rail) {
+    /* A sample at a rail is not filament.  A disconnected lever board reads at one end of the
+     * scale, and a shorted one at the other.  The low rail is inside the "present" region of every
+     * band.  Such a lane reads absent for the tick, which is how the health mask says why.  The
+     * filter is reseeded rather than stepped.  This happens at the rail, and once more on the first
+     * sample back between the rails.  So the hysteresis restarts from the real value.  A filter
+     * left integrating at the low rail would climb through the "present" band on the way back, and
+     * report filament that is not there. */
+    if (!self->adc_primed || self->insert_reseed || rail || l->insert_at_rail) {
         l->insert_filt16 = mv16;
     } else {
         l->insert_filt16 += (mv16 - l->insert_filt16) / ACE2K_SENSORS_IIR_DIV;
@@ -115,10 +96,11 @@ static void tick_insert(struct ace2k_sensors *self, uint8_t i,
     l->insert_at_rail = rail;
     uint32_t filt_mv = (uint32_t)l->insert_filt16 >> ACE2K_SENSORS_FILT_SHIFT;
     uint32_t band = (uint32_t)l->band.high_mv - l->band.low_mv;
-    uint32_t present_mv = l->band.low_mv + (band * ACE2K_SENSORS_TRIP_PRESENT_PCT / 100U);
-    uint32_t absent_mv = l->band.low_mv + (band * ACE2K_SENSORS_TRIP_ABSENT_PCT / 100U);
-    /* filament present is the low reading: a strand presses the lever and the reading falls
-     * (measured on the unit 2026-09-17) */
+    uint32_t present_mv = l->band.low_mv + (band * ACE2K_SENSORS_TRIP_PRESENT_PCT / ACE2K_PCT_FULL);
+    uint32_t absent_mv = l->band.low_mv + (band * ACE2K_SENSORS_TRIP_ABSENT_PCT / ACE2K_PCT_FULL);
+    /* Filament present is the low reading.  Filament presses the lever and the reading falls
+     * (measured on the unit).  So filament is present at or below 30 % of
+     * the band, and absent at or above 70 %. */
     if (filt_mv <= present_mv) {
         l->insert_raw = true;
     } else if (filt_mv >= absent_mv) {
@@ -132,40 +114,67 @@ static void tick_insert(struct ace2k_sensors *self, uint8_t i,
     }
 }
 
-void ace2k_sensors_tick(struct ace2k_sensors *self, uint32_t now_ms,
-                        const struct ace2k_sensors_inputs *in)
+/* A stopped scan leaves the last pass in place with a growing age.  Its insert readings are the
+ * frozen ones, so a spool that runs out meanwhile would never show.  The inserts go unknown
+ * instead, and stand still until a fresh pass, which reseeds the filters.
+ * A flash write stalls the core, and the scan with it, without stopping it.  The pass from before
+ * the stall can pass the bound on the tick's catch-up, and for the two periods the next pass takes
+ * (util.h, ace2k_catchup_settled).  For ACE2K_CATCHUP_SETTLE_MS after the catch-up, a stale pass
+ * keeps the last verdict: known stays known, on the readings from just before the stall, and
+ * unknown stays unknown.  It steps nothing.  A scan that is still stopped after it goes unknown.
+ * Returns true when the pass was read, so the caller reads the rest of it too. */
+static bool tick_inserts(struct ace2k_sensors *self, const struct ace2k_sensors_inputs *in)
 {
-    (void)now_ms;
+    bool settled = ace2k_catchup_settled(&self->catchup, in->now_ms, ACE2K_SENSORS_TICK_PERIOD_MS);
+    bool fresh_pass = (bool)(in->adc_valid && in->adc_age_ms <= ACE2K_SENSORS_ADC_STALE_MS);
+    if (!fresh_pass && in->adc_valid && !settled) {
+        return false;
+    }
+    self->insert_known = fresh_pass;
+    if (!fresh_pass) {
+        if (in->adc_valid) {
+            self->insert_reseed = true;
+        }
+        return false;
+    }
+    for (uint8_t i = 0; i < ACE2K_LANE_COUNT; i++) {
+        tick_insert(self, i, in);
+    }
+    self->adc_primed = true;
+    self->insert_reseed = false;
+    return true;
+}
+
+void ace2k_sensors_tick(struct ace2k_sensors *self, const struct ace2k_sensors_inputs *in)
+{
     self->adc_valid = in->adc_valid;
-    /* the input's age is meaningless without a pass: 0, so the report and the freshness test
-     * never see an indeterminate value */
+    /* The age of the input means nothing without a pass.  So it is 0, and the report and the
+     * freshness test never see an undefined value. */
     self->adc_age_ms = in->adc_valid ? in->adc_age_ms : 0;
+    /* The auxiliary input is read with the inserts, from a pass they read.  So the report never
+     * pairs it with insert readings of another pass. */
+    if (tick_inserts(self, in)) {
+        self->aux_mv = in->mv[ACE2K_ADC_AUX];
+    }
     for (uint8_t i = 0; i < ACE2K_LANE_COUNT; i++) {
         struct ace2k_sensors_lane *l = &self->lane[i];
-        if (in->adc_valid) {
-            tick_insert(self, i, in);
-        }
         /* active low: asserted when the pin reads 0 */
-        if (debounce(&l->rest, &l->rest_last, low_of(in, ACE2K_SENSORS_IN_REST1 + i),
+        if (debounce(&l->rest, &l->rest_last, (bool)!level_of(in, ACE2K_SENSORS_IN_REST1 + i),
                      self->primed)) {
             push_event(self, i, ACE2K_SENSORS_KIND_REST, l->rest);
         }
-        if (debounce(&l->pushed, &l->pushed_last, low_of(in, ACE2K_SENSORS_IN_PUSHED1 + i),
+        if (debounce(&l->pushed, &l->pushed_last, (bool)!level_of(in, ACE2K_SENSORS_IN_PUSHED1 + i),
                      self->primed)) {
             push_event(self, i, ACE2K_SENSORS_KIND_PUSHED, l->pushed);
         }
-        /* one store, after both debounces: what the health self-test reads (sensors.h) */
-        l->rest_and_pushed = both(l->rest, l->pushed);
+        /* one store, after both debounces; the health self-test reads it (sensors.h) */
+        l->rest_and_pushed = (bool)(l->rest && l->pushed);
     }
-    if (in->adc_valid) {
-        self->aux_mv = in->mv[ACE2K_ADC_AUX];
-        self->adc_primed = true;
-    }
-    if (debounce(&self->pulled, &self->pulled_last, low_of(in, ACE2K_SENSORS_IN_PULLED),
+    if (debounce(&self->pulled, &self->pulled_last, (bool)!level_of(in, ACE2K_SENSORS_IN_PULLED),
                  self->primed)) {
         push_event(self, ACE2K_SENSORS_LANE_NONE, ACE2K_SENSORS_KIND_PULLED, self->pulled);
     }
-    /* the cutout input idles low (docs/hardware.md); asserted = high */
+    /* the cutout input idles low (docs/hardware.md); asserted means high */
     if (debounce(&self->cutout, &self->cutout_last, level_of(in, ACE2K_SENSORS_IN_CUTOUT),
                  self->primed)) {
         push_event(self, ACE2K_SENSORS_LANE_NONE, ACE2K_SENSORS_KIND_CUTOUT, self->cutout);
@@ -217,6 +226,11 @@ bool ace2k_sensors_pop_event(struct ace2k_sensors *self, struct ace2k_sensors_ev
 bool ace2k_sensors_has_events(const struct ace2k_sensors *self)
 {
     return self->head != self->tail;
+}
+
+bool ace2k_sensors_insert_known(const struct ace2k_sensors *self)
+{
+    return self->insert_known;
 }
 
 bool ace2k_sensors_fresh(const struct ace2k_sensors *self)

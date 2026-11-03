@@ -1,6 +1,12 @@
 """ace2k_dryer.py: the presence checks per image, the G-codes and their refusals, the reports,
 the events, the log and its seeding — against the fake printer of test_ace2k_extras."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import ace2k
+import ace2k_dryer
 import pytest
 from test_ace2k_extras import (
     KNOWN_ALL_BUT_HEALTH,
@@ -9,7 +15,16 @@ from test_ace2k_extras import (
     FakeGcmd,
     FakeReactor,
     make,
+    make_units,
 )
+
+if TYPE_CHECKING:
+    from typing import Any
+
+    from ace2k import Ace2k
+    from ace2k_dryer import Ace2kDryer
+    from ace2k_klipper_types import Params
+    from test_ace2k_extras import FakeMcu, FakePrinter, Responses
 
 AIRFLOW_NAMES = {
     "ace2k_fan_set",
@@ -45,11 +60,16 @@ DRYER_RESPONSES = dict(
 )
 
 
-def dryer_of(printer):
+def dryer_of(printer: FakePrinter) -> Ace2kDryer:
     return printer.objects["ace2k_dryer"]
 
 
-def build(known=None, responses=None, options=None, formats=None):
+def build(
+    known: set[str] | None = None,
+    responses: Responses | None = None,
+    options: dict[str, Any] | None = None,
+    formats: dict[str, str] | None = None,
+) -> tuple[Ace2k, FakePrinter, FakeMcu, Ace2kDryer]:
     module, printer, mcu = make(
         dict(responses or DRYER_RESPONSES), options=options, known=known, formats=formats
     )
@@ -57,29 +77,29 @@ def build(known=None, responses=None, options=None, formats=None):
     return module, printer, mcu, dryer_of(printer)
 
 
-def gcode(printer, name, **params):
+def gcode(printer: FakePrinter, name: str, **params: object) -> FakeGcmd:
     gcmd = FakeGcmd({k: str(v) for k, v in params.items()})
     printer.objects["gcode"].commands[name](gcmd)
     return gcmd
 
 
-def sent_to(mcu, name):
+def sent_to(mcu: FakeMcu, name: str) -> list[list[Any]]:
     return [data for fmt, data in mcu.queries if fmt == name]
 
 
 def state_frame(
-    state=0,
-    target=0,
-    drive_dc=0,
-    duty=0,
-    remaining=0,
-    fans=0,
-    flaps=0,
-    fault=0,
-    notices=0,
-    lost=0,
-    oldest=0,
-):
+    state: int = 0,
+    target: int = 0,
+    drive_dc: int = 0,
+    duty: int = 0,
+    remaining: int = 0,
+    fans: int = 0,
+    flaps: int = 0,
+    fault: int = 0,
+    notices: int = 0,
+    lost: int = 0,
+    oldest: int = 0,
+) -> dict[str, int]:
     return {
         "state": state,
         "target_c": target,
@@ -95,7 +115,7 @@ def state_frame(
     }
 
 
-def test_a_release_dictionary_starts_the_two_reports():
+def test_a_release_dictionary_starts_the_two_reports() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     assert dryer.airflow_present and dryer.dryer_present
     init = [c for c, is_init in mcu.config_cmds if is_init]
@@ -109,44 +129,48 @@ def test_a_release_dictionary_starts_the_two_reports():
     assert not any(n.startswith("ace2k_heat_") for n in mcu.subscriptions)
 
 
-def test_an_image_without_the_dryer_keeps_fans_and_flaps_and_refuses_ace_dry(caplog):
+def test_an_image_without_the_dryer_keeps_fans_and_flaps_and_refuses_ace_dry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     with caplog.at_level("WARNING", logger="root"):
         module, printer, mcu, dryer = build(known=NO_DRYER)
     assert dryer.airflow_present and not dryer.dryer_present
     assert "CONFIG_ACE2K_DRYER" in caplog.text
     with pytest.raises(FakeGcmd.error, match="CONFIG_ACE2K_DRYER"):
-        gcode(printer, "ACE_DRY", TEMP=55, DURATION=60)
-    gcode(printer, "ACE_FAN", ON=1, SECONDS=10)
+        gcode(printer, "ACEK_DRY", TEMP=55, DURATION=60)
+    gcode(printer, "ACEK_FAN", ON=1, SECONDS=10)
     assert sent_to(mcu, "ace2k_fan_set") == [[1, 10]]
-    gcode(printer, "ACE_FLAP", WHICH="rear", OPEN=1)
+    gcode(printer, "ACEK_FLAP", WHICH="rear", OPEN=1)
     assert sent_to(mcu, "ace2k_flap_pulse") == [[1, 1]]
     init = [c for c, is_init in mcu.config_cmds if is_init]
     assert "ace2k_airflow_query rest_ticks=120000000" in init
     assert "ace2k_dryer_query rest_ticks=120000000" not in init
 
 
-def test_a_firmware_without_the_heat_disables_every_gcode_here(caplog):
+def test_a_firmware_without_the_heat_disables_every_gcode_here(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     with caplog.at_level("WARNING", logger="root"):
         module, printer, mcu, dryer = build(known=set(KNOWN_ALL_BUT_HEALTH))
     assert not (dryer.airflow_present or dryer.dryer_present)
     assert "CONFIG_ACE2K_HEAT" in caplog.text
     for name, params in (
-        ("ACE_DRY", {"TEMP": 55, "DURATION": 60}),
-        ("ACE_DRY_STOP", {}),
-        ("ACE_DRY_CLEAR", {}),
-        ("ACE_FAN", {"ON": 1}),
-        ("ACE_FLAP", {"WHICH": "rear", "OPEN": 1}),
-        ("ACE_DRYER_LOG", {}),
+        ("ACEK_DRY", {"TEMP": 55, "DURATION": 60}),
+        ("ACEK_DRY_STOP", {}),
+        ("ACEK_DRY_CLEAR", {}),
+        ("ACEK_FAN", {"ON": 1}),
+        ("ACEK_FLAP", {"WHICH": "rear", "OPEN": 1}),
+        ("ACEK_DRYER_LOG", {}),
     ):
         with pytest.raises(FakeGcmd.error, match="CONFIG_ACE2K_HEAT"):
             gcode(printer, name, **params)
     assert not any(c.startswith(("ace2k_airflow_", "ace2k_dryer_")) for c, _ in mcu.config_cmds)
     assert mcu.queries == []
-    gcmd = gcode(printer, "ACE_STATUS")
+    gcmd = gcode(printer, "ACEK_STATUS")
     assert "dryer:" not in gcmd.lines[0] and "airflow:" not in gcmd.lines[0]
 
 
-def test_a_dryer_format_from_another_commit_is_a_config_error():
+def test_a_dryer_format_from_another_commit_is_a_config_error() -> None:
     old = "ace2k_dryer_state state=%c target_c=%c duty=%c"
     with pytest.raises(Exception, match="ace2k_dryer_state.*different commits"):
         build(formats={"ace2k_dryer_state": old})
@@ -161,7 +185,7 @@ def test_a_dryer_format_from_another_commit_is_a_config_error():
         build(known=RELEASE - {"ace2k_dryer_log_query"})
 
 
-def test_the_v0_5_0_event_and_state_formats_are_a_config_error():
+def test_the_v0_5_0_event_and_state_formats_are_a_config_error() -> None:
     with pytest.raises(Exception, match="ace2k_dryer_event.*different commits"):
         build(formats={"ace2k_dryer_event": "ace2k_dryer_event kind=%c arg=%c"})
     old_state = (
@@ -182,9 +206,9 @@ def test_the_v0_5_0_event_and_state_formats_are_a_config_error():
     "text, minutes",
     [("4h", 240), ("90m", 90), ("1.5h", 90), ("45", 45), ("24h", 1440), (" 2H ", 120)],
 )
-def test_ace_dry_sends_the_temperature_and_the_minutes(text, minutes):
+def test_ace_dry_sends_the_temperature_and_the_minutes(text: str, minutes: int) -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
-    gcmd = gcode(printer, "ACE_DRY", TEMP=55, DURATION=text)
+    gcmd = gcode(printer, "ACEK_DRY", TEMP=55, DURATION=text)
     assert sent_to(mcu, "ace2k_dryer_start") == [[55, minutes]]
     assert "drying at 55 °C" in gcmd.lines[-1]
 
@@ -204,10 +228,12 @@ def test_ace_dry_sends_the_temperature_and_the_minutes(text, minutes):
         ({"TEMP": 14, "DURATION": "60"}, "TEMP"),
     ],
 )
-def test_ace_dry_refuses_bad_arguments_before_it_sends(params, words):
+def test_ace_dry_refuses_bad_arguments_before_it_sends(
+    params: dict[str, int | str], words: str
+) -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     with pytest.raises(FakeGcmd.error, match=words):
-        gcode(printer, "ACE_DRY", **params)
+        gcode(printer, "ACEK_DRY", **params)
     assert sent_to(mcu, "ace2k_dryer_start") == []
 
 
@@ -222,46 +248,123 @@ def test_ace_dry_refuses_bad_arguments_before_it_sends(params, words):
         (6, "power-cycle the unit"),
         (7, "cooling down"),
         (8, "Klipper shutdown — FIRMWARE_RESTART"),
-        (9, "the mains has just come back — its frequency is being measured; try ACE_DRY again"),
+        (9, "the mains has just come back — its frequency is being measured; try ACEK_DRY again"),
         (99, "reason 99"),
     ],
 )
-def test_each_dryer_refusal_is_named(reason, words):
+def test_each_dryer_refusal_is_named(reason: int, words: str) -> None:
     responses = dict(DRYER_RESPONSES, ace2k_dryer_start={"op": 0, "accepted": 0, "reason": reason})
     module, printer, mcu, dryer = build(known=RELEASE, responses=responses)
     with pytest.raises(FakeGcmd.error, match=words):
-        gcode(printer, "ACE_DRY", TEMP=55, DURATION=60)
+        gcode(printer, "ACEK_DRY", TEMP=55, DURATION=60)
 
 
-def test_stop_and_clear_are_sent_and_a_refused_clear_is_named():
+def test_stop_and_clear_are_sent_and_a_refused_clear_is_named() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
-    gcmd = gcode(printer, "ACE_DRY_STOP")
+    gcmd = gcode(printer, "ACEK_DRY_STOP")
     assert sent_to(mcu, "ace2k_dryer_stop") == [[]]
     assert "cools the heater down" in gcmd.lines[-1]
-    gcode(printer, "ACE_DRY_CLEAR")
+    gcode(printer, "ACEK_DRY_CLEAR")
     assert sent_to(mcu, "ace2k_dryer_clear") == [[]]
     responses = dict(DRYER_RESPONSES, ace2k_dryer_clear={"op": 2, "accepted": 0, "reason": 7})
     module, printer, mcu, dryer = build(known=RELEASE, responses=responses)
     with pytest.raises(FakeGcmd.error, match="cooling down"):
-        gcode(printer, "ACE_DRY_CLEAR")
+        gcode(printer, "ACEK_DRY_CLEAR")
     responses = dict(DRYER_RESPONSES, ace2k_dryer_clear={"op": 2, "accepted": 0, "reason": 6})
     module, printer, mcu, dryer = build(known=RELEASE, responses=responses)
     with pytest.raises(FakeGcmd.error, match="power-cycle the unit"):
-        gcode(printer, "ACE_DRY_CLEAR")
+        gcode(printer, "ACEK_DRY_CLEAR")
 
 
-def printer_error():
+# --- the host calls: start, stop and clear from a host module (API_VERSION 13) ----------------
+
+
+def test_the_host_calls_send_their_requests_and_return_on_acceptance() -> None:
+    module, printer, mcu, dryer = build(known=RELEASE)
+    assert dryer.start(55, 240) is None
+    assert sent_to(mcu, "ace2k_dryer_start") == [[55, 240]]
+    assert dryer.stop() is None
+    assert sent_to(mcu, "ace2k_dryer_stop") == [[]]
+    assert dryer.clear() is None
+    assert sent_to(mcu, "ace2k_dryer_clear") == [[]]
+
+
+@pytest.mark.parametrize(
+    "call, response, reason, name",
+    [
+        ("start", "ace2k_dryer_start", 1, "busy"),
+        ("start", "ace2k_dryer_start", 8, "shutdown"),
+        ("start", "ace2k_dryer_start", 9, "measuring"),
+        ("stop", "ace2k_dryer_stop", 3, "faulted"),
+        ("clear", "ace2k_dryer_clear", 7, "not_cool"),
+        ("clear", "ace2k_dryer_clear", 6, "cutout"),
+        ("clear", "ace2k_dryer_clear", 99, "reason 99"),
+    ],
+)
+def test_a_refused_host_call_raises_dryer_refused_with_the_reason_name(
+    call: str, response: str, reason: int, name: str
+) -> None:
+    op = {"start": 0, "stop": 1, "clear": 2}[call]
+    responses = dict(DRYER_RESPONSES, **{response: {"op": op, "accepted": 0, "reason": reason}})
+    module, printer, mcu, dryer = build(known=RELEASE, responses=responses)
+    args = (55, 60) if call == "start" else ()
+    with pytest.raises(ace2k_dryer.DryerRefused) as caught:
+        getattr(dryer, call)(*args)
+    assert (caught.value.what, caught.value.reason, caught.value.code) == (call, name, reason)
+    # the reason's name, not the G-code's advice: no G-code ran
+    assert str(caught.value) == f"ace2k: dryer {call} refused: {name}"
+
+
+@pytest.mark.parametrize("target, minutes", [(14, 60), (66, 60), (55, 0), (55, 1441), (55.5, 60)])
+def test_a_start_out_of_range_is_a_value_error_before_it_sends(target: float, minutes: int) -> None:
+    module, printer, mcu, dryer = build(known=RELEASE)
+    with pytest.raises(ValueError):
+        dryer.start(target, minutes)
+    assert sent_to(mcu, "ace2k_dryer_start") == []
+
+
+def test_the_host_calls_on_an_image_without_the_dryer_or_with_no_answer_raise() -> None:
+    module, printer, mcu, dryer = build(known=NO_DRYER)
+    for call, args in (("start", (55, 60)), ("stop", ()), ("clear", ())):
+        with pytest.raises(RuntimeError, match="CONFIG_ACE2K_DRYER"):
+            getattr(dryer, call)(*args)
+    module, printer, mcu, dryer = build(known=set(KNOWN_ALL_BUT_HEALTH))
+    with pytest.raises(RuntimeError, match="CONFIG_ACE2K_HEAT"):
+        dryer.stop()
+    responses = dict(DRYER_RESPONSES, ace2k_dryer_stop=[printer_error()])
+    module, printer, mcu, dryer = build(known=RELEASE, responses=responses)
+    with pytest.raises(ace2k.NoAnswerError, match="no answer from the unit"):
+        dryer.stop()
+
+
+def printer_error() -> FakeCommandError:
     return FakeCommandError("Timeout on wait for 'ace2k_dryer_response' response")
 
 
-def test_an_unanswered_request_is_a_gcode_error_not_a_crash():
+def test_an_unanswered_request_is_a_gcode_error_not_a_crash() -> None:
     responses = dict(DRYER_RESPONSES, ace2k_dryer_stop=[printer_error()])
     module, printer, mcu, dryer = build(known=RELEASE, responses=responses)
-    with pytest.raises(FakeGcmd.error, match="no answer from the unit"):
-        gcode(printer, "ACE_DRY_STOP")
+    with pytest.raises(
+        FakeGcmd.error,
+        match=r"^ace2k: ace2k_dryer_stop: no answer from the unit; check the link \(Timeout",
+    ):
+        gcode(printer, "ACEK_DRY_STOP")
 
 
-def test_the_state_report_lands_in_the_status_and_ace_status():
+def test_a_dryer_request_is_sent_under_the_units_query_mutex() -> None:
+    held = []
+
+    def answer() -> dict[str, int]:
+        held.append(ace2k.query_mutex(printer, mcu).depth)
+        return {"op": 1, "accepted": 1, "reason": 0}
+
+    responses = dict(DRYER_RESPONSES, ace2k_dryer_stop=answer)
+    module, printer, mcu, dryer = build(known=RELEASE, responses=responses)
+    gcode(printer, "ACEK_DRY_STOP")
+    assert held == [1]
+
+
+def test_the_state_report_lands_in_the_status_and_ace_status() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     mcu.config_callback()  # a reconnect
     mcu.subscriptions["ace2k_dryer_state"](
@@ -273,11 +376,11 @@ def test_the_state_report_lands_in_the_status_and_ace_status():
     assert st["fans"] == {"left": True, "right": True}
     assert st["flaps"] == {"bottom": "closed", "rear": "closed"}
     assert (st["fault"], st["notices"]) == (None, [])
-    gcmd = gcode(printer, "ACE_STATUS")
+    gcmd = gcode(printer, "ACEK_STATUS")
     assert "dryer: heating 55 °C (drive 62.0 °C, duty 40 %), 3 h 12 min left" in gcmd.lines[0]
 
 
-def test_the_flaps_fault_is_named_apart_from_the_fans():
+def test_the_flaps_fault_is_named_apart_from_the_fans() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     mcu.subscriptions["ace2k_dryer_state"](state_frame(state=4, target=55, fault=11))
     assert dryer.status()["fault"] == "flaps"
@@ -285,7 +388,13 @@ def test_the_flaps_fault_is_named_apart_from_the_fans():
     assert dryer.status()["fault"] == "fans"
 
 
-def test_a_fault_the_notices_and_an_unknown_flap_are_named():
+def test_the_lid_fault_is_named() -> None:
+    module, printer, mcu, dryer = build(known=RELEASE)
+    mcu.subscriptions["ace2k_dryer_state"](state_frame(state=4, target=55, fault=12))
+    assert dryer.status()["fault"] == "lid"
+
+
+def test_a_fault_the_notices_and_an_unknown_flap_are_named() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     mcu.subscriptions["ace2k_dryer_state"](
         state_frame(state=4, target=65, fans=1, flaps=0b0001, fault=4, notices=0x3)
@@ -300,7 +409,7 @@ def test_a_fault_the_notices_and_an_unknown_flap_are_named():
     assert (st["state"], st["target"], st["drive"]) == ("idle", None, None)
 
 
-def test_a_mains_dip_ridden_out_is_named():
+def test_a_mains_dip_ridden_out_is_named() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     mcu.subscriptions["ace2k_dryer_state"](state_frame(state=2, target=55, notices=0x8))
     assert dryer.status()["notices"] == ["mains_dip"]
@@ -308,7 +417,7 @@ def test_a_mains_dip_ridden_out_is_named():
     assert dryer.status()["notices"] == ["hot_ambient", "mains_dip"]
 
 
-def test_edges_off_phase_is_named():
+def test_edges_off_phase_is_named() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     mcu.subscriptions["ace2k_dryer_state"](state_frame(state=2, target=55, notices=0x10))
     assert dryer.status()["notices"] == ["edges_off_phase"]
@@ -316,7 +425,9 @@ def test_edges_off_phase_is_named():
     assert dryer.status()["notices"] == ["mains_dip", "edges_off_phase"]
 
 
-def test_a_log_that_cannot_be_stored_is_a_notice_and_a_warning(caplog):
+def test_a_log_that_cannot_be_stored_is_a_notice_and_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     with caplog.at_level("WARNING", logger="root"):
         mcu.subscriptions["ace2k_dryer_state"](state_frame(notices=0x4))
@@ -330,13 +441,13 @@ def test_a_log_that_cannot_be_stored_is_a_notice_and_a_warning(caplog):
     assert "cannot store" not in "\n".join(dryer.status_lines())
 
 
-def test_an_unknown_notice_bit_is_kept_by_number_not_an_error():
+def test_an_unknown_notice_bit_is_kept_by_number_not_an_error() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     mcu.subscriptions["ace2k_dryer_state"](state_frame(state=2, notices=0x1 | 0x40 | 0x80))
     assert dryer.status()["notices"] == ["hot_ambient", "notice_0x40", "notice_0x80"]
 
 
-def test_the_airflow_report_names_the_owner_and_the_read_back():
+def test_the_airflow_report_names_the_owner_and_the_read_back() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     mcu.subscriptions["ace2k_airflow_state"](
         {"fans_cmd": 1, "fans_read": 2, "owner": 3, "flaps": 0b0110}
@@ -353,12 +464,12 @@ def test_the_airflow_report_names_the_owner_and_the_read_back():
     assert dryer.status()["owner"] == "manual"
 
 
-def _connected(mcu, oldest=0):
+def _connected(mcu: FakeMcu, oldest: int = 0) -> None:
     """The first state report after a connect: the unit's oldest unacknowledged event."""
     mcu.subscriptions["ace2k_dryer_state"](state_frame(oldest=oldest))
 
 
-def test_every_event_is_a_klipper_event_and_a_log_line(caplog):
+def test_every_event_is_a_klipper_event_and_a_log_line(caplog: pytest.LogCaptureFixture) -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     _connected(mcu, 0)
     with caplog.at_level("INFO", logger="root"):
@@ -368,19 +479,129 @@ def test_every_event_is_a_klipper_event_and_a_log_line(caplog):
         mcu.subscriptions["ace2k_dryer_event"]({"kind": 0, "arg": 0, "seq": 2})
         mcu.subscriptions["ace2k_dryer_event"]({"kind": 42, "arg": 5, "seq": 3})
     events = [params[0] for name, params in printer.events if name == "ace2k:dryer"]
-    assert events[0] == {"kind": "fault", "arg": 8, "reason": "cutout"}
-    assert events[1] == {"kind": "lowered", "arg": 2, "lane": 2}
-    assert events[2] == {"kind": "done", "arg": 0}
-    assert events[3] == {"kind": 42, "arg": 5}
+    assert events[0] == {"kind": "fault", "arg": 8, "reason": "cutout", "unit": None}
+    assert events[1] == {"kind": "lowered", "arg": 2, "lane": 2, "unit": None}
+    assert events[2] == {"kind": "done", "arg": 0, "unit": None}
+    assert events[3] == {"kind": 42, "arg": 5, "unit": None}
     assert "ace2k dryer: fault cutout" in caplog.text and "power-cycle" in caplog.text
     assert "lane 2" in caplog.text and "45 °C" in caplog.text
     assert "ace2k dryer: cycle done" in caplog.text
 
 
+def test_the_lid_fault_line_asks_about_the_lid_and_the_others_keep_their_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    module, printer, mcu, dryer = build(known=RELEASE)
+    _connected(mcu, 0)
+    with caplog.at_level("INFO", logger="root"):
+        mcu.subscriptions["ace2k_dryer_event"]({"kind": 2, "arg": 12, "seq": 0})
+        mcu.subscriptions["ace2k_dryer_event"]({"kind": 2, "arg": 3, "seq": 1})
+    assert (
+        "ace2k dryer: fault lid — the chamber does not follow the heater: is the lid open?"
+        " The heater stopped; the fans cool it down (ACEK_DRY_CLEAR once it is cool)"
+    ) in caplog.text
+    assert "ace2k dryer: fault sides — the heater stopped; the fans cool it down" in caplog.text
+    assert "fault sides — the heater stopped; the fans cool it down (" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("fault", "text"),
+    [
+        (12, "automatic cycle ended by the lid fault (1 failed in a row)"),
+        (None, "automatic cycle done but the box is still humid (1 failed in a row)"),
+        (3, "automatic cycle done but the box is still humid (1 failed in a row)"),
+    ],
+)
+def test_auto_failed_names_the_lid_only_right_after_a_lid_fault(
+    fault: int | None, text: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    module, printer, mcu, dryer = build(known=RELEASE)
+    _connected(mcu, 0)
+    seq = 0
+    with caplog.at_level("INFO", logger="root"):
+        if fault is not None:
+            mcu.subscriptions["ace2k_dryer_event"]({"kind": 2, "arg": fault, "seq": seq})
+            seq += 1
+        mcu.subscriptions["ace2k_dryer_event"]({"kind": 10, "arg": 1, "seq": seq})
+        # the memory is used up: the next auto_failed reads the plain text again
+        mcu.subscriptions["ace2k_dryer_event"]({"kind": 10, "arg": 2, "seq": seq + 1})
+    assert f"ace2k dryer: {text}" in caplog.text
+    assert "automatic cycle done but the box is still humid (2 failed in a row)" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("kind", "arg", "name", "text", "level"),
+    [
+        (
+            8,
+            45,
+            "auto_started",
+            "automatic cycle started at 45 °C: the box stayed at or above",
+            "INFO",
+        ),
+        (9, 31, "auto_dry", "automatic cycle done: the box reads 31 % cold", "INFO"),
+        (10, 2, "auto_failed", "the box is still humid (2 failed in a row)", "INFO"),
+        (11, 4, "auto_stopped", "the humidity mode stopped after 4 failed cycles", "WARNING"),
+        (
+            12,
+            0,
+            "auto_off",
+            "the humidity mode is off: an automatic cycle was stopped by hand",
+            "INFO",
+        ),
+        (
+            13,
+            0,
+            "stopped_link",
+            "the print mode's cycle ended: the host was gone for the link time",
+            "WARNING",
+        ),
+    ],
+)
+def test_the_modes_events_are_named_and_logged(
+    kind: int, arg: int, name: str, text: str, level: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    module, printer, mcu, dryer = build(known=RELEASE)
+    _connected(mcu, 0)
+    with caplog.at_level("INFO", logger="root"):
+        mcu.subscriptions["ace2k_dryer_event"]({"kind": kind, "arg": arg, "seq": 0})
+    events = [params[0] for n, params in printer.events if n == "ace2k:dryer"]
+    assert events == [{"kind": name, "arg": arg, "unit": None}]
+    (record,) = [r for r in caplog.records if text in r.getMessage()]
+    assert record.levelname == level
+    console = printer.objects["gcode"].output
+    (line,) = [c for c in console if text in c]  # said once on the console
+    assert line.startswith("ace2k dryer: ")
+    mcu.subscriptions["ace2k_dryer_event"]({"kind": kind, "arg": arg, "seq": 0})  # a resend
+    assert len([c for c in console if text in c]) == 1
+
+
+def test_the_other_events_stay_in_the_log_only() -> None:
+    module, printer, mcu, dryer = build(known=RELEASE)
+    _connected(mcu, 0)
+    for seq, kind in enumerate((0, 1, 2, 3, 4, 5, 6, 7)):
+        mcu.subscriptions["ace2k_dryer_event"]({"kind": kind, "arg": 1, "seq": seq})
+    assert not any("dryer:" in c for c in printer.objects["gcode"].output)
+
+
+def test_a_modes_event_names_its_unit_on_the_console() -> None:
+    units, printer, mcus = make_units(responses=DRYER_RESPONSES)
+    mcu = mcus["b"]
+    mcu.known = RELEASE
+    mcu.config_callback()
+    _connected(mcu, 0)
+    mcu.subscriptions["ace2k_dryer_event"]({"kind": 8, "arg": 45, "seq": 0})
+    assert printer.objects["gcode"].output == [
+        "ace2k b: dryer: automatic cycle started at 45 °C: the box stayed at or above the limit"
+    ]
+
+
 ACK = "ace2k_dryer_event_ack seq=%c"
 
 
-def test_every_event_is_acknowledged_and_a_resend_is_handled_once(caplog):
+def test_every_event_is_acknowledged_and_a_resend_is_handled_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     _connected(mcu, 7)
     with caplog.at_level("INFO", logger="root"):
@@ -394,23 +615,23 @@ def test_every_event_is_acknowledged_and_a_resend_is_handled_once(caplog):
     assert caplog.text.count("cycle done") == 1
 
 
-def _event(mcu, seq, kind=6):
+def _event(mcu: FakeMcu, seq: int, kind: int = 6) -> None:
     mcu.subscriptions["ace2k_dryer_event"]({"kind": kind, "arg": 0, "seq": seq})
 
 
-def _acks(mcu):
+def _acks(mcu: FakeMcu) -> list[Any]:
     return [d[0] for fmt, d in mcu.commands if fmt == ACK]
 
 
-def _handled(printer):
+def _handled(printer: FakePrinter) -> list[Params]:
     return [p[0] for name, p in printer.events if name == "ace2k:dryer"]
 
 
-def _queries(mcu):
+def _queries(mcu: FakeMcu) -> list[list[Any]]:
     return [d for fmt, d in mcu.commands if fmt == "ace2k_dryer_query rest_ticks=%u"]
 
 
-def test_a_lost_event_holds_the_acknowledgement_until_its_resend_arrives():
+def test_a_lost_event_holds_the_acknowledgement_until_its_resend_arrives() -> None:
     """The unit's acknowledgement is cumulative: acknowledging 3 with 2 lost would drop 2."""
     module, printer, mcu, dryer = build(known=RELEASE)
     _connected(mcu, 1)
@@ -430,7 +651,7 @@ def test_a_lost_event_holds_the_acknowledgement_until_its_resend_arrives():
     assert _acks(mcu)[-3:] == [3, 3, 3]
 
 
-def test_the_sequence_is_contiguous_across_the_wrap():
+def test_the_sequence_is_contiguous_across_the_wrap() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     _connected(mcu, 254)
     for seq in (254, 255, 0, 1):
@@ -442,7 +663,7 @@ def test_the_sequence_is_contiguous_across_the_wrap():
     assert len(_handled(printer)) == 4
 
 
-def test_events_before_the_first_state_report_are_held_then_handled_from_its_base():
+def test_events_before_the_first_state_report_are_held_then_handled_from_its_base() -> None:
     """After a connect the base is the first report's oldest: an event before it is neither
     handled nor acknowledged, then taken in order from the base — a fresh one that arrived ahead
     of the resend included."""
@@ -462,7 +683,7 @@ def test_events_before_the_first_state_report_are_held_then_handled_from_its_bas
     assert _acks(mcu)[-1] == 12
 
 
-def test_a_lost_first_resend_frame_is_still_handled():
+def test_a_lost_first_resend_frame_is_still_handled() -> None:
     """The resend's first frame lost on the wire: the base is the unit's, so the next one is a
     gap — a query asks the resend, and the lost event is handled, never acknowledged unhandled."""
     module, printer, mcu, dryer = build(known=RELEASE)
@@ -476,7 +697,7 @@ def test_a_lost_first_resend_frame_is_still_handled():
     assert _acks(mcu)[-2:] == [20, 21]
 
 
-def test_a_host_restart_without_a_unit_reset_takes_the_base_from_the_unit():
+def test_a_host_restart_without_a_unit_reset_takes_the_base_from_the_unit() -> None:
     """The unit went on counting: its first report after the restart names 40, the oldest the old
     host had not acknowledged; 38 and 39 (acknowledged) are never handled again."""
     module, printer, mcu, dryer = build(known=RELEASE)
@@ -488,7 +709,7 @@ def test_a_host_restart_without_a_unit_reset_takes_the_base_from_the_unit():
     assert _acks(mcu) == [39, 40, 41]
 
 
-def test_the_base_is_taken_from_the_first_report_only():
+def test_the_base_is_taken_from_the_first_report_only() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     _connected(mcu, 5)
     _event(mcu, 5)
@@ -498,7 +719,7 @@ def test_the_base_is_taken_from_the_first_report_only():
     assert len(_handled(printer)) == 2
 
 
-def test_a_gap_within_a_connection_asks_the_resend_at_once_and_once():
+def test_a_gap_within_a_connection_asks_the_resend_at_once_and_once() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     _connected(mcu, 5)
     _event(mcu, 5)
@@ -517,7 +738,7 @@ def test_a_gap_within_a_connection_asks_the_resend_at_once_and_once():
     assert len(_queries(mcu)) == 2
 
 
-def test_the_acknowledgement_and_the_gap_query_are_sent_from_the_reactor():
+def test_the_acknowledgement_and_the_gap_query_are_sent_from_the_reactor() -> None:
     """The event handler runs in the serial thread: its commands go out from the reactor, through
     register_async_callback, never sent from the handler itself."""
     module, printer, mcu, dryer = build(known=RELEASE)
@@ -533,7 +754,9 @@ def test_the_acknowledgement_and_the_gap_query_are_sent_from_the_reactor():
     assert len(_queries(mcu)) == 1
 
 
-def test_a_reconnect_forgets_the_sequences_so_the_boot_cutout_is_handled(caplog):
+def test_a_reconnect_forgets_the_sequences_so_the_boot_cutout_is_handled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """The base is forgotten at the config callback, which Klipper runs at every connect (a host
     restart over a unit already configured included) — the module's only call site."""
     module, printer, mcu, dryer = build(known=RELEASE)
@@ -547,12 +770,12 @@ def test_a_reconnect_forgets_the_sequences_so_the_boot_cutout_is_handled(caplog)
         mcu.subscriptions["ace2k_dryer_event"]({"kind": 2, "arg": 8, "seq": 0})
         _connected(mcu, 0)
     events = [p[0] for name, p in printer.events if name == "ace2k:dryer"]
-    assert events[-1] == {"kind": "fault", "arg": 8, "reason": "cutout"}
+    assert events[-1] == {"kind": "fault", "arg": 8, "reason": "cutout", "unit": None}
     assert "fault cutout" in caplog.text
     assert [d for fmt, d in mcu.commands if fmt == ACK][-1] == [0]
 
 
-def test_lost_events_are_shown_only_when_there_are_some(caplog):
+def test_lost_events_are_shown_only_when_there_are_some(caplog: pytest.LogCaptureFixture) -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     assert dryer.status()["events_lost"] == 0
     mcu.subscriptions["ace2k_dryer_state"](state_frame(lost=0))
@@ -567,7 +790,7 @@ def test_lost_events_are_shown_only_when_there_are_some(caplog):
     assert not any("events lost" in line for line in dryer.status_lines())
 
 
-def _lost_lines(caplog, level):
+def _lost_lines(caplog: pytest.LogCaptureFixture, level: str) -> list[str]:
     return [
         r.getMessage()
         for r in caplog.records
@@ -576,7 +799,9 @@ def _lost_lines(caplog, level):
 
 
 @pytest.mark.parametrize("reconnect", [False, True])
-def test_the_lost_count_at_a_connect_is_information_once_not_a_warning(reconnect, caplog):
+def test_the_lost_count_at_a_connect_is_information_once_not_a_warning(
+    reconnect: bool, caplog: pytest.LogCaptureFixture
+) -> None:
     """The unit counts since its boot: after a host restart (a new session, or a reconnect) the
     first report's count is stated once as information; only a count that grows is a warning."""
     module, printer, mcu, dryer = build(known=RELEASE)
@@ -595,7 +820,7 @@ def test_the_lost_count_at_a_connect_is_information_once_not_a_warning(reconnect
     ]
 
 
-def test_ambient_above_and_measuring_are_named():
+def test_ambient_above_and_measuring_are_named() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     mcu.subscriptions["ace2k_dryer_state"](state_frame(state=2, target=15, notices=0x20))
     assert dryer.status()["notices"] == ["ambient_above"]
@@ -608,40 +833,40 @@ def test_ambient_above_and_measuring_are_named():
     responses = dict(DRYER_RESPONSES, ace2k_dryer_start={"op": 0, "accepted": 0, "reason": 9})
     module, printer, mcu, dryer = build(known=RELEASE, responses=responses)
     with pytest.raises(FakeGcmd.error, match="being measured"):
-        gcode(printer, "ACE_DRY", TEMP=55, DURATION=60)
+        gcode(printer, "ACEK_DRY", TEMP=55, DURATION=60)
 
 
-def test_ace_fan_and_ace_flap_send_and_name_a_refusal():
+def test_ace_fan_and_ace_flap_send_and_name_a_refusal() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
-    gcode(printer, "ACE_FAN", ON=1, SECONDS=30)
-    gcode(printer, "ACE_FAN", ON=1)
-    gcode(printer, "ACE_FAN", ON=0)
+    gcode(printer, "ACEK_FAN", ON=1, SECONDS=30)
+    gcode(printer, "ACEK_FAN", ON=1)
+    gcode(printer, "ACEK_FAN", ON=0)
     assert sent_to(mcu, "ace2k_fan_set") == [[1, 30], [1, 60], [0, 0]]
-    gcode(printer, "ACE_FLAP", WHICH="rear", OPEN=1)
-    gcode(printer, "ACE_FLAP", WHICH="BOTTOM", OPEN=0)
+    gcode(printer, "ACEK_FLAP", WHICH="rear", OPEN=1)
+    gcode(printer, "ACEK_FLAP", WHICH="BOTTOM", OPEN=0)
     assert sent_to(mcu, "ace2k_flap_pulse") == [[1, 1], [0, 0]]
     with pytest.raises(FakeGcmd.error, match="WHICH"):
-        gcode(printer, "ACE_FLAP", WHICH="side", OPEN=1)
+        gcode(printer, "ACEK_FLAP", WHICH="side", OPEN=1)
     with pytest.raises(FakeGcmd.error, match="SECONDS of at most 600"):
-        gcode(printer, "ACE_FAN", ON=1, SECONDS=601)
+        gcode(printer, "ACEK_FAN", ON=1, SECONDS=601)
     responses = dict(DRYER_RESPONSES, ace2k_fan_set={"op": 0, "accepted": 0, "reason": 1})
     module, printer, mcu, dryer = build(known=RELEASE, responses=responses)
     with pytest.raises(FakeGcmd.error, match="holds the fans and flaps"):
-        gcode(printer, "ACE_FAN", ON=1)
+        gcode(printer, "ACEK_FAN", ON=1)
     responses = dict(DRYER_RESPONSES, ace2k_flap_pulse={"op": 1, "accepted": 0, "reason": 2})
     module, printer, mcu, dryer = build(known=RELEASE, responses=responses)
     with pytest.raises(FakeGcmd.error, match="rear flap refused: out of range"):
-        gcode(printer, "ACE_FLAP", WHICH="rear", OPEN=1)
+        gcode(printer, "ACEK_FLAP", WHICH="rear", OPEN=1)
     # busy for a flap: the dryer's hold, or another pulse still running
     responses = dict(DRYER_RESPONSES, ace2k_flap_pulse={"op": 1, "accepted": 0, "reason": 1})
     module, printer, mcu, dryer = build(known=RELEASE, responses=responses)
     with pytest.raises(FakeGcmd.error, match="bottom flap refused: busy.*another flap pulse"):
-        gcode(printer, "ACE_FLAP", WHICH="bottom", OPEN=1)
+        gcode(printer, "ACEK_FLAP", WHICH="bottom", OPEN=1)
 
 
-def test_ace_fan_off_says_the_request_was_released_not_that_the_fans_are_off():
+def test_ace_fan_off_says_the_request_was_released_not_that_the_fans_are_off() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
-    gcmd = gcode(printer, "ACE_FAN", ON=0)
+    gcmd = gcode(printer, "ACEK_FAN", ON=0)
     assert "released" in gcmd.lines[-1]
     assert "45 °C" in gcmd.lines[-1]
     assert "fans off" not in gcmd.lines[-1]
@@ -649,23 +874,32 @@ def test_ace_fan_off_says_the_request_was_released_not_that_the_fans_are_off():
     mcu.subscriptions["ace2k_airflow_state"](
         {"fans_cmd": 1, "fans_read": 3, "owner": 1, "flaps": 0}
     )
-    gcmd = gcode(printer, "ACE_FAN", ON=0)
+    gcmd = gcode(printer, "ACEK_FAN", ON=0)
     assert "released" in gcmd.lines[-1] and "commanded on" in gcmd.lines[-1]
     assert "fans off" not in gcmd.lines[-1]
 
 
-def test_the_release_flap_refuses_a_pulse_length_and_sends_nothing():
+def test_ace_fan_off_with_seconds_is_refused_and_the_fans_are_not_touched() -> None:
+    module, printer, mcu, dryer = build(known=RELEASE)
+    with pytest.raises(FakeGcmd.error, match="SECONDS applies only with ON=1"):
+        gcode(printer, "ACEK_FAN", ON=0, SECONDS=30)
+    assert sent_to(mcu, "ace2k_fan_set") == []
+
+
+def test_the_release_flap_refuses_a_pulse_length_and_sends_nothing() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     with pytest.raises(FakeGcmd.error, match="takes no MS="):
-        gcode(printer, "ACE_FLAP", WHICH="rear", OPEN=1, MS=200)
+        gcode(printer, "ACEK_FLAP", WHICH="rear", OPEN=1, MS=200)
     assert sent_to(mcu, "ace2k_flap_pulse") == []
 
 
-def log_frame(index, a=0, b=0, c=0, d=0, e=0, f=0):
+def log_frame(
+    index: int, a: int = 0, b: int = 0, c: int = 0, d: int = 0, e: int = 0, f: int = 0
+) -> dict[str, int]:
     return {"index": index, "a": a, "b": b, "c": c, "d": d, "e": e, "f": f}
 
 
-def test_ace_dryer_log_prints_the_counters_the_energy_and_the_entries():
+def test_ace_dryer_log_prints_the_counters_the_energy_and_the_entries() -> None:
     fault = 2 | (4 << 8) | (12 << 16)  # kind fault, reason chamber_over, cycle 12
     interrupted = 4 | (0 << 8) | (11 << 16)
     minus_5 = (1 << 32) - 50  # -5.0 °C sign-extended to 32 bits
@@ -682,7 +916,7 @@ def test_ace_dryer_log_prints_the_counters_the_energy_and_the_entries():
         ],
     )
     module, printer, mcu, dryer = build(known=RELEASE, responses=responses, options={})
-    gcmd = gcode(printer, "ACE_DRYER_LOG")
+    gcmd = gcode(printer, "ACEK_DRYER_LOG")
     text = gcmd.lines[-1]
     assert "12 cycles started, 10 completed, 1 fault;" in text
     assert "10.0 h of heating" in text and "720 Wh at 360 W" in text
@@ -696,7 +930,7 @@ def test_ace_dryer_log_prints_the_counters_the_energy_and_the_entries():
     assert sent_to(mcu, "ace2k_dryer_log_query") == [[0], [1], [2], [3], [4], [0]]
 
 
-def test_a_full_log_stops_after_eight_entries_and_names_the_cutout():
+def test_a_full_log_stops_after_eight_entries_and_names_the_cutout() -> None:
     entry = log_frame(1, a=2 | (8 << 8) | (3 << 16), b=3600, c=700, d=700, e=500)
     responses = dict(
         DRYER_RESPONSES,
@@ -705,7 +939,7 @@ def test_a_full_log_stops_after_eight_entries_and_names_the_cutout():
         + [log_frame(0, a=3, b=1, e=9, f=0x2)],
     )
     module, printer, mcu, dryer = build(known=RELEASE, responses=responses)
-    text = gcode(printer, "ACE_DRYER_LOG").lines[-1]
+    text = gcode(printer, "ACEK_DRYER_LOG").lines[-1]
     assert "9 faults" in text and "power-cycle the unit" in text
     assert text.count("fault cutout") == 8
     assert sent_to(mcu, "ace2k_dryer_log_query") == [[n] for n in range(9)] + [[0]]
@@ -715,7 +949,7 @@ FAULT_FANS = 2 | (10 << 8) | (5 << 16)
 FAULT_CHAMBER = 2 | (4 << 8) | (6 << 16)
 
 
-def test_a_log_that_changes_while_read_is_read_again_until_it_holds():
+def test_a_log_that_changes_while_read_is_read_again_until_it_holds() -> None:
     before = log_frame(0, a=5, b=4, e=1)
     after = log_frame(0, a=6, b=4, e=2)  # a fault appended during the first read
     responses = dict(
@@ -733,7 +967,7 @@ def test_a_log_that_changes_while_read_is_read_again_until_it_holds():
         ],
     )
     module, printer, mcu, dryer = build(known=RELEASE, responses=responses)
-    text = gcode(printer, "ACE_DRYER_LOG").lines[-1]
+    text = gcode(printer, "ACEK_DRYER_LOG").lines[-1]
     assert "6 cycles started, 4 completed, 2 faults" in text
     assert "#1 cycle 6 at 1.0 h: fault chamber_over" in text
     assert "#2 cycle 5 at 1.0 h: fault fans" in text
@@ -742,10 +976,10 @@ def test_a_log_that_changes_while_read_is_read_again_until_it_holds():
     assert dryer.log_counters["faults"] == 2
 
 
-def test_a_log_that_never_holds_is_printed_from_the_last_read_with_a_note():
+def test_a_log_that_never_holds_is_printed_from_the_last_read_with_a_note() -> None:
     counter = iter(range(1, 100))
 
-    def counters():
+    def counters() -> dict[str, int]:
         n = next(counter)
         return log_frame(0, a=n, e=n)
 
@@ -754,14 +988,14 @@ def test_a_log_that_never_holds_is_printed_from_the_last_read_with_a_note():
         frames += [counters(), log_frame(1, a=FAULT_FANS, b=3600), log_frame(2), counters()]
     responses = dict(DRYER_RESPONSES, ace2k_dryer_log_query=frames)
     module, printer, mcu, dryer = build(known=RELEASE, responses=responses)
-    text = gcode(printer, "ACE_DRYER_LOG").lines[-1]
+    text = gcode(printer, "ACEK_DRYER_LOG").lines[-1]
     assert text.count("the log changed while it was read (3 tries)") == 1
     assert "6 cycles started" in text and "6 faults" in text  # the last read's counters
     assert text.count("fault fans") == 1
     assert len(sent_to(mcu, "ace2k_dryer_log_query")) == 12
 
 
-def test_heater_watts_scales_the_energy():
+def test_heater_watts_scales_the_energy() -> None:
     responses = dict(
         DRYER_RESPONSES,
         ace2k_dryer_log_query=[log_frame(0, d=3600), log_frame(1), log_frame(0, d=3600)],
@@ -769,10 +1003,12 @@ def test_heater_watts_scales_the_energy():
     module, printer, mcu, dryer = build(
         known=RELEASE, responses=responses, options={"heater_watts": 340}
     )
-    assert "340 Wh at 340 W" in gcode(printer, "ACE_DRYER_LOG").lines[-1]
+    assert "340 Wh at 340 W" in gcode(printer, "ACEK_DRYER_LOG").lines[-1]
 
 
-def test_the_counters_are_read_once_after_ready_from_a_timer(caplog):
+def test_the_counters_are_read_once_after_ready_from_a_timer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     responses = dict(
         DRYER_RESPONSES, ace2k_dryer_log_query=[log_frame(0, a=3, b=2, f=0x2), EMPTY_LOG]
     )
@@ -789,7 +1025,7 @@ def test_the_counters_are_read_once_after_ready_from_a_timer(caplog):
     assert not [t for t in printer.reactor.armed() if t[0] == dryer._seed_log]
 
 
-def test_an_unanswered_seed_is_a_warning_and_no_retry(caplog):
+def test_an_unanswered_seed_is_a_warning_and_no_retry(caplog: pytest.LogCaptureFixture) -> None:
     responses = dict(DRYER_RESPONSES, ace2k_dryer_log_query=[printer_error()])
     module, printer, mcu, dryer = build(known=RELEASE, responses=responses)
     printer.handlers["klippy:ready"]()
@@ -797,14 +1033,26 @@ def test_an_unanswered_seed_is_a_warning_and_no_retry(caplog):
     with caplog.at_level("WARNING", logger="root"):
         assert seed[0](seed[1]) == FakeReactor.NEVER
     assert "dryer log query failed" in caplog.text and dryer.log_counters is None
+    assert "no answer from the unit; check the link" in caplog.text
 
 
-def test_an_image_without_the_dryer_seeds_no_log():
+def test_an_image_without_the_dryer_seeds_no_log() -> None:
     module, printer, mcu, dryer = build(known=NO_DRYER)
     printer.handlers["klippy:ready"]()
     assert not [t for t in printer.reactor.timers if t[0] == dryer._seed_log]
 
 
-def test_the_module_is_idle_until_ready_and_has_no_timer_armed_before():
+def test_the_module_is_idle_until_ready_and_has_no_timer_armed_before() -> None:
     module, printer, mcu, dryer = build(known=RELEASE)
     assert [t for t in printer.reactor.timers if t[1] != FakeReactor.NEVER] == []
+
+
+def test_check_cycle_takes_the_ranges_and_names_the_bad_argument() -> None:
+    ace2k_dryer.check_cycle(15, 1)
+    ace2k_dryer.check_cycle(65, ace2k_dryer.MINUTES_MAX)
+    with pytest.raises(ValueError, match="dryer target 14 outside 15–65 °C"):
+        ace2k_dryer.check_cycle(14, 60)
+    with pytest.raises(ValueError, match="dryer target 40.5 outside"):
+        ace2k_dryer.check_cycle(40.5, 60)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="dryer minutes 0 outside 1–1440"):
+        ace2k_dryer.check_cycle(40, 0)

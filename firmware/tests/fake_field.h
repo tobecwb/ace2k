@@ -10,12 +10,46 @@
  * the idle ones, WUPA the idle and the halted, anticollision frames get the remaining bits of
  * the cascade level with the first differing bit reported as a collision, a SELECT that matches
  * one tag moves it on (the others back to idle), HLTA halts the active tag, READ answers four
- * NTAG pages or an authenticated MIFARE block, MFAuthent checks the sector's key A and, like a
- * real tag, stays silent on a wrong one (auth_nak: the reader's AUTH_FAILED instead).  An
- * ACTIVE tag takes a REQA or a WUPA as an unexpected command: it drops to idle without an
- * answer.  bad_reads: that many READ answers go out with a broken CRC_A.  Every first byte the
- * engine sends is logged. */
+ * NTAG pages or an authenticated MIFARE block, MFAuthent checks the sector's key A or key B
+ * and, like a real tag, stays silent on a wrong one (auth_nak: the reader's AUTH_FAILED instead).
+ * A READY or ACTIVE tag takes a REQA or a WUPA as an unexpected command: it drops to idle without
+ * an answer.  bad_reads: that many READ answers go out with a broken CRC_A.  lose_halts: that many
+ * HLTAs are lost on the air, and the active tag stays active.  hostile: one kind of
+ * malformed answer, sent on every frame of its type while it is set.  override_frame and
+ * override_poll: every frame of that kind ends with that poll status instead of its answer, as a
+ * reader error, a collision or silence would.  start_rc: when not 0, every start fails with it and
+ * reaches no tag.  Every first byte the engine sends is logged. */
 #define MAXTAGS 4
+
+/* The malformed answers a hostile tag can send.  Each one breaks a single rule of ISO 14443-3
+ * and keeps the rest of the frame valid, so only the guard for that rule can refuse it.
+ * READ_LONG is the exception: it breaks the receive path's length, not a rule of the tag. */
+enum ace2k_fake_hostile {
+    ACE2K_FAKE_HOSTILE_NONE = 0,
+    ACE2K_FAKE_HOSTILE_ATQA_SHORT,     /* the wake-up answered with one byte */
+    ACE2K_FAKE_HOSTILE_ATQA_LONG,      /* the wake-up answered with three bytes */
+    ACE2K_FAKE_HOSTILE_BCC,            /* a full anticollision answer with a wrong BCC */
+    ACE2K_FAKE_HOSTILE_COLL_AT_KNOWN,  /* after a real collision, one at the last known bit */
+    ACE2K_FAKE_HOSTILE_COLL_PAST_UID,  /* a collision at bit 33, past the four UID bytes */
+    ACE2K_FAKE_HOSTILE_SAK_SHORT,      /* the SAK alone, without its CRC_A */
+    ACE2K_FAKE_HOSTILE_SAK_LONG,       /* two bytes and a valid CRC_A */
+    ACE2K_FAKE_HOSTILE_SAK_CRC,        /* the SAK with a broken CRC_A */
+    ACE2K_FAKE_HOSTILE_SAK_CASCADE,    /* every SAK says "cascade", the last level's too */
+    ACE2K_FAKE_HOSTILE_READ_SHORT,     /* 15 bytes and a valid CRC_A */
+    ACE2K_FAKE_HOSTILE_READ_LAST_BITS, /* 16 bytes and a valid CRC_A, the last byte partial */
+    ACE2K_FAKE_HOSTILE_READ_LONG,      /* a valid answer, but len says 19: one past the buffer */
+    ACE2K_FAKE_HOSTILE_CL_LONG,        /* a full anticollision answer with one byte too many */
+    ACE2K_FAKE_HOSTILE_CL_LAST_BITS,   /* a full anticollision answer, the last byte partial */
+};
+
+/* The kinds of frame an override can end with another poll status. */
+enum ace2k_fake_frame {
+    ACE2K_FAKE_FRAME_NONE = 0,
+    ACE2K_FAKE_FRAME_WAKE,     /* REQA or WUPA */
+    ACE2K_FAKE_FRAME_ANTICOLL, /* an anticollision frame of any level */
+    ACE2K_FAKE_FRAME_SELECT,   /* a SELECT of any level */
+    ACE2K_FAKE_FRAME_READ,     /* READ */
+};
 // NOLINTNEXTLINE(readability-identifier-naming)
 struct ftag {
     uint8_t uid[10];
@@ -27,6 +61,7 @@ struct ftag {
     uint8_t pages[64][4];
     uint8_t blocks[64][16];
     uint8_t key_a[16][6];
+    uint8_t key_b[16][6];
     int state; /* 0 idle, 1 ready, 2 active, 3 halted */
     int level;
     int authed_sector;
@@ -39,9 +74,14 @@ struct fld {
     enum ace2k_rfid_poll pending;
     struct ace2k_rfid_rx rx;
     bool mute;
-    bool
-        auth_nak; /* a wrong key ends MFAuthent without MFCrypto1On; default: silence (a real tag) */
-    int bad_reads; /* the next READ answers with a broken CRC_A: the engine's ERROR */
+    /* a wrong key ends MFAuthent without MFCrypto1On; default: silence (a real tag) */
+    bool auth_nak;
+    int bad_reads;  /* the next READ answers with a broken CRC_A: the engine's ERROR */
+    int lose_halts; /* the next HLTAs never reach the tag: it stays active */
+    enum ace2k_fake_hostile hostile;
+    enum ace2k_fake_frame override_frame;
+    enum ace2k_rfid_poll override_poll;
+    int start_rc;
     int starts, polls, crypto_offs;
     uint8_t firsts[1024];
     int nfirst;
@@ -104,8 +144,8 @@ static enum ace2k_rfid_poll wake(struct fld *f, bool wupa)
     int first = -1;
     for (int i = 0; i < f->n; i++) {
         struct ftag *t = &f->t[i];
-        if (!t->absent && t->state == 2) {
-            t->state = 0; /* an unexpected command to an ACTIVE tag: back to idle, no answer */
+        if (!t->absent && (t->state == 1 || t->state == 2)) {
+            t->state = 0; /* an unexpected command to a READY or ACTIVE tag: idle, no answer */
             continue;
         }
         if (t->absent || !(t->state == 0 || (wupa && t->state == 3))) {
@@ -123,6 +163,12 @@ static enum ace2k_rfid_poll wake(struct fld *f, bool wupa)
     f->rx.data[0] = (uint8_t)f->t[first].atqa;
     f->rx.data[1] = (uint8_t)((uint32_t)f->t[first].atqa >> 8U);
     f->rx.len = 2;
+    if (f->hostile == ACE2K_FAKE_HOSTILE_ATQA_SHORT) {
+        f->rx.len = 1;
+    } else if (f->hostile == ACE2K_FAKE_HOSTILE_ATQA_LONG) {
+        f->rx.data[2] = 0xFF;
+        f->rx.len = 3;
+    }
     return ACE2K_RFID_POLL_DONE;
 }
 
@@ -200,11 +246,46 @@ static enum ace2k_rfid_poll anticoll(struct fld *f, const uint8_t *tx, int level
     }
     int coll = first_collision(cl, nc, known);
     fill_answer(f, cl[0], nbytes, nbits);
+    if (f->hostile == ACE2K_FAKE_HOSTILE_COLL_AT_KNOWN && known > 0) {
+        coll = known;
+    } else if (f->hostile == ACE2K_FAKE_HOSTILE_COLL_PAST_UID) {
+        coll = 33;
+    } else if (f->hostile == ACE2K_FAKE_HOSTILE_BCC && coll == 0) {
+        f->rx.data[f->rx.len - 1] ^= 0x01U; /* the BCC is the answer's last byte */
+    } else if (f->hostile == ACE2K_FAKE_HOSTILE_CL_LONG && coll == 0) {
+        f->rx.data[f->rx.len++] = 0x00;
+    } else if (f->hostile == ACE2K_FAKE_HOSTILE_CL_LAST_BITS && coll == 0) {
+        f->rx.last_bits = 4;
+    }
     if (coll != 0) {
         f->rx.coll_pos = (uint8_t)coll;
         return ACE2K_RFID_POLL_COLLISION;
     }
     return ACE2K_RFID_POLL_DONE;
+}
+
+/* The selected tag's answer and its CRC_A.  Before the last level the SAK says "cascade" (0x04);
+ * at the last level it is the tag's own.  A hostile kind changes the answer as its name says. */
+static void sak_answer(struct fld *f, struct ftag *t, int level)
+{
+    if (level < levels_of(t) - 1 || f->hostile == ACE2K_FAKE_HOSTILE_SAK_CASCADE) {
+        t->level = level + 1;
+        f->rx.data[0] = 0x04;
+    } else {
+        t->state = 2;
+        f->rx.data[0] = t->sak;
+    }
+    f->rx.len = 1;
+    if (f->hostile == ACE2K_FAKE_HOSTILE_SAK_SHORT) {
+        return;
+    }
+    if (f->hostile == ACE2K_FAKE_HOSTILE_SAK_LONG) {
+        f->rx.data[f->rx.len++] = 0x00;
+    }
+    with_crc(&f->rx);
+    if (f->hostile == ACE2K_FAKE_HOSTILE_SAK_CRC) {
+        f->rx.data[2] ^= 0xFFU;
+    }
 }
 
 static enum ace2k_rfid_poll select_tag(struct fld *f, const uint8_t *tx, uint8_t len, int level)
@@ -229,16 +310,7 @@ static enum ace2k_rfid_poll select_tag(struct fld *f, const uint8_t *tx, uint8_t
     if (hit < 0) {
         return ACE2K_RFID_POLL_TIMEOUT;
     }
-    struct ftag *t = &f->t[hit];
-    if (level < levels_of(t) - 1) {
-        t->level = level + 1;
-        f->rx.data[0] = 0x04;
-    } else {
-        t->state = 2;
-        f->rx.data[0] = t->sak;
-    }
-    f->rx.len = 1;
-    with_crc(&f->rx);
+    sak_answer(f, &f->t[hit], level);
     return ACE2K_RFID_POLL_DONE;
 }
 
@@ -272,7 +344,15 @@ static enum ace2k_rfid_poll read_tag(struct fld *f, const uint8_t *tx, uint8_t l
         return ACE2K_RFID_POLL_DONE;
     }
     f->rx.len = 16;
+    if (f->hostile == ACE2K_FAKE_HOSTILE_READ_SHORT) {
+        f->rx.len = 15;
+    }
     with_crc(&f->rx);
+    if (f->hostile == ACE2K_FAKE_HOSTILE_READ_LAST_BITS) {
+        f->rx.last_bits = 4;
+    } else if (f->hostile == ACE2K_FAKE_HOSTILE_READ_LONG) {
+        f->rx.len = ACE2K_RFID_RX_MAX + 1U; /* one byte past the buffer */
+    }
     if (f->bad_reads > 0) {
         f->bad_reads--;
         f->rx.data[16] ^= 0xFFU;
@@ -288,7 +368,8 @@ static enum ace2k_rfid_poll auth(struct fld *f, const uint8_t *tx, uint8_t len)
     }
     int sector = tx[1] / 4;
     bool uid_ok = memcmp(&tx[8], &t->uid[t->uid_len - 4], 4) == 0;
-    if (tx[0] == 0x60 && uid_ok && memcmp(&tx[2], t->key_a[sector], 6) == 0) {
+    const uint8_t *key = tx[0] == 0x60 ? t->key_a[sector] : t->key_b[sector];
+    if (uid_ok && memcmp(&tx[2], key, 6) == 0) {
         t->authed_sector = sector;
         return ACE2K_RFID_POLL_DONE;
     }
@@ -296,32 +377,58 @@ static enum ace2k_rfid_poll auth(struct fld *f, const uint8_t *tx, uint8_t len)
     return f->auth_nak ? ACE2K_RFID_POLL_AUTH_FAILED : ACE2K_RFID_POLL_TIMEOUT;
 }
 
+/* The answer to one transceive frame, left pending for the poll; the kind of frame it was. */
+static enum ace2k_fake_frame transceive(struct fld *f, const uint8_t *tx, uint8_t len,
+                                        uint8_t last_bits)
+{
+    if ((tx[0] == 0x26 || tx[0] == 0x52) && len == 1 && last_bits == 7) {
+        f->pending = wake(f, tx[0] == 0x52);
+        return ACE2K_FAKE_FRAME_WAKE;
+    }
+    if (tx[0] == 0x93 || tx[0] == 0x95 || tx[0] == 0x97) {
+        int level = (tx[0] - 0x93) / 2;
+        if (tx[1] == 0x70) {
+            f->pending = select_tag(f, tx, len, level);
+            return ACE2K_FAKE_FRAME_SELECT;
+        }
+        f->pending = anticoll(f, tx, level);
+        return ACE2K_FAKE_FRAME_ANTICOLL;
+    }
+    if (tx[0] == 0x30) {
+        f->pending = read_tag(f, tx, len);
+        return ACE2K_FAKE_FRAME_READ;
+    }
+    if (tx[0] == 0x50 && len == 4 && crc_ok(tx, len)) {
+        struct ftag *t = active(f);
+        if (f->lose_halts > 0) {
+            f->lose_halts--;
+            t = NULL; /* lost on the air: the tag stays active */
+        }
+        if (t) {
+            t->state = 3;
+        }
+    }
+    f->pending = ACE2K_RFID_POLL_TIMEOUT;
+    return ACE2K_FAKE_FRAME_NONE;
+}
+
 static int f_start(void *ctx, uint8_t reader, uint8_t cmd, const uint8_t *tx, uint8_t len,
                    uint8_t last_bits)
 {
     struct fld *f = &((struct fake_field *)ctx)->rd[reader];
     f->starts++;
+    if (f->start_rc != 0) {
+        return f->start_rc;
+    }
     f->firsts[f->nfirst++ % 1024] = tx[0];
     f->rx = (struct ace2k_rfid_rx){ 0 };
     if (cmd == ACE2K_RFID_CMD_MF_AUTHENT) {
         f->pending = auth(f, tx, len);
         return 0;
     }
-    if ((tx[0] == 0x26 || tx[0] == 0x52) && len == 1 && last_bits == 7) {
-        f->pending = wake(f, tx[0] == 0x52);
-    } else if (tx[0] == 0x93 || tx[0] == 0x95 || tx[0] == 0x97) {
-        int level = (tx[0] - 0x93) / 2;
-        f->pending = tx[1] == 0x70 ? select_tag(f, tx, len, level) : anticoll(f, tx, level);
-    } else if (tx[0] == 0x50 && len == 4 && crc_ok(tx, len)) {
-        struct ftag *t = active(f);
-        if (t) {
-            t->state = 3;
-        }
-        f->pending = ACE2K_RFID_POLL_TIMEOUT;
-    } else if (tx[0] == 0x30) {
-        f->pending = read_tag(f, tx, len);
-    } else {
-        f->pending = ACE2K_RFID_POLL_TIMEOUT;
+    enum ace2k_fake_frame kind = transceive(f, tx, len, last_bits);
+    if (kind != ACE2K_FAKE_FRAME_NONE && kind == f->override_frame) {
+        f->pending = f->override_poll;
     }
     return 0;
 }
@@ -348,7 +455,7 @@ static void f_crypto_off(void *ctx, uint8_t reader)
     }
 }
 
-static const struct ace2k_iso14443a_ops ace2k_fld_ops
+static const struct ace2k_iso14443a_ops fld_ops
     __attribute__((unused)) = { .start = f_start, .poll = f_poll, .crypto_off = f_crypto_off };
 
 __attribute__((unused)) static struct ftag *add_mifare(struct fld *f, const uint8_t uid[4])
@@ -364,6 +471,8 @@ __attribute__((unused)) static struct ftag *add_mifare(struct fld *f, const uint
     for (int s = 0; s < 16; s++) {
         uint8_t k[6] = { (uint8_t)s, 1, 2, 3, 4, 5 };
         memcpy(t->key_a[s], k, 6);
+        uint8_t kb[6] = { (uint8_t)s, 9, 8, 7, 6, 5 };
+        memcpy(t->key_b[s], kb, 6);
     }
     return t;
 }

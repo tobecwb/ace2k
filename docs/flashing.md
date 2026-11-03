@@ -1,7 +1,7 @@
 # Flashing
 
-`firmware/tools/ace2k_flash.py` flashes the unit with one command on the Klipper host. It works in
-every direction:
+`ace2k_flash.pyz` flashes the unit with one command on the Klipper host. It works in every
+direction:
 
 - from the factory firmware to ace2k;
 - from ace2k to a newer ace2k;
@@ -15,6 +15,11 @@ updater (<https://gist.github.com/hakimio/39c71fa7174e699c6470b7c79323b189>).
 
 You can always go back to the factory firmware, with the same tool. See
 [Back to the factory firmware](#back-to-the-factory-firmware) below.
+
+**Who can flash the unit.** The unit does not check who talks to it. Any program that can open
+the unit's serial port can flash it, with this tool or another one. A new image decides how the
+heater, the fans and the motors run. So keep the unit's cable on your Klipper host, and do not give
+a program you do not trust access to its port.
 
 ## Before you start
 
@@ -38,12 +43,16 @@ Below, `<user>@<host>` is how you log into your Klipper host over SSH. Klipper i
 
 **On your computer:**
 
-1. **Get the release.** Clone this repository at the release's tag, and download the release's
-   image into it:
+1. **Get the release.** Clone this repository at the release's tag. Download the release's image
+   and its host bundle into it. Then take the tool out of the bundle:
 
        git clone --branch vX.Y.Z https://github.com/tobecwb/ace2k
        cd ace2k
        curl -LO https://github.com/tobecwb/ace2k/releases/download/vX.Y.Z/ace2k-X.Y.Z.bin
+       curl -LO https://github.com/tobecwb/ace2k/releases/download/vX.Y.Z/ace2k-host-X.Y.Z.tar.gz
+       tar -xzf ace2k-host-X.Y.Z.tar.gz firmware/tools/ace2k_flash.pyz
+
+   The tool is one file, `firmware/tools/ace2k_flash.pyz`.
 
 2. **Copy everything to the Klipper host.** The host module goes into Klipper. The tool and the
    image go into one directory, `~/ace2k-flash`. The tool also saves its calibration copies there.
@@ -51,16 +60,17 @@ Below, `<user>@<host>` is how you log into your Klipper host over SSH. Klipper i
        scp klippy/extras/ace2k*.py <user>@<host>:klipper/klippy/extras/
        scp -r klippy/extras/ace2k_tags <user>@<host>:klipper/klippy/extras/
        ssh <user>@<host> mkdir -p ace2k-flash
-       scp firmware/tools/ace2k_flash.py ace2k-X.Y.Z.bin <user>@<host>:ace2k-flash/
+       scp firmware/tools/ace2k_flash.pyz ace2k-X.Y.Z.bin <user>@<host>:ace2k-flash/
 
 **On Windows:**
 
-- Windows Terminal / PowerShell already has `ssh`, `scp` and `curl`.
+- Windows Terminal / PowerShell already has `ssh`, `scp`, `curl` and `tar`.
 - `git` comes with [Git for Windows](https://git-scm.com/download/win).
 - There is no `ssh-copy-id`. Without a key, `ssh` and `scp` simply ask for the host's password.
 - If you prefer graphical tools: [WinSCP](https://winscp.net/) copies the files of step 2, and
   [PuTTY](https://www.putty.org/) opens the SSH session for the steps below. The release page
-  offers the source as a zip and the image as a file.
+  offers the source as a zip, and the image and the host bundle as files. The tool is inside the
+  bundle, in `firmware/tools/`.
 
 **On the Klipper host** (`ssh <user>@<host>`):
 
@@ -88,7 +98,7 @@ Below, `<user>@<host>` is how you log into your Klipper host over SSH. Klipper i
 6. **Run the tool:**
 
        cd ~/ace2k-flash
-       python3 ace2k_flash.py ace2k-X.Y.Z.bin
+       python3 ace2k_flash.pyz ace2k-X.Y.Z.bin
 
    The tool finds the unit from `printer.cfg`. It shows what it will do and asks
    `Proceed? [y/N]`. Answer `y`. Then the tool:
@@ -103,22 +113,35 @@ Below, `<user>@<host>` is how you log into your Klipper host over SSH. Klipper i
 
    It ends with `Klipper reports ace2k X.Y.Z: done.`
 
-7. **Check.** Klipper is ready. In the console, `ACE_STATUS` starts with `ace2k X.Y.Z, link
+7. **Check.** Klipper is ready. In the console, `ACEK_STATUS` starts with `ace2k X.Y.Z, link
    proven: yes`. The lane LEDs show each lane's state: on for a loaded lane, off for an empty one.
+   With every lane empty, all four flash together briefly every 10 s.
 
 If anything stops the tool, it tells you what state the unit and Klipper are in. Running the same
 command again is safe.
 
 ### Updating to a newer ace2k
 
-1. Get the new release. Copy its host module and image to the Klipper host, as in steps 1 and 2
-   above. The tool restarts Klipper after the flash, and that loads the new host module.
+> **Updating from v0.12.0-rc.1 or earlier.** Every G-code command is now named `ACEK_*`. For
+> example, `ACE_FEED` is now `ACEK_FEED` and `ACE_STATUS` is now `ACEK_STATUS`. Klipper answers
+> `Unknown command` to an old name and does nothing. After the update, look for `ACE_` in your
+> macros, in your slicer's start and end G-code and in `printer.cfg`, and rename each command to
+> its `ACEK_` name. The tool itself works while Klipper still runs the old host module: it sends
+> the name Klipper lists, old or new (`ACE_RESTORE_STOCK` is now `ACEK_RESTORE_STOCK`).
+>
+> The tool is now one file, `ace2k_flash.pyz`. Copy it to the Klipper host as step 1 says, and run
+> that file. The old tool in `~/ace2k-flash` is no longer needed. It is the file whose name ends
+> in `.py`. Delete it.
+
+1. Get the new release. Copy its host module, the tool and the image to the Klipper host, as in
+   steps 1 and 2 above. The tool restarts Klipper after the flash, and that loads the new host
+   module.
 2. Stop the dryer and any lane that moves. Do not update during a print. The tool refuses in both
    cases, and then changes nothing.
 3. On the Klipper host:
 
        cd ~/ace2k-flash
-       python3 ace2k_flash.py ace2k-X.Y.Z.bin
+       python3 ace2k_flash.pyz ace2k-X.Y.Z.bin
 
    Answer `y`. The unit resets into the bootloader: all four LEDs strobe fast. The tool writes the
    new image and starts Klipper again. Klipper must report the new version: `Klipper reports ace2k
@@ -129,7 +152,7 @@ command again is safe.
 The tool runs on the Klipper host, as a user allowed to stop and start Klipper. That is root, or
 another user with `--klipper-stop "sudo systemctl stop klipper"` and `--klipper-start "sudo
 systemctl start klipper"`. Give those two options together. Every option is in
-[`commands.md`](commands.md#ace2k_flashpy).
+[`commands.md`](commands.md#ace2k_flashpyz).
 
 What it does, in order:
 
@@ -139,12 +162,29 @@ What it does, in order:
    - The tool derives the version string it announces to the bootloader from the version: the
      first 11 characters.
    - At the end, the tool recognises an older ace2k image by its own version string. The firmware
-     embeds that string. So the tool accepts whatever version Klipper reports, when that exact
-     string occurs in the image. Example: `--version 0.11` for an image that reports `0.11.0`.
+     embeds that string. So the tool accepts the version Klipper reports when it looks like a
+     version (`0.11.0`, `0.4.0-50-g52ae07e`, or a commit such as `552ba0e`) and the image holds
+     it whole, not as a piece of a longer string. Example: `--version 0.11` for an image that
+     reports `0.11.0`.
+   - It refuses a damaged ace2k image (its checksum does not match its contents), and an ace2k
+     image too large to end before the config page at the end of the slot.
 2. **Finds the port.** It takes `--port`. Without it, it takes the `serial` of the MCU that
    `[ace2k]` uses in Klipper's config. It reads that config through Moonraker (`--moonraker`,
-   default `http://localhost:7125`). With neither, it lists the adapters of the kind in the unit's
-   cable, and stops.
+   default `http://localhost:7125`; the URL starts with `http://` or `https://`). With neither,
+   it lists the adapters of the kind in the unit's cable, and stops.
+   - A `--port` that is not an adapter of that kind
+     (`/dev/serial/by-id/usb-1a86_USB_Single_Serial_*`, or a path that leads to one) gets one
+     warning line before anything is sent:
+     `Warning: <port> does not look like the unit's adapter (…). Never give the port of a printer
+     head.` The run then goes on as usual. Nothing that changes a device is sent to a port that
+     does not answer as the factory firmware or the bootloader's recovery.
+   - **Several units** (`[ace2k <name>]` sections): give `--port`. The tool finds the section
+     whose MCU uses that port, and its `ACEK_RESTORE_STOCK` carries `UNIT=<name>`. Without
+     `--port` it lists each unit and its port, and stops. With a single `[ace2k <name>]`, its
+     port is taken as for `[ace2k]`.
+   - When one unit resets, Klipper loses its MCU and shuts down every unit. Flash the units one
+     after another with Klipper stopped, then start it: the tool proves each new image as it
+     writes it (step 8), so no unit waits for Klipper.
 3. **Identifies the unit.** It acts only on what it identified:
    - ace2k: Klipper reports it on that port.
    - The factory firmware, or the bootloader's recovery: they answer on the port.
@@ -158,26 +198,45 @@ What it does, in order:
 
    More than one unit on a port is a daisy chain. An update reaches every unit at address 0, so
    the tool flashes one unit per port. Split the chain first, or move the unit to its own cable.
+   Two replies can collide on the bus, so the tool counts the units over three rounds.
 4. **Shows the plan and asks** `Proceed? [y/N]`. `--yes` skips the question.
 5. **Keeps the calibration**, when the unit runs the factory firmware. The unit's id and its
    `GET_MOTOR_STATUS` go to `ace-calibration-<unit id>-<date-time>.txt` in `--calibration-dir`
    (default: the current directory).
 6. **From ace2k, puts the unit in recovery and stops Klipper.**
-   - It sends `ACE_RESTORE_STOCK`. The console refuses it while the dryer heats or a lane moves.
-     The tool then shows the console's reason and changes nothing.
+   - It reads the list of commands Klipper knows (Moonraker's `/printer/gcode/help`). It sends
+     `ACEK_RESTORE_STOCK` when the list has it. A host module up to v0.12.0-rc.1 lists the old
+     name instead (`ACE_RESTORE_STOCK` → `ACEK_RESTORE_STOCK`), and the tool sends the old name.
+     The plan names the command the tool will send. When the list has neither, the tool stops
+     before it asks you, and changes nothing. When Moonraker does not answer the list, the plan
+     says "unchecked" and the tool sends `ACEK_RESTORE_STOCK`. If Klipper then prints
+     `Unknown command:"ACEK_RESTORE_STOCK"`, the tool sends the old name once. If that fails too,
+     the message says the list could not be read.
+   - ace2k refuses the command with a G-code error while the dryer heats or a lane moves. The tool
+     then shows the reason and changes nothing.
    - It stops Klipper. With `--klipper-stop` / `--klipper-start` given, it uses them: they take
      precedence over the detection. Otherwise it uses `systemctl` when a `klipper` unit exists,
      else `/etc/init.d/S60klipper` when it exists. When neither exists, you must give
      `--klipper-stop` / `--klipper-start`.
    - It waits up to 15 s for Klipper to notice the reset.
-7. **Writes the image** (about 20 s for ace2k, 30 s for the factory image).
+7. **Writes the image** (about 20 s for ace2k, 30 s for the factory image). Just before it
+   writes, it checks again that no other program opened the port.
 8. **Checks the result.**
-   - **ace2k:** the bootloader no longer answers. Klipper is started again and must report the new
-     version on that port. With no `[ace2k]` in the config, the tool cannot check this, and says
-     so. A newly written image goes back to recovery if no host talks to it within 180 s. So
-     configure Klipper (see [First install](#first-install)) and start it within that window. If
-     the window passes, finish the config, restart Klipper and run the tool again.
-   - **Factory firmware:** it answers with the version given. The tool reads its calibration again
+   - **ace2k:** the bootloader no longer answers. The tool then asks the new image for its
+     version itself, as Klipper does at connect (its dictionary, then `ace2k_version`, at 250000
+     baud). That answer is the image's link proof: a proven image never goes back to recovery on
+     its own. An image that does not answer within 30 s is a failure: it goes back to recovery by
+     itself within 180 s of its start, and the tool, run again, finds recovery. Then Klipper is
+     started again and must report the new version on that port. With no `[ace2k]` in the
+     config, the tool cannot check this, and says so: configure Klipper (see
+     [First install](#first-install)) and start it, with no hurry. When another program holds the
+     port at that moment, Klipper's own connect proves the image instead, within 180 s of the
+     write. An installer passes `--config-follows`: the caller stopped Klipper and starts it
+     after this run. The flasher proves the image and returns (status 2). It never waits for
+     Klipper, and says so in one line.
+   - **Factory firmware:** the old factory firmware answers for a moment after the update. The
+     tool waits up to 15 s for it to stop. Then the new one must answer with the version given.
+     The tool reads its calibration again
      and compares it with the newest earlier file of the same unit in `--calibration-dir`. It
      reports "calibration intact", or the pairs that differ. With no earlier file, it skips the
      comparison and says so. Klipper is then left stopped. Before you start it, remove
@@ -190,22 +249,56 @@ The tool's exit status:
 | Status | Meaning |
 |---|---|
 | 0 | Flashed and verified. |
-| 1 | Refused or failed. This includes an ace2k image that was written but whose version Klipper did not report in time. |
-| 2 | Flashed, but it cannot be checked here: no `[ace2k]` on that port in Klipper's config, or Moonraker does not answer. |
+| 1 | Failed, or refused after something was done: Klipper was stopped, the restore command was sent, or the update started. This includes an ace2k image that was written but whose version Klipper did not report in time. |
+| 2 | Flashed, but it cannot be checked here: no `[ace2k]` on that port in Klipper's config, or Moonraker does not answer. When this run stopped Klipper and could not start it again, the status stays 2 and the last line says `Klipper did NOT start`. |
+| 3 | Refused, and nothing was changed. At most read-only queries reached the unit (its identity, version and calibration). No command that changes the unit or Klipper ran, and Klipper was neither stopped nor started. |
+| 4 | Nothing answered on the port that this flasher can use: not the factory firmware, not recovery, and no ace2k that this flasher can send to recovery. Nothing that changes the unit was sent. When Klipper was not ready and used that port, it was stopped to free the port and started again (if that start fails, the status is 1). The unit may be off, or it may run an ace2k image older than `ace2k_bootloader_enter`. |
+| 5 | Only with `--identify`: the unit answered but cannot blink (recovery, or an ace2k older than v0.13.0). Nothing that changes the unit was sent. |
 
-On status 1, the message says what state the unit and Klipper are in. To retry a failed update,
-run the same command again: recovery accepts a new update.
+A script can tell the cases apart by the status alone. On status 1, the message says what state
+the unit and Klipper are in. Ctrl-C ends the run with status 3 when nothing was done yet, and
+with status 1 after that. To retry a failed update, run the same command again: recovery
+accepts a new update. If the unit ran the factory firmware when the update failed, power-cycle
+the unit first. The factory firmware keeps an update it did not finish, and it refuses a new one
+until it restarts. The tool says so when this applies.
 
 What a refusal means depends on when it happens:
 
-- **The console refuses `ACE_RESTORE_STOCK`** (the dryer heats, a lane moves). Nothing changed.
-- **A refusal after the unit reset.** For example: a second unit found on the port, an answer that
-  is not recovery's, a failed Klipper stop, a program holding the port. The unit stays in the
-  bootloader's recovery, which is persistent and accepts an update. The tool says so. Klipper will
-  not connect until ace2k is written again: run the tool again.
-- **Klipper still reports ready after the wait, and no refusal was printed.** The unit may or may
-  not have reset. Nothing was stopped. Look at the LEDs: all four strobing fast is recovery. Then
-  run the tool again. It identifies recovery on its own.
+- **ace2k refuses `ACEK_RESTORE_STOCK`** (the dryer heats, a lane moves). The tool prints the
+  refusal. Nothing changed.
+- **`ACEK_RESTORE_STOCK` did not run.** Klipper was not ready or not connected, or Moonraker
+  answered with an error of its own. The tool prints that error. Nothing changed.
+- **A refusal after the unit reset.** For example: a second unit found on the port, no answer, a
+  failed Klipper stop, a program holding the port. The unit stays in the bootloader's recovery,
+  which is persistent and accepts an update. The tool says so. Klipper will not connect until
+  ace2k is written again: run the tool again.
+- **The factory firmware answers after the restore.** The reset did not reach the unit, and
+  nothing was written. Klipper does not connect to the factory firmware. Run the tool again: it
+  identifies the factory firmware and writes the image.
+- **Klipper still reports ready after the wait.** The tool says what it saw: the command failed
+  (for example, the unit did not answer), the request got no answer, or the command ran and no
+  refusal was printed. The unit may or may not have reset. Nothing was stopped. Look at the LEDs:
+  all four strobing fast is recovery. Then run the tool again. It identifies recovery on its own.
+
+### Known limits
+
+- **A factory image written over the same factory version.** After the factory firmware takes an
+  update, it still answers with its old version for about 2 s, and then it resets. The tool waits
+  until two questions in a row get no answer. If two of the old firmware's replies are lost in a
+  row during those 2 s, the wait ends too soon. With the same version on both sides, the old
+  firmware's next answer then looks like the new one, and the run can end with status 0 although
+  the old firmware did not take the image. The unit then still runs the factory firmware it ran
+  before, so nothing is lost, but the rewrite may not have happened. With a different version, or
+  with ace2k, this cannot happen.
+
+## Which unit is on this cable
+
+    python3 ace2k_flash.pyz --identify --port /dev/serial/by-id/usb-1a86_USB_Single_Serial_<...>
+
+The unit on that cable blinks its four LEDs together for a few seconds. It works on the factory
+firmware and on ace2k (since v0.13.0). Nothing is written, and Klipper is not stopped. Exit 5 says
+the unit cannot blink: it is in recovery (its LEDs already strobe fast), or it runs an older ace2k.
+Klipper connected to that unit refuses it (exit 3): Klipper holds the port.
 
 ## Back to the factory firmware
 
@@ -237,10 +330,10 @@ the unit's factory calibration pages, and the bootloader's recovery mode accepts
    tool and your calibration copy. Run the tool there, with the image's version:
 
        cd ~/ace2k-flash
-       python3 ace2k_flash.py ACE2_V1.1.31.bin --version 1.1.31
+       python3 ace2k_flash.pyz ACE2_V1.1.31.bin --version 1.1.31
 
    It shows the plan and asks `Proceed? [y/N]`. Answer `y`. The tool then sends
-   `ACE_RESTORE_STOCK` itself, stops Klipper and writes the image (about 30 s).
+   `ACEK_RESTORE_STOCK` itself, stops Klipper and writes the image (about 30 s).
 4. **Watch the LEDs.** After the reset, all four lane LEDs strobe fast while the image is written.
    This is the bootloader's recovery mode: persistent and safe. Then the unit boots the factory
    firmware.
@@ -251,6 +344,10 @@ the unit's factory calibration pages, and the bootloader's recovery mode accepts
    stopped. Delete `[mcu ace2k]` and `[ace2k]` from `printer.cfg`. Also delete any `#*# [ace2k]`
    section in the SAVE_CONFIG block at the end of the file: Klipper will not start while that
    block still declares `[ace2k]`. Then start Klipper.
+7. **To go back to ace2k later, follow [First install](#first-install) from step 4.** Put the two
+   sections back, restart Klipper and run the tool. The tool then stops and starts Klipper itself.
+   If you run the tool while Klipper is stopped, it asks for `--port`. With `--port`, it writes the
+   image, proves it, and does not start Klipper. Start Klipper yourself.
 
 If the unit does not answer at any point, nothing is lost. You do not need to power-cycle it first,
 and you can simply run the same command again. See
@@ -275,7 +372,7 @@ them byte for byte. Comparing with your copy is how you check that it did.
 
 You do not need to copy anything into `printer.cfg` for the unit to work. The firmware reads the
 same values from the unit's own page at every boot (`hardware.md`, "Factory calibration page"),
-and uses them for the insert sensors. `ACE_STATUS` shows the bands in use and where they came from.
+and uses them for the insert sensors. `ACEK_STATUS` shows the bands in use and where they came from.
 
 ### Factory firmware → ace2k
 
@@ -303,8 +400,8 @@ Then add the unit to `printer.cfg` and restart Klipper:
 You need both sections:
 
 - `[ace2k]` sends `ace2k_version` when Klipper identifies the MCU. That is the firmware's proof
-  that the link works. Without it, a freshly flashed unit resets into recovery after 180 s
-  (`protocol.md`, "The link proof").
+  that the link works (`ace2k_flash.pyz` sends it too, right after a flash). Without either, a
+  freshly flashed unit resets into recovery after 180 s (`protocol.md`, "The link proof").
 - `restart_method: command` makes `FIRMWARE_RESTART` a plain reset of the unit. The unit goes back
   into ace2k through the bootloader's validation, never into recovery.
 
@@ -329,7 +426,8 @@ Without Klipper at all, Klipper's own `klippy/console.py PORT` connects to the u
 
 ### ace2k → factory firmware
 
-1. Send `ACE_RESTORE_STOCK` from Klipper. On a bench without Klipper running, connect with
+1. Send `ACEK_RESTORE_STOCK` from Klipper. A host module up to v0.12.0-rc.1 takes the old name
+   (`ACE_RESTORE_STOCK` → `ACEK_RESTORE_STOCK`). On a bench without Klipper running, connect with
    Klipper's `klippy/console.py PORT` instead, and send the firmware command
    `ace2k_bootloader_enter`. That is a low-level command of the unit; it does not exist in
    Klipper's console. The command is refused while the dryer is heating or a lane moves, so stop
@@ -355,9 +453,14 @@ encoder scale). Klipper will not start while that block still declares `[ace2k]`
 
 ### ace2k → a newer ace2k
 
-Follow the same path as the restore, with the new image instead of the factory one:
+With Klipper stopped, the flasher reaches the unit over its cable and sends it into recovery
+itself: it sends `ace2k_bootloader_enter`, and a unit that is busy (a lane moves, the heater or the
+fans run) refuses, with nothing changed. By hand, follow the same path as the restore, with the
+new image instead of the factory one:
 
-1. Send `ACE_RESTORE_STOCK`, or the firmware command `ace2k_bootloader_enter` from `console.py`.
+1. Send `ACEK_RESTORE_STOCK`, or the old name on a host module up to v0.12.0-rc.1
+   (`ACE_RESTORE_STOCK` → `ACEK_RESTORE_STOCK`), or the firmware command `ace2k_bootloader_enter`
+   from `console.py`.
 2. Stop Klipper.
 3. Run `python3 ace2-ota-update.py PORT ace2k-X.Y.Z.bin --version ace2k-X.Y.Z --force` (about
    20 s). `--force` is harmless here. It is needed when the version string you announce is the one
@@ -370,7 +473,7 @@ see:
 
 1. the chase, until Klipper is started again (or `console.py` queries the version);
 2. then the intro sweep, when every lane is empty;
-3. then the lanes' own states.
+3. then the lanes' own states, or, with every lane empty, a short flash of all four every 10 s.
 
 **The updater's verify step never ends here, and that is expected.** Once every chunk is written,
 the updater prints `[verify] Waiting for ACE to reboot and report version …`. Then it prints
@@ -382,7 +485,7 @@ an ace2k image answers only the Klipper host. It is not a failure. What to do:
 3. Start Klipper. Do it within the 180 s an unproven image waits for the host (see "If the unit
    does not answer after a flash", below).
 4. The LEDs are the real confirmation: the chase until Klipper connects, then the intro sweep
-   (when every lane is empty). `ACE_STATUS` names the new version.
+   (when every lane is empty). `ACEK_STATUS` names the new version.
 
 ### If the unit does not answer after a flash
 
@@ -406,7 +509,8 @@ The three LED states, so you can tell them apart:
 - **Intro sweep:** 300 ms dark, then 1 → 4 → 1 twice, 150 ms a step, about 2 s. It plays once at
   boot (or when the image is proven), and only while every lane is empty. The image has been
   proven and runs. It never resets itself for lack of a host. After the sweep, each LED shows its
-  lane ([Lane LEDs](hardware.md#lane-leds)).
+  lane ([Lane LEDs](hardware.md#lane-leds)). With every lane empty, all four then flash together
+  for 100 ms every 10 s, the first flash 10 s after the sweep.
 - **All four strobing fast** (~17 Hz): the bootloader's recovery. Step 3 of "ace2k → factory
   firmware" works.
 

@@ -1,25 +1,27 @@
 #!/bin/sh
-# Check the host toolchain the ace2k build, tests and lints need.  Exit 1 if anything is
-# missing.  Klipper needs a cross toolchain WITH newlib (sched.c includes <setjmp.h> and the
-# link uses libc_nano); the Homebrew arm-none-eabi-gcc formula ships without it, the Arm GNU
-# Toolchain cask (gcc-arm-embedded) ships with it.
+# Check the host toolchain that the ace2k build, tests and lints need. Exit with 1 if anything is
+# missing.
+# Klipper needs a cross toolchain with newlib. The file sched.c includes <setjmp.h>, and the link
+# uses libc_nano. The Homebrew formula arm-none-eabi-gcc comes without newlib. The Arm GNU
+# Toolchain cask (gcc-arm-embedded) comes with it.
 set -u
 status=0
 llvm_bin=$(brew --prefix llvm 2>/dev/null)/bin
 PATH="$PATH:$llvm_bin"
 
-report() { # status name detail
+report() { # arguments: status name detail
     printf '  %-8s %-18s %s\n' "$1" "$2" "$3"
 }
-need() { # name command hint
+need() { # arguments: name command hint
     if command -v "$2" >/dev/null 2>&1; then report ok "$1" "$(command -v "$2")"
     else report MISSING "$1" "install: $3"; status=1; fi
 }
 
 echo "ace2k doctor"
 
-# Cross compiler: prefer the Arm cask, fall back to PATH; require newlib either way.  Newlib is
-# detected by asking the compiler itself to find <setjmp.h>, whatever the distribution's layout.
+# Cross compiler. Prefer the Arm cask and fall back to PATH. Newlib is required either way.
+# To detect newlib, ask the compiler itself to find <setjmp.h>. This works with any layout of the
+# distribution.
 cross=$(ls -d /Applications/ArmGNUToolchain/*/arm-none-eabi/bin/arm-none-eabi-gcc 2>/dev/null | head -1)
 [ -n "$cross" ] || cross=$(command -v arm-none-eabi-gcc 2>/dev/null)
 if [ -z "$cross" ]; then
@@ -36,14 +38,15 @@ need clang-format clang-format "brew install llvm  (keg-only: found via brew --p
 need clang-tidy clang-tidy "brew install llvm"
 need cppcheck cppcheck "brew install cppcheck"
 need ruff ruff "brew install ruff"
-# pytest as `make test-py` runs it: `python3 -m pytest`, so the module must import from python3.
+# Check pytest the way `make test-py` runs it, with `python3 -m pytest`. So the module must import
+# from python3.
 if pytest_version=$(python3 -c 'import pytest; print(pytest.__version__)' 2>/dev/null); then
     report ok pytest "python3 -m pytest ($pytest_version)"
 else
     report MISSING pytest "install it into that python3 (Debian/Ubuntu: apt install python3-pytest; elsewhere: python3 -m pip install pytest)"; status=1
 fi
 
-# The Klipper submodule, when present: report its commit and whether it matches the pin.
+# The Klipper submodule, if it is present. Report its commit and whether it matches the pin.
 here=$(cd "$(dirname "$0")/.." && pwd)
 if [ -f "$here/firmware/klipper.pin" ]; then
     pin=$(cat "$here/firmware/klipper.pin")

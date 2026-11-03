@@ -16,7 +16,7 @@ module does not depend on the printer. But it has only been tested on a Snapmake
 
 - On the U1, the adapter [ace2k-u1](https://github.com/tobecwb/ace2k-u1) connects the printer's
   own filament functions to the unit.
-- On another printer, you control the lanes from your own macros with the `ACE_*` commands
+- On another printer, you control the lanes from your own macros with the `ACEK_*` commands
   ([`docs/commands.md`](docs/commands.md)).
 
 **Spool tags from almost any brand.** Spool tags come in two kinds, NTAG and MIFARE Classic, and
@@ -31,8 +31,8 @@ brand.
 
 Nothing is ever written to a tag.
 
-**Status: Release Candidate `v0.12.0-rc.1`.** The long-run print test (burn-in) has not been done
-yet.
+**Status: `v0.13.0`.** The long-run print test (burn-in) ran on the release candidate: two
+prints, about 9 hours, with all four lanes of one unit in use.
 
 **How this was built.** AI tools were used in developing this firmware. Every feature and every
 change was verified on real hardware, over many hours of bench testing, before it was accepted.
@@ -42,6 +42,21 @@ Human review of the source code is still in progress.
 documentation may read a little oddly. Corrections are welcome.
 
 ## Read this first
+
+> [!CAUTION]
+> **The dryer's humidity mode turns a mains heater on by itself, with nobody there.**
+>
+> The dryer's heater runs on mains power. In the humidity mode, the unit starts a drying cycle on
+> its own whenever its box stays humid. It does this with the printer off and with nobody in the
+> room.
+>
+> The mode is off by default. It runs only after you set `unattended_drying: True` in the unit's
+> section of `printer.cfg`. Set it only if all of this is true:
+>
+> - The unit stands in a ventilated place, with nothing that burns next to it.
+> - Nothing is on the lid or over the vents.
+> - You accept that the heater's protections have never been triggered on purpose on a real unit
+>   (see the warning below).
 
 **Risks.** Flashing third-party firmware onto your ACE 2 Pro carries a small but real risk of
 damaging it. What limits that risk:
@@ -62,15 +77,12 @@ may void your warranty. This project is not affiliated with or endorsed by Anycu
 `1.6.0-paxx12-22`, at 127 V / 60 Hz. Nothing else has been tested.
 
 > [!WARNING]
-> **Connect only one unit to the printer.** ace2k has been tested with one ACE 2 Pro only. With
-> two or more units, the behaviour is unknown. This applies to every combination:
+> **Give each unit its own USB connection.** ace2k drives several ACE 2 Pro units, one per USB
+> connection, each as a named `[ace2k <name>]` section. See "Several units" in
+> [`docs/commands.md`](docs/commands.md#several-units). Two things are not supported:
 >
-> - all units on ace2k;
 > - one unit on ace2k and another on the factory firmware;
 > - units in a daisy chain, whatever firmware they run.
->
-> Support for several units is not implemented, and not decided yet
-> ([`docs/roadmap.md`](docs/roadmap.md)).
 
 > [!WARNING]
 > **Do not leave a drying cycle unattended.** The dryer switches mains power to a heater. Only the
@@ -102,15 +114,14 @@ All the documents:
 
 - [`docs/cable.md`](docs/cable.md) — the USB cable: Anycubic's own cable with a USB plug
 - [`docs/flashing.md`](docs/flashing.md) — flash the unit, and go back to the factory firmware
-- [`docs/commands.md`](docs/commands.md) — every `ACE_*` command and the flashing tool
+- [`docs/commands.md`](docs/commands.md) — every `ACEK_*` command and the flashing tool
 - [`docs/features.md`](docs/features.md) — configuration, the follow, the tail, the grip, the
-  feed-forward, encoder calibration, spool tags, drying, the lane LEDs
+  feed-forward, encoder calibration, spool tags, drying (by hand, by humidity, or during a print),
+  the lane LEDs
 - [`docs/differences-from-stock.md`](docs/differences-from-stock.md) — what behaves differently
   from the factory firmware
 - [`docs/limitations.md`](docs/limitations.md) — known limitations
 - [`docs/roadmap.md`](docs/roadmap.md) — what may come next
-- [`docs/logging.md`](docs/logging.md) — recording a long run, and what to attach to a problem
-  report
 - [`docs/hardware.md`](docs/hardware.md) — the board: pins, sensors, links
 - [`docs/protocol.md`](docs/protocol.md) — the host–unit protocol
 - [`docs/architecture.md`](docs/architecture.md) — layers, the MCU/host split, the module map
@@ -141,6 +152,14 @@ Run every target from `firmware/`, or as `make -C firmware <target>` from the tr
 Klipper is a git submodule, pinned in `firmware/klipper.pin`. `make build` applies one small patch
 to it (`firmware/patches/`) and overlays `firmware/src/`. Nothing under `firmware/klipper/` is
 edited by hand.
+
+## Reporting a problem
+
+Open an issue with what you saw (the time, the lane, the LEDs) and the output of `ACEK_STATUS` and
+`ACEK_HEALTH` from the console. Before you post `klippy.log` or your `printer.cfg`, remove your
+unit's USB serial number from it. It appears in the
+`/dev/serial/by-id/usb-1a86_USB_Single_Serial_<serial>-if00` path. A problem with the heater, the
+fans, the motors or flash is a safety problem: report it privately ([`SECURITY.md`](SECURITY.md)).
 
 ## Credits
 

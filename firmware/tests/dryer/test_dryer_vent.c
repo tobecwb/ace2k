@@ -187,7 +187,7 @@ static enum ace2k_dryer_vent_action guard_on_a_dip(uint32_t room_cg_over, uint32
     return run(&v, 55000, s, *t0, *t0 + (30U * 60000U), at);
 }
 
-/* Measured on the unit (2026-10-01): a 0.5 g/m³ dip below the room closed the flaps; under the 1 g/m³ close
+/* Measured on the unit: a 0.5 g/m³ dip below the room closed the flaps; under the 1 g/m³ close
  * margin it holds them open for 30 min. */
 TEST(a_half_gram_dip_below_the_room_does_not_close)
 {

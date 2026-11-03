@@ -43,8 +43,11 @@ named constant with its reason beside it. It goes at the top of the `.h` if it i
   … }`, with `ctx` supplied by the binding. The core never reads the clock or a register: `now_ms`
   and readings are arguments.
 - The core includes only `<stdint.h>`, `<stdbool.h>`, `<stddef.h>` and other core headers.
-- A `.c` over ~500 lines is a sign of a wrong cut. Split it (`feed.c` + `feed_insert.c` sharing a
-  private `feed_internal.h`).
+- **Size.** A `.c` or `.h` file has at most 1000 lines of code. Blank lines and lines with only a
+  comment do not count. A file over 1000 lines in total only gets a warning. `make quality` checks
+  every file under `src/` and fails above the limit. Do not aim for the limit: a `.c` over about
+  500 lines is a sign of a wrong cut. Split it (`feed.c` + `feed_insert.c` sharing a private
+  `feed_internal.h`).
 - Shared helpers (`ace2k_time_after()`, `ace2k_clamp_i32()`, `ACE2K_ARRAY_SIZE()`, mV ↔ m°C, CRC)
   exist **once**, in `ace2k/core/util.h`. Grep before you write one. If Klipper's `src/generic/`
   already has it, the binding uses Klipper's. The header's name shadows a BSD `<util.h>` that the
@@ -98,15 +101,21 @@ named constant with its reason beside it. It goes at the top of the `.h` if it i
 
 - The single flash erase/program routine refuses any address outside the ace2k config page. It is
   the only flash-writing code in the application.
-- `pins.h` classifies every pin. The triac gate is driven only by `dryer` through its `ops`. The
-  cutout latch-reset pin is **never driven by any image**.
-- The fan/heater interlock is in `dryer.c`: fans on before the first gate pulse, and kept on
-  through a temperature-gated cool-down. It is not in the binding, and not in Python.
+- `pins.h` classifies every pin. The triac gate is driven only by `heat` through its `ops`
+  (`ace2k_board/gate.c`). Only `heat_cmds.c` includes its header.
+- The cutout latch-reset pin is **never driven or configured by any image**. It has no name in
+  `pins.h`. Every image with the lane or the heater reserves it exactly once, so the host cannot
+  drive it. `tests/python/test_reserve_pins.py` and `make flag-check` check this.
+- The fan/heater interlock is in `heat.c`: both fans commanded on and reading high before every
+  gate pulse, plus the absolute limits and the lease. The dryer's policy (states, controller,
+  cool-down, protections) is in `dryer.c`. The rule "a fan is never off above 45 °C" is in
+  `airflow.c`. None of this is in a binding or in Python.
 - The cutout fault input latches a fault in every dryer state, not only while heating.
 - Motion stops on link loss, and `lane` enforces it:
   - Its tick takes `link_ok` as an argument. The binding samples it once per tick from the serial
-    driver. Klipper's clock queries arrive about once a second. 3 s without a received byte is a
-    lost link, latched until the next byte.
+    driver. Klipper's clock queries arrive about once a second. 3 s without a valid frame (its CRC
+    and sequence checked by Klipper) is a lost link, latched until the next frame. Bytes alone do
+    not count: noise, or a converter that keeps sending after the host died, is bytes too.
   - A false `link_ok` ends every running move on that tick, with the motor stopped.
   - `feed` receives the same sample after the lane's tick. Without it, `feed` refuses to start
     anything (a move, an assist, a load). It also ends what was armed with no move running: an
@@ -159,7 +168,7 @@ These are short, because the host is thin by the decision in
   `load_config_prefix` for named sections); dependencies via `printer.lookup_object()`; G-code via
   `gcode.register_command()`; state via `get_status(eventtime)`. Anyone who has read a Klipper
   `extras/` module will recognise ours.
-- **Namespace**: files `ace2k*.py`, classes `Ace2k<Thing>`, section `[ace2k]`, G-codes `ACE_*`,
+- **Namespace**: files `ace2k*.py`, classes `Ace2k<Thing>`, section `[ace2k]`, G-codes `ACEK_*`,
   status keys `snake_case`.
 - **Talk to the MCU only through the dictionary**: `mcu.lookup_command()` /
   `mcu.lookup_query_command()` to send, `mcu.register_response()` for events. No manual parsing, no
@@ -170,12 +179,24 @@ These are short, because the host is thin by the decision in
 - **Do not duplicate what the MCU enforces.** Interlocks, limits and timeouts live in C. Python
   shows state, turns user intent into commands, and sequences the printer side (extruder, tip
   forming, the change itself). A safety rule found in Python is in the wrong place.
-- **Style**: Python 3, PEP 8 at 100 columns, `ruff` for lint **and** formatting (one tool), type
-  hints on public signatures. English docstrings have the same shape as the C prose: what, units,
-  what happens on error.
+- **Style**: Python 3, PEP 8 at 100 columns, `ruff` for lint **and** formatting (one tool). Every
+  function has type hints, public and private. `mypy --strict` checks the host modules and the
+  firmware tools. English docstrings have the same shape as the C prose: what, units, what happens
+  on error.
+- **Size and complexity**: a module has at most 1000 lines of code. Blank lines, comments and
+  docstrings do not count. A module over 1000 lines in total only gets a warning. Every function
+  stays at complexity C or better in `xenon`. A module that grows past this is cut in two by what
+  it does, not trimmed.
 - **Tests**: `pytest` with a fake `mcu` object for the sequencing logic. The fake records the
   commands sent and injects events. Klipper's batch mode (`test/klippy/`) is for integration, once
-  a `.dict` exists.
+  a `.dict` exists. The tests follow the same `ruff` rules as the code, type hints included, with
+  six exceptions for test files only:
+  - `PLR2004`: a number in an assertion is the point of the test;
+  - `ARG001`, `ARG002`, `ARG005`: a fake keeps the real signature, so it may not use every
+    argument;
+  - `PLR0913`, `PLR0917`: a test helper may take many parameters.
+
+  `mypy` does not run on the tests.
 - **Install**: the `.py` files are copied into the printer's `klippy/extras/`, and the `.cfg` files
   are included from `printer.cfg`. Nothing else in Klipper is touched. The Snapmaker U1 adapter's
   install guide shows the commands.
@@ -193,10 +214,13 @@ Every target is run from `firmware/`, or as `make -C firmware <target>` from the
 | Target | Does |
 |---|---|
 | `make` | resets the submodule to its pin → applies `patches/*.patch` (`git apply --check` first) as one deterministic temporary commit → `overlay` (symlinks `src/ace2k`, `src/ace2k_board`, `src/stm32/gd32f30x.c` into `klipper/src/`, excluded from the submodule's status) → copies `config/ace2k.config` → `make -C klipper` → `mkimage.py` → `build/ace2k-<version>.bin`, `.elf`, `.dict`, size report → resets the submodule again |
-| `make test` | host tests of the core (`cc`, no Klipper, no hardware) + `pytest` |
-| `make lint` | `clang-format --dry-run`, `clang-tidy`, `cppcheck`, `ruff check` |
+| `make test` | host tests of the core (`cc`, no Klipper, no hardware, under the address and undefined-behaviour sanitizers) + `pytest` |
+| `make lint` | `clang-format --dry-run`, `clang-tidy` (`tidy` and `tidy-bind`), `cppcheck`, `ruff check`, and no C line over 100 characters |
+| `make tidy-bind` | `clang-tidy` on the Klipper-facing layer, with Klipper's and the Arm headers; needs `make build` first (see [Lints](#lints)) |
+| `make quality` | the quality gate (see [Quality gate](#quality-gate)) |
+| `make flag-check` | builds the release and proves what it must and must not carry: made from `config/ace2k.config`, the version constant, the cutout latch-reset pin never drivable, the dryer present, no bench command |
 | `make lint-selftest` | proves the `clang-tidy` rules fire: runs them on `tests/lint-fixtures/bad_style.c` and requires the findings the fixture was written for |
-| `make coverage` | `llvm-cov` report of the host tests on `src/ace2k/` (built with `clang` — `COVCC=` to point elsewhere) |
+| `make coverage` | `llvm-cov` report of the host tests on `src/ace2k/` (built with `clang` and without the sanitizers; `COVCC=` to point elsewhere) |
 | `make format` | `clang-format -i`, `ruff format` |
 | `make doctor` | checks the toolchain (`arm-none-eabi-gcc`, `llvm` for clang-format/clang-tidy, `cppcheck`, `ruff`) and the submodule pin |
 | `make hooks` | installs `scripts/pre-commit`, which runs `make format-check` only, on the staged copy of the tree (what will be committed, not the working tree) and only when something it checks is staged; resolves the firmware directory from the repository root at run time; refuses to overwrite a hook it did not write itself |
@@ -207,7 +231,7 @@ There is one patch to Klipper. `firmware/patches/README.md` lists every hunk. It
 - the GD32F303 hooks: the processor entry, the clock file's routing, the stall notice for the flash
   writes, the internal reference as an ADC pseudo-pin, the software I²C setup a module can own;
 - `console_try_sendf`, the transmit call that says whether a frame was queued. With it, a binding
-  can hold a frame that does not fit instead of losing it (`src/ace2k/core/tx.h`).
+  can hold a frame that does not fit instead of losing it (`src/ace2k_board/tx.h`).
 
 The patch stays under 100 added lines (83 today, over ten files). A hook that would grow it past
 that is a Klipper change to argue upstream.
@@ -225,8 +249,8 @@ Version: `git describe --tags --match 'v[0-9]*'` → SemVer `vX.Y.Z`, baked into
 returned by `ace2k_version`. The match keeps another project's tags in the same repository out of
 it. Their names would also overflow the 31 characters the config record holds.
 
-Size budget: the application slot is 112 KB. **The build fails above 96 KB**, to keep a reserve
-for the config page and growth.
+Size budget: the application slot is 112 KB. **The build fails above 104 KB**, to keep a reserve
+for the config page.
 
 Edit only under `firmware/src/`, `firmware/config/`, `firmware/patches/`, `firmware/tests/` and
 `firmware/tools/`. `firmware/klipper/` is disposable and reset on every build.
@@ -251,7 +275,9 @@ There are two `.clang-format` files:
 
 `tests/` and (when it exists) `src/ace2k_board/` use the `src/ace2k` style through a
 `.clang-format` symlink. The formatter does not reflow comments (`ReflowComments: false`), so wrap
-a long comment by hand. Python: `ruff format`. `scripts/pre-commit` runs the format check before
+a long comment by hand. `make lint` fails on any line under `src/` or `tests/` that is longer than
+100 characters. It counts characters, not bytes, so `°` and `µ` count as one. The generated tables
+(`env_table.h`, `thermal_params.h`, `thermal_runs.h`) are not checked. Python: `ruff format`. `scripts/pre-commit` runs the format check before
 each commit.
 
 ### Lints
@@ -265,13 +291,64 @@ each commit.
   `readability-function-cognitive-complexity` (threshold 15) and `readability-identifier-naming`.
   The last one is configured with the table in "Naming": `ace2k_` prefix on globals, `UPPER_CASE`
   for enum values and constants, `snake_case` for functions and variables. It runs on the
-  host-compilable C: the core, `util.h`, the tests. The cross compiler and `cppcheck` check the
-  bindings. `tests/.clang-tidy` turns `readability-magic-numbers` off under `tests/`, because test
-  literals are the point of a test. It runs on our directories only; Klipper's tree is excluded.
+  host-compilable C: the core, `util.h`, the tests. `make tidy-bind` runs it on the Klipper-facing
+  layer (`*_cmds.c`, `src/ace2k_board/`, `src/stm32/gd32f30x.c`, and every `src/ace2k/` or
+  `src/ace2k_board/` header they include) with Klipper's and the Arm headers, so it needs
+  `make build` first. Its config is `src/.clang-tidy-bindings`: the same checks minus three that
+  fight Klipper's conventions, each with its reason in the file:
+  - `misc-use-internal-linkage`: Klipper finds command handlers and `DECL_*` objects by their
+    global name;
+  - `performance-no-int-to-ptr`: registers are reached through integer addresses;
+  - `readability-non-const-parameter`: Klipper declares every handler as
+    `void (*)(uint32_t *)`.
+
+  Macros do not count toward the cognitive complexity there. `src/stm32/gd32f30x.c` keeps
+  Klipper's own naming and braces, through `NOLINT` markers in that file. Anywhere else, a
+  `NOLINT` names its check and says why. `scripts/tidy-ratchet.txt` lists accepted findings, and
+  it is empty: every finding fails. Fix the code. Never add an entry to make a change pass.
+
+  The tests follow the same rules, with two changes in `tests/.clang-tidy`:
+  `readability-magic-numbers` is off, because a literal in a test is the point of the test, and
+  macros do not count toward the cognitive complexity, because the assertions are macros.
+  `clang-tidy` runs on our directories only; Klipper's tree is excluded.
 - **`cppcheck --enable=warning,style,performance,portability`**. Suppressions are inline and
   justified.
 - **`ruff check`** on every Python file (see [Python rules](#python-rules)). The rule set is
-  `ruff.toml` at the root of the tree.
+  `ruff.toml` at the root of the tree. Its few per-file ignores are permanent, each with its
+  reason: Klipper's fixed names in `klippy/extras`, the bare names of the `vulture` whitelist,
+  Klipper's own signatures in `ace2k_klipper_types.py`, and the six test exceptions. Never add an
+  ignore to make a change pass.
+
+### Quality gate
+
+`make -C firmware quality` checks the host code in `klippy/extras` and `scripts`, and the
+firmware tools in `firmware/tools`. It runs five tools on them:
+
+- `xenon` (complexity): every function at C or better, and every module and the average at A
+  (a tool module may be at B);
+- a module-size check: at most 1000 lines of code in a module. Blank lines, comments and
+  docstrings do not count. A module over 1000 lines in total only gets a warning;
+- `vulture` (dead code);
+- `pytest` with a coverage floor: 98.5 % for the host code, 97 % for the tools, each measured on
+  its own;
+- `mypy --strict` on every host module and every tool.
+
+It then checks the C core:
+
+- the same module-size limit over `firmware/src` (`.c` and `.h`; blank lines and comments do not
+  count);
+- a floor for the line and branch coverage that `make coverage` reports: 98.4 % of lines and
+  95.6 % of branches (`C_COVERAGE_LINES`, `C_COVERAGE_BRANCHES`).
+
+The limits are final. A floor goes up when tests add coverage, and never goes down.
+
+Install the tools once, in a virtual environment:
+`python3 -m pip install -r requirements-dev.txt`. Then run
+`make -C firmware quality PYTHON=<that environment's python>`.
+
+Run it before you open a pull request. It is not part of `make lint` and no hook calls it,
+because the coverage step runs the whole test suite. The limits live at the top of the `quality`
+target.
 
 ### Tests
 
@@ -284,8 +361,11 @@ each commit.
   every call. Every tag decoder has real-dump fixtures under `tests/fixtures/`, **with a synthetic
   UID, never a real one**. The test re-encodes the dump: UID replaced, BCC recomputed, derived keys
   re-derived.
-- **Coverage**: `llvm-cov` on `src/ace2k/`, reported in CI. It becomes a gate (80 %) from the
-  first release.
+- **Sanitizers**: `make test` builds every C test with AddressSanitizer and
+  UndefinedBehaviorSanitizer. Any report (an out-of-bounds access, a signed overflow, a bad shift)
+  stops the test, and the suite fails.
+- **Coverage**: `llvm-cov` on `src/ace2k/`, reported in CI. `make quality` fails below the floors
+  of [Quality gate](#quality-gate).
 - **Python**: `pytest` with the fake `mcu` (see [Python rules](#python-rules)).
 - **Bench**: not automatable. Each subsystem has an acceptance checklist, written with its change.
   It is run on a unit, with the date and the unit noted in the pull request. The whole firmware is
@@ -373,5 +453,8 @@ not start (observed on the unit).
 
 - SemVer `vX.Y.Z`.
 - A changelog by module.
+- The host interface only grows. A change that would break a caller follows
+  [`docs/protocol.md`](docs/protocol.md), "What a caller can rely on": announced one release ahead,
+  then a minor version and a **Breaking** line.
 - `.bin` + `sha256` + `.dict`.
 - The bench checklist and the reversibility drill, dated in the release note.

@@ -1,5 +1,6 @@
 #include "test.h"
 #include "lane/sensors.h"
+#include "core/config.h" // ace2k_insert_band_defaults
 
 static struct ace2k_insert_band ace2k_defaults[ACE2K_LANE_COUNT];
 
@@ -25,6 +26,7 @@ static void inputs_idle(struct ace2k_sensors_inputs *in)
     }
     in->adc_age_ms = 0;
     in->adc_valid = true;
+    in->now_ms = 0;
     in->levels = (uint16_t)(bit_of(ACE2K_SENSORS_IN_COUNT) - 1U);
     in->levels &= (uint16_t)~bit_of(ACE2K_SENSORS_IN_CUTOUT); /* idle low */
 }
@@ -42,12 +44,22 @@ static int drain(struct ace2k_sensors *s, struct ace2k_sensors_event *last)
     return n;
 }
 
-static void ticks(struct ace2k_sensors *s, struct ace2k_sensors_inputs *in, int n, uint32_t *now)
+/* One tick every ACE2K_SENSORS_TICK_PERIOD_MS, as the board's tick runs it. */
+static void ticks(struct ace2k_sensors *s, struct ace2k_sensors_inputs *in, int n)
 {
     for (int i = 0; i < n; i++) {
-        *now += 10;
-        ace2k_sensors_tick(s, *now, in);
+        in->now_ms += ACE2K_SENSORS_TICK_PERIOD_MS;
+        ace2k_sensors_tick(s, in);
     }
+}
+
+/* A flash write held the core for stall_ms: the board's tick catches up in one call, its clock
+ * moved on by the whole stall, and the pass left from before the stall is that much older. */
+static void stall(struct ace2k_sensors *s, struct ace2k_sensors_inputs *in, uint32_t stall_ms)
+{
+    in->now_ms += stall_ms;
+    in->adc_age_ms += stall_ms;
+    ace2k_sensors_tick(s, in);
 }
 
 TEST(first_tick_primes_silently_even_with_switches_asserted)
@@ -59,8 +71,7 @@ TEST(first_tick_primes_silently_even_with_switches_asserted)
     inputs_idle(&in);
     in.levels &= (uint16_t)~bit_of(ACE2K_SENSORS_IN_REST1); /* lane 1 at rest */
     in.mv[ACE2K_ADC_INSERT1] = 400;                         /* present: below 750 */
-    uint32_t now = 0;
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     ASSERT_EQ(drain(&s, 0), 0);
     ASSERT_TRUE(s.lane[0].rest);
     ASSERT_TRUE(s.lane[0].insert); /* primed straight from the hysteresis of the seeded filter */
@@ -74,20 +85,19 @@ TEST(insert_asserts_after_the_filter_and_the_debounce_with_one_event)
     make_defaults();
     ace2k_sensors_init(&s, ace2k_defaults);
     inputs_idle(&in);
-    uint32_t now = 0;
-    ticks(&s, &in, 5, &now);
+    ticks(&s, &in, 5);
     ASSERT_EQ(drain(&s, 0), 0);
     in.mv[ACE2K_ADC_INSERT1] = 500; /* a strand: the reading falls */
-    ticks(&s, &in, 4, &now);
+    ticks(&s, &in, 4);
     ASSERT_EQ(drain(&s, 0), 0); /* α = 0.2: 500 + 700 × 0.8^4 = 786 > 750 */
     /* tick 5: 729 ≤ 750, raw present; tick 6: the debounce's second sample, the event */
-    ticks(&s, &in, 4, &now);
+    ticks(&s, &in, 4);
     ASSERT_EQ(drain(&s, &ev), 1);
     ASSERT_EQ(ev.lane, 0);
     ASSERT_EQ(ev.kind, ACE2K_SENSORS_KIND_INSERT);
     ASSERT_EQ(ev.level, 1);
     ASSERT_TRUE(ace2k_sensors_switches(&s) & 1U);
-    ticks(&s, &in, 20, &now);
+    ticks(&s, &in, 20);
     ASSERT_EQ(drain(&s, 0), 0);
 }
 
@@ -99,20 +109,19 @@ TEST(insert_hysteresis_at_thirty_and_seventy_percent_of_the_band)
     make_defaults();
     ace2k_sensors_init(&s, ace2k_defaults);
     inputs_idle(&in);
-    uint32_t now = 0;
     in.mv[ACE2K_ADC_INSERT2] = 800; /* above 750: never asserts */
-    ticks(&s, &in, 50, &now);
+    ticks(&s, &in, 50);
     ASSERT_EQ(drain(&s, 0), 0);
     ASSERT_TRUE(!s.lane[1].insert);
     in.mv[ACE2K_ADC_INSERT2] = 500; /* tick 1: 740 ≤ 750, raw present; the event on tick 2 */
-    ticks(&s, &in, 30, &now);
+    ticks(&s, &in, 30);
     ASSERT_EQ(drain(&s, 0), 1);
     in.mv[ACE2K_ADC_INSERT2] = 900; /* below 950: stays (the filter settles at 899) */
-    ticks(&s, &in, 50, &now);
+    ticks(&s, &in, 50);
     ASSERT_EQ(drain(&s, 0), 0);
     ASSERT_TRUE(s.lane[1].insert);
     in.mv[ACE2K_ADC_INSERT2] = 1000; /* tick 4: 958 ≥ 950, raw absent; the event on tick 5 */
-    ticks(&s, &in, 30, &now);
+    ticks(&s, &in, 30);
     ASSERT_EQ(drain(&s, &ev), 1);
     ASSERT_EQ(ev.lane, 1);
     ASSERT_EQ(ev.level, 0);
@@ -126,13 +135,12 @@ TEST(switch_needs_two_identical_samples_and_ignores_a_glitch)
     make_defaults();
     ace2k_sensors_init(&s, ace2k_defaults);
     inputs_idle(&in);
-    uint32_t now = 0;
-    ticks(&s, &in, 3, &now);
+    ticks(&s, &in, 3);
     in.levels &= (uint16_t)~bit_of(ACE2K_SENSORS_IN_PUSHED1 + 2); /* lane 3 pushed */
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     ASSERT_EQ(drain(&s, 0), 0);
     ASSERT_TRUE(!s.lane[2].pushed);
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     ASSERT_EQ(drain(&s, &ev), 1);
     ASSERT_EQ(ev.lane, 2);
     ASSERT_EQ(ev.kind, ACE2K_SENSORS_KIND_PUSHED);
@@ -141,9 +149,9 @@ TEST(switch_needs_two_identical_samples_and_ignores_a_glitch)
                 1U);
     /* a one-tick release is a glitch */
     in.levels |= (uint16_t)bit_of(ACE2K_SENSORS_IN_PUSHED1 + 2);
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     in.levels &= (uint16_t)~bit_of(ACE2K_SENSORS_IN_PUSHED1 + 2);
-    ticks(&s, &in, 3, &now);
+    ticks(&s, &in, 3);
     ASSERT_EQ(drain(&s, 0), 0);
     ASSERT_TRUE(s.lane[2].pushed);
 }
@@ -156,17 +164,16 @@ TEST(pulled_and_cutout_are_shared_events_with_no_lane)
     make_defaults();
     ace2k_sensors_init(&s, ace2k_defaults);
     inputs_idle(&in);
-    uint32_t now = 0;
-    ticks(&s, &in, 2, &now);
+    ticks(&s, &in, 2);
     in.levels &= (uint16_t)~bit_of(ACE2K_SENSORS_IN_PULLED);
-    ticks(&s, &in, 2, &now);
+    ticks(&s, &in, 2);
     ASSERT_EQ(drain(&s, &ev), 1);
     ASSERT_EQ(ev.lane, ACE2K_SENSORS_LANE_NONE);
     ASSERT_EQ(ev.kind, ACE2K_SENSORS_KIND_PULLED);
     ASSERT_EQ(ev.level, 1);
     ASSERT_TRUE(((uint32_t)ace2k_sensors_switches(&s) >> ACE2K_SENSORS_STATE_PULLED_BIT) & 1U);
     in.levels |= (uint16_t)bit_of(ACE2K_SENSORS_IN_CUTOUT); /* asserted high */
-    ticks(&s, &in, 2, &now);
+    ticks(&s, &in, 2);
     ASSERT_EQ(drain(&s, &ev), 1);
     ASSERT_EQ(ev.kind, ACE2K_SENSORS_KIND_CUTOUT);
     ASSERT_TRUE(((uint32_t)ace2k_sensors_switches(&s) >> ACE2K_SENSORS_STATE_CUTOUT_BIT) & 1U);
@@ -193,18 +200,17 @@ TEST(fresh_connected_and_consistent)
     make_defaults();
     ace2k_sensors_init(&s, ace2k_defaults);
     inputs_idle(&in);
-    uint32_t now = 0;
     ASSERT_TRUE(!ace2k_sensors_fresh(&s));
     in.adc_age_ms = 50;
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     ASSERT_TRUE(ace2k_sensors_fresh(&s));
     in.adc_age_ms = 51;
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     ASSERT_TRUE(!ace2k_sensors_fresh(&s));
     in.mv[ACE2K_ADC_INSERT1] = 10;
     in.mv[ACE2K_ADC_INSERT2] = 3260;
     in.mv[ACE2K_ADC_INSERT3] = 800;
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     ASSERT_TRUE(!ace2k_sensors_insert_connected(&s, 0));
     ASSERT_TRUE(!ace2k_sensors_insert_connected(&s, 1));
     ASSERT_TRUE(ace2k_sensors_insert_connected(&s, 2));
@@ -214,7 +220,7 @@ TEST(fresh_connected_and_consistent)
     in.mv[ACE2K_ADC_INSERT2] = ACE2K_SENSORS_RAIL_HIGH_MV;
     in.mv[ACE2K_ADC_INSERT3] = ACE2K_SENSORS_RAIL_LOW_MV + 1;
     in.mv[ACE2K_ADC_INSERT4] = ACE2K_SENSORS_RAIL_HIGH_MV - 1;
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     ASSERT_TRUE(!ace2k_sensors_insert_connected(&s, 0));
     ASSERT_TRUE(!ace2k_sensors_insert_connected(&s, 1));
     ASSERT_TRUE(ace2k_sensors_insert_connected(&s, 2));
@@ -222,7 +228,7 @@ TEST(fresh_connected_and_consistent)
     ASSERT_TRUE(ace2k_sensors_buffer_consistent(&s, 3));
     in.levels &=
         (uint16_t)~(bit_of(ACE2K_SENSORS_IN_REST1 + 3) | bit_of(ACE2K_SENSORS_IN_PUSHED1 + 3));
-    ticks(&s, &in, 2, &now);
+    ticks(&s, &in, 2);
     ASSERT_TRUE(!ace2k_sensors_buffer_consistent(&s, 3));
 }
 
@@ -233,10 +239,9 @@ TEST(a_sample_at_a_rail_is_never_filament)
     make_defaults();
     ace2k_sensors_init(&s, ace2k_defaults);
     inputs_idle(&in);
-    uint32_t now = 0;
     in.mv[ACE2K_ADC_INSERT1] = 10;   /* a disconnected lever board: below every band */
     in.mv[ACE2K_ADC_INSERT2] = 3260; /* a shorted one */
-    ticks(&s, &in, 50, &now);
+    ticks(&s, &in, 50);
     ASSERT_EQ(drain(&s, 0), 0);
     ASSERT_TRUE(!s.lane[0].insert);
     ASSERT_TRUE(!s.lane[1].insert);
@@ -245,16 +250,16 @@ TEST(a_sample_at_a_rail_is_never_filament)
     ASSERT_TRUE(!ace2k_sensors_insert_connected(&s, 1));
     /* a strand on a lane with filament already, then the board comes off: absent, one event */
     in.mv[ACE2K_ADC_INSERT3] = 500;
-    ticks(&s, &in, 30, &now);
+    ticks(&s, &in, 30);
     ASSERT_EQ(drain(&s, 0), 1);
     ASSERT_TRUE(s.lane[2].insert);
     in.mv[ACE2K_ADC_INSERT3] = 0;
-    ticks(&s, &in, 2, &now);
+    ticks(&s, &in, 2);
     ASSERT_EQ(drain(&s, 0), 1);
     ASSERT_TRUE(!s.lane[2].insert);
     /* back between the rails at a "present" reading: present again after the debounce */
     in.mv[ACE2K_ADC_INSERT3] = 500;
-    ticks(&s, &in, 30, &now);
+    ticks(&s, &in, 30);
     ASSERT_EQ(drain(&s, 0), 1);
     ASSERT_TRUE(s.lane[2].insert);
 }
@@ -267,25 +272,24 @@ TEST(a_return_from_the_low_rail_restarts_the_filter_from_the_real_value)
     make_defaults();
     ace2k_sensors_init(&s, ace2k_defaults);
     inputs_idle(&in);
-    uint32_t now = 0;
     /* the lever board off for 500 ms, then back with no filament: a filter left at 0 mV would
      * climb 240, 432, 585, 708 … through the "present" band and report a strand for 70 ms */
     in.mv[ACE2K_ADC_INSERT1] = 0;
-    ticks(&s, &in, 50, &now);
+    ticks(&s, &in, 50);
     ASSERT_EQ(drain(&s, 0), 0);
     ASSERT_TRUE(!s.lane[0].insert);
     in.mv[ACE2K_ADC_INSERT1] = 1200;
     for (int t = 0; t < 30; t++) {
-        ticks(&s, &in, 1, &now);
+        ticks(&s, &in, 1);
         ASSERT_EQ(drain(&s, 0), 0);
         ASSERT_TRUE(!s.lane[0].insert);
     }
     /* off again, then back with a strand present: one event, present */
     in.mv[ACE2K_ADC_INSERT1] = 0;
-    ticks(&s, &in, 50, &now);
+    ticks(&s, &in, 50);
     ASSERT_EQ(drain(&s, 0), 0);
     in.mv[ACE2K_ADC_INSERT1] = 500;
-    ticks(&s, &in, 30, &now);
+    ticks(&s, &in, 30);
     ASSERT_EQ(drain(&s, &ev), 1);
     ASSERT_EQ(ev.lane, 0);
     ASSERT_EQ(ev.kind, ACE2K_SENSORS_KIND_INSERT);
@@ -300,12 +304,11 @@ TEST(a_full_ring_drops_and_counts)
     make_defaults();
     ace2k_sensors_init(&s, ace2k_defaults);
     inputs_idle(&in);
-    uint32_t now = 0;
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     /* toggle lane 1's rest switch: every two ticks one event; 40 toggles overflow 15 slots */
     for (int t = 0; t < 40; t++) {
         in.levels ^= (uint16_t)bit_of(ACE2K_SENSORS_IN_REST1);
-        ticks(&s, &in, 2, &now);
+        ticks(&s, &in, 2);
     }
     ASSERT_EQ(s.dropped, 40 - (ACE2K_SENSORS_EVENT_RING - 1));
     ASSERT_TRUE(ace2k_sensors_has_events(&s));
@@ -322,14 +325,13 @@ TEST(a_peek_leaves_the_oldest_event_in_the_ring_for_the_pop)
     make_defaults();
     ace2k_sensors_init(&s, ace2k_defaults);
     inputs_idle(&in);
-    uint32_t now = 0;
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     struct ace2k_sensors_event ev;
     ASSERT_TRUE(!ace2k_sensors_peek_event(&s, &ev)); /* empty */
     in.levels ^= (uint16_t)bit_of(ACE2K_SENSORS_IN_REST1);
-    ticks(&s, &in, 2, &now);
+    ticks(&s, &in, 2);
     in.levels ^= (uint16_t)bit_of(ACE2K_SENSORS_IN_PUSHED1 + 1);
-    ticks(&s, &in, 2, &now);
+    ticks(&s, &in, 2);
     ASSERT_TRUE(ace2k_sensors_peek_event(&s, &ev));
     ASSERT_EQ(ev.kind, ACE2K_SENSORS_KIND_REST);
     ASSERT_EQ(ev.lane, 0);
@@ -355,11 +357,10 @@ TEST(insert_filter_seeds_on_the_first_pass_when_the_first_tick_had_none)
     ace2k_sensors_init(&s, ace2k_defaults);
     inputs_idle(&in);
     in.adc_valid = false;
-    uint32_t now = 0;
-    ticks(&s, &in, 3, &now);
+    ticks(&s, &in, 3);
     in.adc_valid = true;
     in.mv[ACE2K_ADC_INSERT1] = 400; /* present: below 750 */
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     ASSERT_EQ(drain(&s, 0), 0); /* seeded present, silently */
     ASSERT_TRUE(s.lane[0].insert);
 }
@@ -374,9 +375,8 @@ TEST(a_lane_moving_from_rest_to_pushed_in_one_pass_never_reads_as_both)
     make_defaults();
     ace2k_sensors_init(&s, ace2k_defaults);
     inputs_idle(&in);
-    uint32_t now = 0;
     in.levels &= (uint16_t)~bit_of(ACE2K_SENSORS_IN_REST1 + 1); /* lane 2 at rest */
-    ticks(&s, &in, 2, &now);
+    ticks(&s, &in, 2);
     ASSERT_TRUE(s.lane[1].rest);
     ASSERT_TRUE(!s.lane[1].rest_and_pushed);
     ASSERT_TRUE(ace2k_sensors_buffer_consistent(&s, 1));
@@ -384,7 +384,7 @@ TEST(a_lane_moving_from_rest_to_pushed_in_one_pass_never_reads_as_both)
     in.levels |= (uint16_t)bit_of(ACE2K_SENSORS_IN_REST1 + 1);
     in.levels &= (uint16_t)~bit_of(ACE2K_SENSORS_IN_PUSHED1 + 1);
     for (int t = 0; t < 4; t++) {
-        ticks(&s, &in, 1, &now);
+        ticks(&s, &in, 1);
         ASSERT_TRUE(!s.lane[1].rest_and_pushed);
         ASSERT_TRUE(ace2k_sensors_buffer_consistent(&s, 1));
     }
@@ -392,16 +392,16 @@ TEST(a_lane_moving_from_rest_to_pushed_in_one_pass_never_reads_as_both)
     ASSERT_TRUE(s.lane[1].pushed);
     /* a genuinely broken lane: both held for two ticks */
     in.levels &= (uint16_t)~bit_of(ACE2K_SENSORS_IN_REST1 + 1);
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     ASSERT_TRUE(!s.lane[1].rest_and_pushed); /* the first sample: not yet debounced */
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     ASSERT_TRUE(s.lane[1].rest_and_pushed);
     ASSERT_TRUE(!ace2k_sensors_buffer_consistent(&s, 1));
     ASSERT_TRUE(ace2k_sensors_buffer_consistent(&s, 0));
     ASSERT_TRUE(!ace2k_sensors_buffer_consistent(&s, 4)); /* no such lane */
     /* released: consistent again after the debounce */
     in.levels |= (uint16_t)bit_of(ACE2K_SENSORS_IN_PUSHED1 + 1);
-    ticks(&s, &in, 2, &now);
+    ticks(&s, &in, 2);
     ASSERT_TRUE(!s.lane[1].rest_and_pushed);
     ASSERT_TRUE(ace2k_sensors_buffer_consistent(&s, 1));
 }
@@ -415,22 +415,194 @@ TEST(the_age_is_zero_while_no_adc_pass_exists)
     make_defaults();
     ace2k_sensors_init(&s, ace2k_defaults);
     inputs_idle(&in);
-    uint32_t now = 0;
     in.adc_valid = false;
     in.adc_age_ms = 0xDEADBEEFU; /* indeterminate on the board */
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     ASSERT_EQ(s.adc_age_ms, 0);
     ASSERT_TRUE(!ace2k_sensors_fresh(&s));
     in.adc_valid = true;
     in.adc_age_ms = 20;
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     ASSERT_EQ(s.adc_age_ms, 20);
     ASSERT_TRUE(ace2k_sensors_fresh(&s));
     in.adc_valid = false;
     in.adc_age_ms = 0xDEADBEEFU;
-    ticks(&s, &in, 1, &now);
+    ticks(&s, &in, 1);
     ASSERT_EQ(s.adc_age_ms, 0);
     ASSERT_TRUE(!ace2k_sensors_fresh(&s));
+}
+
+TEST(the_insert_is_unknown_before_the_first_pass_and_known_after_it)
+{
+    struct ace2k_sensors s;
+    struct ace2k_sensors_inputs in;
+    make_defaults();
+    ace2k_sensors_init(&s, ace2k_defaults);
+    ASSERT_TRUE(!ace2k_sensors_insert_known(&s));
+    inputs_idle(&in);
+    in.adc_valid = false;
+    ticks(&s, &in, 2);
+    ASSERT_TRUE(!ace2k_sensors_insert_known(&s));
+    in.adc_valid = true;
+    ticks(&s, &in, 1);
+    ASSERT_TRUE(ace2k_sensors_insert_known(&s));
+}
+
+TEST(a_stale_pass_makes_the_insert_unknown_steps_nothing_and_sends_no_event)
+{
+    /* The scan stopped: the pass keeps its last values and only its age grows.  Past the bound
+     * env uses for the NTCs the insert is unknown, and nothing it reads moves the state. */
+    struct ace2k_sensors s;
+    struct ace2k_sensors_inputs in;
+    make_defaults();
+    ace2k_sensors_init(&s, ace2k_defaults);
+    inputs_idle(&in);
+    in.mv[ACE2K_ADC_INSERT1] = 400; /* lane 1 present */
+    ticks(&s, &in, 5);
+    ASSERT_EQ(drain(&s, 0), 0);
+    ASSERT_TRUE(s.lane[0].insert);
+    in.adc_age_ms = ACE2K_SENSORS_ADC_STALE_MS; /* at the bound: still a reading */
+    ticks(&s, &in, 1);
+    ASSERT_TRUE(ace2k_sensors_insert_known(&s));
+    in.adc_age_ms = ACE2K_SENSORS_ADC_STALE_MS + 10U;
+    in.mv[ACE2K_ADC_INSERT1] = 1200; /* what a frozen pass can never show: not read */
+    in.mv[ACE2K_ADC_INSERT2] = 400;
+    ticks(&s, &in, 30);
+    ASSERT_TRUE(!ace2k_sensors_insert_known(&s));
+    ASSERT_EQ(drain(&s, 0), 0);
+    ASSERT_TRUE(s.lane[0].insert); /* the debounced state is left as it was */
+    ASSERT_TRUE(!s.lane[1].insert);
+    /* the switches are digital and keep their debounce */
+    in.levels &= (uint16_t)~bit_of(ACE2K_SENSORS_IN_REST1);
+    ticks(&s, &in, 2);
+    struct ace2k_sensors_event ev;
+    ASSERT_EQ(drain(&s, &ev), 1);
+    ASSERT_EQ(ev.kind, ACE2K_SENSORS_KIND_REST);
+}
+
+TEST(a_resumed_scan_reseeds_the_filter_and_a_real_change_gives_its_edge)
+{
+    struct ace2k_sensors s;
+    struct ace2k_sensors_inputs in;
+    struct ace2k_sensors_event ev;
+    make_defaults();
+    ace2k_sensors_init(&s, ace2k_defaults);
+    inputs_idle(&in);
+    in.mv[ACE2K_ADC_INSERT1] = 400; /* lanes 1 and 2 present */
+    in.mv[ACE2K_ADC_INSERT2] = 400;
+    ticks(&s, &in, 5);
+    ASSERT_EQ(drain(&s, 0), 0);
+    in.adc_age_ms = 500U;
+    ticks(&s, &in, 10);
+    /* the scan is back: lane 1's spool ran out meanwhile, lane 2 is unchanged */
+    in.adc_age_ms = 0;
+    in.mv[ACE2K_ADC_INSERT1] = 1200;
+    ticks(&s, &in, 1);
+    ASSERT_TRUE(ace2k_sensors_insert_known(&s));
+    ASSERT_EQ(drain(&s, 0), 0); /* the debounce's first sample */
+    ticks(&s, &in, 1);
+    /* the filter started from the fresh pass: α = 0.2 from 400 would still read present here */
+    ASSERT_EQ(drain(&s, &ev), 1);
+    ASSERT_EQ(ev.lane, 0);
+    ASSERT_EQ(ev.kind, ACE2K_SENSORS_KIND_INSERT);
+    ASSERT_EQ(ev.level, 0);
+    ticks(&s, &in, 20);
+    ASSERT_EQ(drain(&s, 0), 0);
+    ASSERT_TRUE(s.lane[1].insert);
+    /* the filter steps again from there on: 500 + 700 × 0.8^4 = 786 > 750 after four ticks */
+    in.mv[ACE2K_ADC_INSERT1] = 500;
+    ticks(&s, &in, 4);
+    ASSERT_EQ(drain(&s, 0), 0);
+}
+
+TEST(a_flash_stall_leaves_the_insert_known_while_the_scan_resumes)
+{
+    /* A flash erase holds the core, the scan with it, for tens of ms.  The first pass after it
+     * ends up to two periods later.  So the age can pass the bound on the catch-up and the ticks
+     * just after it, although the scan never stopped.  That is no stale reading. */
+    struct ace2k_sensors s;
+    struct ace2k_sensors_inputs in;
+    make_defaults();
+    ace2k_sensors_init(&s, ace2k_defaults);
+    inputs_idle(&in);
+    in.mv[ACE2K_ADC_INSERT1] = 400; /* lane 1 present */
+    in.adc_age_ms = 5U;
+    ticks(&s, &in, 5);
+    ASSERT_EQ(drain(&s, 0), 0);
+    stall(&s, &in, 300U); /* the pass is now 305 ms old */
+    ASSERT_TRUE(in.adc_age_ms > ACE2K_SENSORS_ADC_STALE_MS);
+    ASSERT_TRUE(ace2k_sensors_insert_known(&s));
+    for (int i = 0; i < 3; i++) { /* the scan's first pass is not out yet */
+        in.adc_age_ms += ACE2K_SENSORS_TICK_PERIOD_MS;
+        ticks(&s, &in, 1);
+        ASSERT_TRUE(ace2k_sensors_insert_known(&s));
+    }
+    in.adc_age_ms = 2U; /* the scan is back */
+    for (int i = 0; i < 30; i++) {
+        ticks(&s, &in, 1);
+        ASSERT_TRUE(ace2k_sensors_insert_known(&s));
+    }
+    ASSERT_EQ(drain(&s, 0), 0);
+    ASSERT_TRUE(s.lane[0].insert);
+}
+
+TEST(a_scan_that_stays_stopped_after_a_stall_goes_unknown_once_the_settle_ends)
+{
+    struct ace2k_sensors s;
+    struct ace2k_sensors_inputs in;
+    make_defaults();
+    ace2k_sensors_init(&s, ace2k_defaults);
+    inputs_idle(&in);
+    in.mv[ACE2K_ADC_INSERT1] = 400;
+    ticks(&s, &in, 5);
+    stall(&s, &in, 300U);
+    ASSERT_TRUE(ace2k_sensors_insert_known(&s));
+    uint32_t held_ms = 0;
+    while (ace2k_sensors_insert_known(&s) && held_ms < 1000U) {
+        in.adc_age_ms += ACE2K_SENSORS_TICK_PERIOD_MS;
+        ticks(&s, &in, 1);
+        held_ms += ACE2K_SENSORS_TICK_PERIOD_MS;
+    }
+    ASSERT_TRUE(!ace2k_sensors_insert_known(&s));
+    ASSERT_EQ(held_ms, ACE2K_CATCHUP_SETTLE_MS); /* the settle of the catch-up, no longer */
+    ASSERT_EQ(drain(&s, 0), 0);
+    ASSERT_TRUE(s.lane[0].insert); /* frozen, as for any stale pass */
+}
+
+TEST(a_scan_stopped_before_a_stall_stays_unknown_through_it)
+{
+    struct ace2k_sensors s;
+    struct ace2k_sensors_inputs in;
+    make_defaults();
+    ace2k_sensors_init(&s, ace2k_defaults);
+    inputs_idle(&in);
+    ticks(&s, &in, 5);
+    in.adc_age_ms = 500U;
+    ticks(&s, &in, 1);
+    ASSERT_TRUE(!ace2k_sensors_insert_known(&s));
+    stall(&s, &in, 300U);
+    ASSERT_TRUE(!ace2k_sensors_insert_known(&s)); /* the settle keeps a verdict, it gives none */
+    ticks(&s, &in, 3);
+    ASSERT_TRUE(!ace2k_sensors_insert_known(&s));
+}
+
+TEST(the_aux_reading_is_taken_from_a_readable_pass_only)
+{
+    struct ace2k_sensors s;
+    struct ace2k_sensors_inputs in;
+    make_defaults();
+    ace2k_sensors_init(&s, ace2k_defaults);
+    inputs_idle(&in);
+    in.mv[ACE2K_ADC_AUX] = 1280;
+    ticks(&s, &in, 1);
+    ASSERT_EQ(s.aux_mv, 1280);
+    in.adc_age_ms = ACE2K_SENSORS_ADC_STALE_MS + 10U;
+    in.mv[ACE2K_ADC_AUX] = 900; /* what a frozen pass can never show: not read */
+    ticks(&s, &in, 3);
+    ASSERT_EQ(s.aux_mv, 1280);
+    in.adc_age_ms = 0;
+    ticks(&s, &in, 1);
+    ASSERT_EQ(s.aux_mv, 900);
 }
 
 // NOLINTNEXTLINE(readability-identifier-naming)

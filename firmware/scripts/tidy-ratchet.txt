@@ -1,0 +1,3 @@
+# clang-tidy findings accepted on the Klipper-facing layer, per file (`path: check1, check2`).
+# Empty: every finding fails `make tidy-bind`.  Fix the code; never add an entry to make a change
+# pass.

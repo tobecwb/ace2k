@@ -22,7 +22,7 @@ static bool table_has(uint8_t pin)
     return false;
 }
 
-TEST(the_image_claims_the_sixty_nine_pins_of_the_briefs)
+TEST(the_image_claims_its_sixty_nine_pins)
 {
     size_t count = 0;
     const struct ace2k_pin_entry *t = ace2k_pins_table(&count);
@@ -101,9 +101,10 @@ TEST(the_image_claims_the_sixty_nine_pins_of_the_briefs)
     ASSERT_EQ(per_class[ACE2K_PIN_CLASS_TRIAC], 1);
 }
 
-/* The dryer's first rule: the cutout's latch-reset pin, PC9, is never driven, configured or
- * reserved by any image.  Every entry of the table is scanned for it, and every named output of
- * pins.h must be one of those entries — so no name can expand to PC9 without failing here. */
+/* The cutout's latch-reset pin, PC9, is never driven or configured.  It is reserved exactly once,
+ * so that the host cannot drive it; tests/python/test_reserve_pins.py checks the reservation.  No
+ * entry of the table is PC9, and every named output of pins.h must be one of those entries, so no
+ * name can expand to PC9 without failing here. */
 TEST(the_cutout_latch_reset_is_in_no_table_and_has_no_name)
 {
     size_t count = 0;

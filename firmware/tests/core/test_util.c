@@ -26,6 +26,32 @@ TEST(time_since_survives_the_wrap)
     ASSERT_EQ(ace2k_time_since(1000U, 400U), 600);
 }
 
+TEST(within_u32_includes_both_bounds_and_nothing_outside)
+{
+    ASSERT_TRUE(ace2k_within_u32(10, 10, 20));
+    ASSERT_TRUE(ace2k_within_u32(20, 10, 20));
+    ASSERT_TRUE(!ace2k_within_u32(9, 10, 20));
+    ASSERT_TRUE(!ace2k_within_u32(21, 10, 20));
+    ASSERT_TRUE(ace2k_within_u32(UINT32_MAX, 0, UINT32_MAX));
+}
+
+TEST(abs_i32_is_the_magnitude_and_int32_min_has_one)
+{
+    ASSERT_EQ(ace2k_abs_i32(0), 0);
+    ASSERT_EQ(ace2k_abs_i32(1500), 1500);
+    ASSERT_EQ(ace2k_abs_i32(-1500), 1500);
+    ASSERT_EQ(ace2k_abs_i32(INT32_MAX), 2147483647U);
+    ASSERT_EQ(ace2k_abs_i32(INT32_MIN), 2147483648U); /* no int32_t holds it */
+}
+
+TEST(time_after_compares_any_wrapping_clock)
+{
+    /* the mains' span clock counts timer ticks, not milliseconds: the same comparison */
+    ASSERT_TRUE(ace2k_time_after(120000U, 120000U));
+    ASSERT_TRUE(!ace2k_time_after(119999U, 120000U));
+    ASSERT_TRUE(ace2k_time_after(10U, 0xFFFFFF00U)); /* past the wrap */
+}
+
 TEST(clamp_i32_bounds_both_sides)
 {
     ASSERT_EQ(ace2k_clamp_i32(-5, 0, 10), 0);

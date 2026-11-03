@@ -1,13 +1,19 @@
 """ace2k_tags: the brand modules, the registry, the key derivations, the [ace2k_tag] sections —
 with synthetic UIDs and synthetic dumps only (no real tag's UID ever enters the tree)."""
 
+from __future__ import annotations
+
 import configparser
 import struct
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import ace2k_tag
 import pytest
 from ace2k_tags import base, crypto, registry
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 CFG = Path(__file__).resolve().parents[3] / "config" / "ace2k_tags.cfg"
 UID4 = bytes.fromhex("01020304")
@@ -16,7 +22,7 @@ NTAG = base.Chip(uid=UID7, atqa=0x0044, sak=0x00)
 M1K = base.Chip(uid=UID4, atqa=0x0004, sak=0x08)
 
 
-def sections():
+def sections() -> dict[str, dict[str, str]]:
     """The shipped file's sections as {brand: {option: value}}, as ace2k_tag.py hands them."""
     cp = configparser.ConfigParser(interpolation=None)
     cp.read(CFG)
@@ -28,11 +34,11 @@ def sections():
     return out
 
 
-def brand(name):
+def brand(name: str) -> base.TagFormat:
     return registry.BRANDS[name](sections()[name])
 
 
-def test_aes_matches_fips_197_and_inverts():
+def test_aes_matches_fips_197_and_inverts() -> None:
     key = bytes(range(16))
     pt = bytes.fromhex("00112233445566778899aabbccddeeff")
     ct = crypto.aes128_encrypt_block(key, pt)
@@ -40,7 +46,7 @@ def test_aes_matches_fips_197_and_inverts():
     assert crypto.aes128_decrypt_block(key, ct) == pt
 
 
-def test_hkdf_matches_rfc_5869_case_1():
+def test_hkdf_matches_rfc_5869_case_1() -> None:
     ikm = bytes([0x0B] * 22)
     salt = bytes(range(13))
     info = bytes(range(0xF0, 0xFA))
@@ -50,7 +56,7 @@ def test_hkdf_matches_rfc_5869_case_1():
     )
 
 
-def test_every_brand_parameter_lives_in_the_cfg_with_a_source():
+def test_every_brand_parameter_lives_in_the_cfg_with_a_source() -> None:
     s = sections()
     assert set(s) == {"anycubic", "bambu", "creality", "elegoo", "snapmaker"}
     for name, opts in s.items():
@@ -61,7 +67,7 @@ def test_every_brand_parameter_lives_in_the_cfg_with_a_source():
             assert secret not in text, (py.name, secret)
 
 
-def test_key_derivations_for_a_synthetic_uid():
+def test_key_derivations_for_a_synthetic_uid() -> None:
     bambu = brand("bambu")
     assert bambu.key_for(UID4, 0).hex() == "6b0d673986de"
     assert bambu.key_for(UID4, 1).hex() == "9c41cdfa0a4d"
@@ -72,14 +78,14 @@ def test_key_derivations_for_a_synthetic_uid():
     assert brand("creality").key_for(UID4, 1).hex() == "440cef12b194"
 
 
-def test_claims_by_chip_type():
+def test_claims_by_chip_type() -> None:
     for name in ("anycubic", "elegoo"):
         assert brand(name).claims(NTAG) and not brand(name).claims(M1K)
     for name in ("bambu", "snapmaker", "creality"):
         assert brand(name).claims(M1K) and not brand(name).claims(NTAG)
 
 
-def ntag_got(pages):
+def ntag_got(pages: Mapping[int, bytes | bytearray]) -> base.Got:
     """A Got holding NTAG pages {page: 4 bytes}."""
     got = base.Got()
     for p, b in pages.items():
@@ -87,13 +93,13 @@ def ntag_got(pages):
     return got
 
 
-def ntag_image(img, first=4):
+def ntag_image(img: bytes, first: int = 4) -> dict[int, bytes]:
     """Pages from a byte image starting at page `first`."""
     img = img + bytes((-len(img)) % 4)
     return {first + i // 4: img[i : i + 4] for i in range(0, len(img), 4)}
 
 
-def anycubic_image():
+def anycubic_image() -> bytes:
     img = bytearray(144)
     img[0:4] = b"\x7b\x00\x65\x00"
     img[4:14] = b"AHPLBK-101"
@@ -107,7 +113,7 @@ def anycubic_image():
     return bytes(img)
 
 
-def test_anycubic_reads_the_user_area_in_three_steps_and_decodes():
+def test_anycubic_reads_the_user_area_in_three_steps_and_decodes() -> None:
     a = brand("anycubic")
     got = base.Got()
     steps = a.steps(NTAG, got)
@@ -130,7 +136,7 @@ def test_anycubic_reads_the_user_area_in_three_steps_and_decodes():
     assert a.decode(NTAG, other) is None
 
 
-def elegoo_image():
+def elegoo_image() -> bytes:
     """OpenRFID's aligned layout at page 16: the marker, the material in ASCII, the colour, the
     hot-end range, the diameter and the weight, big-endian."""
     blk = bytearray(48)
@@ -144,7 +150,7 @@ def elegoo_image():
     return bytes(img)
 
 
-def test_elegoo_decodes_its_marker_and_declines_without_it():
+def test_elegoo_decodes_its_marker_and_declines_without_it() -> None:
     e = brand("elegoo")
     got = ntag_got(ntag_image(elegoo_image()))
     for p in range(4, 40):
@@ -157,14 +163,14 @@ def test_elegoo_decodes_its_marker_and_declines_without_it():
     assert e.decode(NTAG, ntag_got(ntag_image(anycubic_image()))) is None
 
 
-def mifare_got(blocks):
+def mifare_got(blocks: Mapping[int, bytes | bytearray]) -> base.Got:
     got = base.Got()
     for b, v in blocks.items():
         got.blocks[b] = bytes(v)
     return got
 
 
-def bambu_blocks():
+def bambu_blocks() -> dict[int, bytearray]:
     b = {i: bytearray(16) for i in (1, 2, 4, 5, 6, 12, 14)}
     b[1][0:6] = b"A00-K0"
     b[1][8:13] = b"GFA00"
@@ -179,7 +185,7 @@ def bambu_blocks():
     return b
 
 
-def test_bambu_asks_sector_by_sector_with_its_keys_and_decodes():
+def test_bambu_asks_sector_by_sector_with_its_keys_and_decodes() -> None:
     bb = brand("bambu")
     got = base.Got()
     (s0,) = bb.steps(M1K, got)
@@ -199,7 +205,7 @@ def test_bambu_asks_sector_by_sector_with_its_keys_and_decodes():
     assert rec.extra["production"] == "2025_10_17_14_26"
 
 
-def test_a_failed_authentication_makes_a_brand_decline():
+def test_a_failed_authentication_makes_a_brand_decline() -> None:
     bb = brand("bambu")
     got = base.Got()
     got.auth_failed.add((0, base.KEY_A))
@@ -207,7 +213,7 @@ def test_a_failed_authentication_makes_a_brand_decline():
     assert bb.decode(M1K, got) is None
 
 
-def snapmaker_blocks():
+def snapmaker_blocks() -> dict[int, bytearray]:
     img = bytearray(176)
     img[16:25] = b"Snapmaker"
     img[32:41] = b"Polymaker"
@@ -220,7 +226,7 @@ def snapmaker_blocks():
     return {b: img[b * 16 : b * 16 + 16] for b in range(11) if b % 4 != 3}
 
 
-def test_snapmaker_reads_three_sectors_and_decodes_its_record():
+def test_snapmaker_reads_three_sectors_and_decodes_its_record() -> None:
     sm = brand("snapmaker")
     got = mifare_got(snapmaker_blocks())
     assert sm.steps(M1K, got) == []
@@ -234,7 +240,7 @@ def test_snapmaker_reads_three_sectors_and_decodes_its_record():
     assert rec.extra["signature"] == "unchecked"
 
 
-def test_creality_decrypts_sector_one_and_decodes_the_ascii_record():
+def test_creality_decrypts_sector_one_and_decodes_the_ascii_record() -> None:
     cr = brand("creality")
     (s1,) = cr.steps(M1K, base.Got())
     assert (s1.arg, s1.blocks, s1.key.hex()) == (1, 0b111, "440cef12b194")
@@ -254,14 +260,14 @@ def test_creality_decrypts_sector_one_and_decodes_the_ascii_record():
     assert cr.decode(M1K, garbage) is None
 
 
-def test_the_shipped_cfg_enables_exactly_the_three_brands_checked_on_real_tags():
+def test_the_shipped_cfg_enables_exactly_the_three_brands_checked_on_real_tags() -> None:
     s = sections()
     on = {name for name, opts in s.items() if registry._enabled(opts)}
     assert on == {"anycubic", "bambu", "snapmaker"}
     assert [f.name for f in registry.build(s)] == ["anycubic", "bambu", "snapmaker"]
 
 
-def all_enabled():
+def all_enabled() -> dict[str, dict[str, str]]:
     """The shipped sections with every brand switched on, Elegoo and Creality included."""
     s = sections()
     for opts in s.values():
@@ -269,7 +275,7 @@ def all_enabled():
     return s
 
 
-def test_the_registry_orders_ntag_brands_then_the_mifare_order_and_skips_disabled():
+def test_the_registry_orders_ntag_brands_then_the_mifare_order_and_skips_disabled() -> None:
     s = all_enabled()
     fmts = registry.build(s, ["creality", "bambu", "snapmaker"])
     assert [f.name for f in fmts] == ["anycubic", "elegoo", "creality", "bambu", "snapmaker"]
@@ -281,16 +287,16 @@ def test_the_registry_orders_ntag_brands_then_the_mifare_order_and_skips_disable
         registry.build(sections(), ["nosuch"])
 
 
-def test_a_new_brand_is_one_module_and_one_register_call():
+def test_a_new_brand_is_one_module_and_one_register_call() -> None:
     class Demo(base.TagFormat):
         name = "demo"
         chip = "ntag"
         needs = ()
 
-        def steps(self, chip, got):
+        def steps(self, chip: base.Chip, got: base.Got) -> list[base.Step]:
             return base.ntag_steps(got, 4, 7)
 
-        def decode(self, chip, got):
+        def decode(self, chip: base.Chip, got: base.Got) -> base.SpoolRecord | None:
             if got.pages.get(4, b"")[:2] != b"DM":
                 return None
             return base.SpoolRecord(format="demo", uid=chip.uid.hex().upper(), brand="Demo")
@@ -307,22 +313,22 @@ def test_a_new_brand_is_one_module_and_one_register_call():
         registry.BRANDS.pop("demo")
 
 
-def test_the_section_module_reads_every_option_and_marks_them_read():
+def test_the_section_module_reads_every_option_and_marks_them_read() -> None:
     class Section:
-        def __init__(self, name, opts):
+        def __init__(self, name: str, opts: dict[str, str]) -> None:
             self.name, self.opts, self.read = name, opts, set()
 
-        def get_name(self):
+        def get_name(self) -> str:
             return self.name
 
-        def get_prefix_options(self, prefix):
+        def get_prefix_options(self, prefix: str) -> list[str]:
             return [k for k in self.opts if k.startswith(prefix)]
 
-        def get(self, key, default=None):
+        def get(self, key: str, default: str | None = None) -> str | None:
             self.read.add(key)
             return self.opts.get(key, default)
 
-        def getboolean(self, key, default=None):
+        def getboolean(self, key: str, default: bool | None = None) -> bool | None:
             self.read.add(key)
             v = self.opts.get(key)
             return default if v is None else v.lower() in ("1", "true", "yes")

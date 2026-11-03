@@ -1,9 +1,8 @@
 #include "heat/mains.h"
 
-/* hz10 = 10 × half-periods / 2 / seconds = HZ10_HALF_MS × half-periods / ms: 10 (tenths of a
- * hertz) × 1 000 (ms a second) / 2 (half-periods a cycle). */
+/* hz10 = 10 × half-periods / 2 / seconds = HZ10_HALF_MS × half-periods / ms. The factors are 10
+ * (tenths of a hertz) × 1 000 (ms in a second) / 2 (half-periods in a cycle). */
 #define HZ10_HALF_MS 5000U
-#define PERCENT      100U
 
 void ace2k_mains_init(struct ace2k_mains *self, const struct ace2k_mains_ops *ops, void *ctx,
                       uint32_t now_ms, uint32_t ticks_per_ms)
@@ -18,8 +17,8 @@ void ace2k_mains_init(struct ace2k_mains *self, const struct ace2k_mains_ops *op
     self->published_ms = now_ms;
 }
 
-/* An edge within the presence window.  Written as an early return: in C a `&&` result is an
- * int, and the lint refuses one assigned to a bool. */
+/* True when an edge came within the presence window. Written with an early return, because in C
+ * a `&&` result is an int, and the lint refuses one assigned to a bool. */
 static bool edge_recent(const struct ace2k_mains *self, uint32_t now_ms)
 {
     if (!self->ever) {
@@ -28,11 +27,11 @@ static bool edge_recent(const struct ace2k_mains *self, uint32_t now_ms)
     return ace2k_time_since(now_ms, self->last_edge_ms) <= ACE2K_MAINS_PRESENT_MS;
 }
 
-/* hz10 of `half` half-periods over `dt` clock units (units_per_ms a millisecond), truncated as
- * the count always was (a value just under a band's floor stays under it).  64-bit, saturated
- * before the narrowing store: a chattering input must read as an impossible frequency, never wrap
- * to a plausible one.  half < 2^32 and HZ10_HALF_MS × units_per_ms ≤ 2^30 for any clock up to
- * 200 MHz: the product fits. */
+/* hz10 of `half` half-periods over `dt` clock units, with units_per_ms units in a millisecond. It
+ * is truncated, as the count always was, so a value just under the floor of a band stays under
+ * it. The math is 64-bit and saturates before the narrowing store. A chattering input must read
+ * as an impossible frequency, and never wrap to a plausible one. half < 2^32, and
+ * HZ10_HALF_MS × units_per_ms ≤ 2^30 for any clock up to 200 MHz, so the product fits. */
 static uint16_t hz10_from(uint32_t half, uint32_t dt, uint32_t units_per_ms)
 {
     if (dt == 0U) {
@@ -43,7 +42,8 @@ static uint16_t hz10_from(uint32_t half, uint32_t dt, uint32_t units_per_ms)
     return hz10 > UINT16_MAX ? UINT16_MAX : (uint16_t)hz10;
 }
 
-/* The base: the span's edge the next measurement runs from — the span's latest, when it has one. */
+/* Sets the base: the span's edge that the next measurement runs from. It is the latest edge
+ * of the span, when it has one. */
 static void rebase(struct ace2k_mains *self, const struct ace2k_mains_span *s)
 {
     self->base = *s;
@@ -52,7 +52,7 @@ static void rebase(struct ace2k_mains *self, const struct ace2k_mains_span *s)
     self->cur_dt = 0U;
 }
 
-/* How far hz10 lies below low_hz10 or above high_hz10, in 0.1 Hz (0 between them). */
+/* How far hz10 lies below low_hz10 or above high_hz10, in 0.1 Hz; 0 between them. */
 static uint32_t outside(uint16_t hz10, uint16_t low_hz10, uint16_t high_hz10)
 {
     if (hz10 < low_hz10) {
@@ -61,7 +61,7 @@ static uint32_t outside(uint16_t hz10, uint16_t low_hz10, uint16_t high_hz10)
     return hz10 > high_hz10 ? (uint32_t)hz10 - high_hz10 : 0U;
 }
 
-/* How far hz10 lies from the nearer band, in 0.1 Hz (0 inside one). */
+/* How far hz10 lies from the nearer band, in 0.1 Hz; 0 inside one. */
 static uint32_t off_band(uint16_t hz10)
 {
     uint32_t fifty = outside(hz10, ACE2K_MAINS_50_LOW_HZ10, ACE2K_MAINS_50_HIGH_HZ10);
@@ -69,10 +69,12 @@ static uint32_t off_band(uint16_t hz10)
     return fifty < sixty ? fifty : sixty;
 }
 
-/* The span's measurement so far, judged when it holds ACE2K_MAINS_SPAN_MIN_STALE_HALF (a missed
- * edge needs no measurement: every gap is a bridge, above): off-band, it is the worst when it lies
- * further from the bands than any before it (the deepest dip); in band, it widens the range the
- * window's measurements span; the longest is kept for the publication. */
+/* Judges the span's measurement so far, when it holds ACE2K_MAINS_SPAN_MIN_STALE_HALF. A
+ * missed edge needs no measurement, because every gap is a bridge (mains.h).
+ * - Off-band, it becomes the worst when it lies further from the bands than any before it. That
+ *   is the deepest dip.
+ * - In band, it widens the range of the window's measurements.
+ * The longest measurement is kept for the publication. */
 static void judge(struct ace2k_mains *self)
 {
     if (self->cur_half < ACE2K_MAINS_SPAN_MIN_STALE_HALF) {
@@ -93,7 +95,8 @@ static void judge(struct ace2k_mains *self)
     }
 }
 
-/* The range starts at the value just published, when it is a frequency. */
+/* Clears what was gathered since the publication. The range starts at the value just published,
+ * when it is a frequency. */
 static void since_publication_clear(struct ace2k_mains *self)
 {
     self->best_half = 0U;
@@ -105,22 +108,16 @@ static void since_publication_clear(struct ace2k_mains *self)
     self->high = band ? self->hz10 : 0U;
 }
 
-/* True once now_ticks has reached at_ticks on the span clock — ace2k_time_after() in the span
- * clock's units, wrap-safe while the two are less than 2^31 ticks apart. */
-static bool ticks_after(uint32_t now_ticks, uint32_t at_ticks)
-{
-    return (int32_t)(now_ticks - at_ticks) >= 0;
-}
-
-/* A pair sharing its first gap with the pair the last MISSED publication reported (its first
- * edge strictly before that pair's last — ticks_after() is inclusive, so a pair that starts at
- * that edge is a new one): the same gap, already published. */
+/* True for a pair that shares its first gap with the pair the last MISSED publication reported.
+ * Its first edge lies strictly before the last edge of that pair. ace2k_time_after() is
+ * inclusive, so a pair that starts at that edge is a new one. Such a pair is the same gap, already
+ * published. The times are ticks of the span clock, compared wrap-safe. */
 static bool bridge_published(const struct ace2k_mains *self, uint32_t from_ticks)
 {
     if (self->missed_hold == 0U) {
         return false;
     }
-    if (ticks_after(from_ticks, self->missed_to)) {
+    if (ace2k_time_after(from_ticks, self->missed_to)) {
         return false;
     }
     return true;
@@ -135,23 +132,26 @@ static void fold_pair(struct ace2k_mains *self, uint32_t pair, uint32_t from, ui
     self->bridge_to = to;
 }
 
-/* The bridges since the last tick, folded into the window's longest, those already published
- * left out.  The longest of the read may be one (the second pair of a published gap); the
- * longest noted after it is folded too, so a dropout noted in the same read is not hidden. */
+/* Folds the bridges since the last tick into the window's longest, leaving out those already
+ * published. The longest of the read may be one of them: the second pair of a published gap. So
+ * the longest pair noted after it is folded too, and a dropout noted in the same read is not
+ * hidden. */
 static void fold_bridge(struct ace2k_mains *self, const struct ace2k_mains_span *s)
 {
     fold_pair(self, s->bridge, s->bridge_from, s->bridge_to);
     fold_pair(self, s->after, s->after_from, s->after_to);
 }
 
-/* Every tick: the bridges the interrupt measured since the last tick — every gap between two
- * edges — are folded in whatever else the tick does, then the span is followed.  Absent, the
- * window is marked, and publish() counts it instead of measuring it — a measurement over the gap
- * never reaches hz10 — and rebases on the first window end the mains is present at: an edge after
- * the return (present means an edge in the last 100 ms, so the span's latest is one).  A new span
- * (a resync edge closed the old one): the old one's measurement is judged, and the new one is
- * followed from its first edge on.  The measurement moves only on an even number of
- * half-periods. */
+/* Runs every tick. First it folds in the bridges that the interrupt measured since the last tick,
+ * which are every gap between two edges. It does so whatever else the tick does. Then it follows
+ * the span.
+ * - Mains absent: the window is marked. publish() counts it instead of measuring it, so a
+ *   measurement over the gap never reaches hz10. It rebases at the first window end with the
+ *   mains present, on an edge after the return. Present means an edge in the last 100 ms, so the
+ *   span's latest edge is one.
+ * - A new span, because a resync edge closed the old one: the measurement of the old one is
+ *   judged, and the new one is followed from its first edge on.
+ * The measurement moves only on an even number of half-periods. */
 static void track(struct ace2k_mains *self, const struct ace2k_mains_span *s)
 {
     fold_bridge(self, s);
@@ -169,24 +169,28 @@ static void track(struct ace2k_mains *self, const struct ace2k_mains_span *s)
         return;
     }
     self->cur_half = half;
-    self->cur_dt = s->last - self->base.last; /* unsigned: right across the clock's wrap */
+    self->cur_dt = s->last - self->base.last; /* unsigned: right across the clock wrap */
 }
 
-/* The longest same-polarity interval (above) a missed edge cannot hide in: ACE2K_MAINS_BRIDGE_PCT
- * of the full period of the last published hz10, or of ACE2K_MAINS_BRIDGE_UNKNOWN_HZ10's with none
- * plausible.  64-bit: the product is ~2^37 at 120 MHz. */
+/* The longest same-polarity interval (mains.h) that a missed edge cannot hide in. It is
+ * ACE2K_MAINS_BRIDGE_PCT of the full period of the last published hz10, or of the period of
+ * ACE2K_MAINS_BRIDGE_UNKNOWN_HZ10 when none is plausible. 64-bit, because the product is ~2^37 at
+ * 120 MHz. */
 static uint32_t bridge_bound(const struct ace2k_mains *self)
 {
     uint32_t hz10 = ace2k_mains_plausible(self) ? self->hz10 : ACE2K_MAINS_BRIDGE_UNKNOWN_HZ10;
     uint64_t num = (uint64_t)HZ10_HALF_MS * 2U * self->ticks_per_ms * ACE2K_MAINS_BRIDGE_PCT;
-    return (uint32_t)(num / ((uint64_t)hz10 * PERCENT));
+    return (uint32_t)(num / ((uint64_t)hz10 * ACE2K_PCT_FULL));
 }
 
-/* What a window the mains was present in publishes, or 0 to keep hz10: an edge missed at a
- * bridge; else the worst span; else an edge missed in some span — the measurements disagree
- * (a short span a dip shortened can read in the other band); else the longest measurement once it
- * holds the minimum, or — hz10 kept ACE2K_MAINS_STALE_MS already — a shorter one, or the stale
- * marker. */
+/* What a window with the mains present publishes, or 0 to keep hz10. In this order:
+ * - an edge missed at a bridge;
+ * - else the worst span;
+ * - else an edge missed in some span, when the measurements disagree. A short span that a dip
+ *   shortened can read in the other band.
+ * - else the longest measurement, once it holds the minimum;
+ * - or, when hz10 was already kept for ACE2K_MAINS_STALE_MS, a shorter one, or the stale
+ *   marker. */
 static uint16_t measured(struct ace2k_mains *self, uint32_t now_ms)
 {
     if (self->bridge > bridge_bound(self)) {
@@ -214,8 +218,8 @@ static uint16_t measured(struct ace2k_mains *self, uint32_t now_ms)
     return ACE2K_MAINS_HZ10_STALE;
 }
 
-/* The next measurement runs from where the open span's was measured to, so consecutive
- * publications tile the edges: no half-period between two of them is left unmeasured. */
+/* The next measurement runs from where the open span was measured to. So consecutive
+ * publications tile the edges, and no half-period between two of them is left unmeasured. */
 static void rebase_measured(struct ace2k_mains *self)
 {
     self->base.edges += self->cur_half;
@@ -224,11 +228,11 @@ static void rebase_measured(struct ace2k_mains *self)
     self->cur_dt = 0U;
 }
 
-/* A window the mains was absent in, counted: its accepted edges over its length.  Its length holds
- * moments of no edge — before the boot's first edge, or up to a tick of them when the mains came
- * back just after the window opened — so the count can read a few edges short: when it still
- * reads plausible it is published as none measured (0), never as a frequency.  A count is no
- * measurement; the next window measures. */
+/* Counts a window in which the mains was absent: its accepted edges over its length. Its length
+ * holds moments of no edge: before the boot's first edge, or up to a tick of them when the
+ * mains came back just after the window opened. So the count can read a few edges short. When it
+ * still reads plausible, it is published as none measured (0), never as a frequency. A count is
+ * no measurement; the next window measures. */
 static uint16_t counted(const struct ace2k_mains *self, uint32_t count, uint32_t now_ms)
 {
     uint32_t elapsed_ms = ace2k_time_since(now_ms, self->window_start_ms);
@@ -239,9 +243,10 @@ static uint16_t counted(const struct ace2k_mains *self, uint32_t count, uint32_t
     return hz10;
 }
 
-/* A window the mains was absent in is counted as a whole — its accepted edges over its length, as
- * a 1 s count reads an outage — and the next measurement runs from the span's latest edge;
- * otherwise measured() decides, and a window it keeps hz10 for publishes nothing. */
+/* A window in which the mains was absent is counted as a whole: its accepted edges over its
+ * length, as a 1 s count reads an outage. The next measurement then runs from the latest edge of
+ * the span. Otherwise measured() decides, and a window for which it keeps hz10 publishes
+ * nothing. */
 static void publish_value(struct ace2k_mains *self, const struct ace2k_mains_span *s,
                           uint32_t count, uint32_t now_ms)
 {
@@ -270,9 +275,9 @@ static void publish_value(struct ace2k_mains *self, const struct ace2k_mains_spa
     since_publication_clear(self);
 }
 
-/* Every ACE2K_MAINS_WINDOW_MS: the window's publication, if any; and the mark of a published gap
- * counts windows, not publications — it holds for the MISSED publication's window and the next
- * one, whether that one publishes or keeps hz10. */
+/* Runs every ACE2K_MAINS_WINDOW_MS: the window's publication, if any. The mark of a
+ * published gap counts windows, not publications. It holds for the window of the MISSED
+ * publication and for the next one, whether that one publishes or keeps hz10. */
 static void publish(struct ace2k_mains *self, const struct ace2k_mains_span *s, uint32_t count,
                     uint32_t now_ms)
 {
@@ -309,21 +314,12 @@ void ace2k_mains_tick(struct ace2k_mains *self, uint32_t now_ms)
     }
 }
 
-/* low_hz10 <= hz10 <= high_hz10, as an early return for the same reason as edge_recent(). */
-static bool within(uint16_t hz10, uint16_t low_hz10, uint16_t high_hz10)
-{
-    if (hz10 < low_hz10) {
-        return false;
-    }
-    return hz10 <= high_hz10;
-}
-
 bool ace2k_mains_hz10_plausible(uint16_t hz10)
 {
-    if (within(hz10, ACE2K_MAINS_50_LOW_HZ10, ACE2K_MAINS_50_HIGH_HZ10)) {
+    if (ace2k_within_u32(hz10, ACE2K_MAINS_50_LOW_HZ10, ACE2K_MAINS_50_HIGH_HZ10)) {
         return true;
     }
-    return within(hz10, ACE2K_MAINS_60_LOW_HZ10, ACE2K_MAINS_60_HIGH_HZ10);
+    return ace2k_within_u32(hz10, ACE2K_MAINS_60_LOW_HZ10, ACE2K_MAINS_60_HIGH_HZ10);
 }
 
 bool ace2k_mains_plausible(const struct ace2k_mains *self)
@@ -351,12 +347,13 @@ void ace2k_mains_edge_filter_init(struct ace2k_mains_edge_filter *f, uint32_t lo
     *f = (struct ace2k_mains_edge_filter){ .lockout = lockout, .prev = lockout, .stalls = stalls };
 }
 
-/* A gap in the edges, noted: from `from` to `to`, with the gap before it — a same-polarity
- * interval — the longest since the last take, and the longest noted after that one.  Saturated:
- * an outage's gap never wraps short. */
+/* Notes a gap in the edges, from `from` to `to`. It is paired with the gap before it, which
+ * makes a same-polarity interval. The filter keeps the longest pair since the last take, and the
+ * longest pair noted after that one. The sum saturates, so the gap of an outage never wraps
+ * short. */
 static void bridge_note(struct ace2k_mains_edge_filter *f, uint32_t from, uint32_t to)
 {
-    uint32_t gap = to - from; /* unsigned: right across the clock's wrap */
+    uint32_t gap = to - from; /* unsigned: right across the clock wrap */
     uint32_t pair = gap > UINT32_MAX - f->prev ? UINT32_MAX : gap + f->prev;
     if (pair > f->span.bridge) {
         f->span.bridge = pair;
@@ -371,12 +368,12 @@ static void bridge_note(struct ace2k_mains_edge_filter *f, uint32_t from, uint32
     f->prev = gap;
 }
 
-/* Every gap between two edges of the mains is a bridge: from `seen` — the last accepted edge, the
- * operation's end after a late one, or the real edge a late one's lockout swallowed — to the next
- * accepted edge, or to the start of an operation whose late edge comes; each is judged with the
- * gap before it (bridge_note).  The operation hides how many edges it held, so the gap after it is
- * paired with the lockout, not with the gap before it.  A counted reject (a bounce) is no edge of
- * the mains and moves nothing. */
+/* Every gap between two edges of the mains is a bridge. It runs from `seen` to the next accepted
+ * edge, or to the start of an operation whose late edge comes. `seen` is the last accepted edge,
+ * the operation's end after a late edge, or the real edge that the lockout of a late edge
+ * swallowed. Each bridge is judged with the gap before it (bridge_note). The operation hides how
+ * many edges it held, so the gap after it is paired with the lockout, not with the gap before
+ * it. A counted reject is a bounce, no edge of the mains, and it moves nothing. */
 enum ace2k_mains_edge ace2k_mains_edge_filter(struct ace2k_mains_edge_filter *f, uint32_t now,
                                               const struct ace2k_mains_stall *stall)
 {

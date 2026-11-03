@@ -4,6 +4,7 @@
  * published — the contract: the interrupt acts on the tick's verdict. */
 #include "test.h"
 #include "ace2k_board/zerocross.h" /* ACE2K_ZEROCROSS_LOCKOUT_US */
+#include "env/env.h"
 #include "heat/heat.h"
 #include "heat/mains.h"
 
@@ -40,6 +41,8 @@ struct rig {
     /* the board's zero-cross filter, on this clock, and the flash operations it reads */
     struct ace2k_mains_edge_filter zc;
     struct ace2k_mains_stall stall;
+    /* runs first in every tick: a test that builds the NTC inputs from a real env sets it */
+    void (*before_tick)(uint32_t now_ms);
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -111,7 +114,7 @@ static bool fake_read(void *ctx)
     return (R.now_us - R.fire_us) < PULSE_US;
 }
 
-static const struct ace2k_heat_ops ace2k_fake_ops = {
+static const struct ace2k_heat_ops fake_ops = {
     .gate_fire = fake_fire,
     .gate_off = fake_off,
     .gate_read = fake_read,
@@ -144,10 +147,10 @@ static void rig_reset(uint32_t half_us)
     R.next_tick_us = TICK_US;
     R.ticking = true;
     ace2k_mains_edge_filter_init(&R.zc, ACE2K_ZEROCROSS_LOCKOUT_US, 0U);
-    ace2k_heat_init(&R.h, &ace2k_fake_ops, 0);
+    ace2k_heat_init(&R.h, &fake_ops, 0);
 }
 
-#define HZ10_OFF_BAND 585U /* the bench's dip: one window read 58.5 Hz */
+#define HZ10_OFF_BAND 585U /* the dip seen on the unit: one window read 58.5 Hz */
 
 /* The mains measured plausible (the train's own frequency) or off-band. */
 static void set_plausible(bool ok)
@@ -157,6 +160,9 @@ static void set_plausible(bool ok)
 
 static void do_tick(void)
 {
+    if (R.before_tick != NULL) {
+        R.before_tick(R.now_us / 1000U);
+    }
     R.pub = R.in;
     uint32_t now_ms = R.now_us / 1000U;
     ace2k_heat_tick(&R.h, &R.in, now_ms, R.now_us);
@@ -265,7 +271,8 @@ static int start_lease(uint8_t duty, uint32_t ms)
     return ace2k_heat_lease(&R.h, duty, ms, R.now_us / 1000U);
 }
 
-/* Renew a 2 000 ms lease every 1 000 ms, as the dryer does. */
+/* Renew a 2 000 ms lease every 1 000 ms: twice per lease.  The dryer renews more often, every
+ * ACE2K_DRYER_LEASE_RENEW_MS (500 ms). */
 static void keep_leased(uint8_t duty)
 {
     R.lease_duty = duty;
@@ -365,6 +372,27 @@ TEST(rule2_a_fan_dropping_mid_lease_latches_and_nothing_fires_after)
     ASSERT_EQ(R.violations, 0);
 }
 
+/* The fans are judged commanded at every tick, not only when the lease is granted: both pins
+ * still read high, but nobody asks for the fans any more. */
+TEST(rule2_fans_uncommanded_mid_lease_latches_fans_and_nothing_fires_after)
+{
+    rig_reset(HALF_CYCLE_US_60);
+    ASSERT_EQ(start_lease(90, 2000), 0);
+    keep_leased(90);
+    run_us(500000U);
+    ASSERT_TRUE(R.fires > 0);
+    R.in.fans_commanded = false; /* both pins keep reading high */
+    uint32_t offs = R.offs;
+    run_us(TICK_US); /* the tick that sees it */
+    uint32_t edge_seen = R.edges;
+    run_us(1000000U);
+    ASSERT_EQ(R.h.state, ACE2K_HEAT_LATCHED);
+    ASSERT_EQ(R.h.reason, ACE2K_HEAT_FANS);
+    ASSERT_TRUE(R.offs > offs);
+    ASSERT_EQ(fires_after(edge_seen), 0);
+    ASSERT_EQ(R.violations, 0);
+}
+
 /* Rule 3: the gate fires only inside a live lease. */
 TEST(rule3_a_lease_not_renewed_ends_idle_not_latched_and_nothing_fires_past_it)
 {
@@ -442,7 +470,7 @@ static void cutout_tripped(struct ace2k_heat_inputs *in)
     in->cutout = true;
 }
 
-static const struct ace2k_breach ace2k_breaches[] = {
+static const struct ace2k_breach breaches[] = {
     { "ntc left at 85 °C", ntc_left_over, ACE2K_HEAT_NTC_OVER },
     { "ntc right at 90 °C", ntc_right_over, ACE2K_HEAT_NTC_OVER },
     { "ntc left invalid", ntc_left_invalid, ACE2K_HEAT_NTC_INVALID },
@@ -454,22 +482,22 @@ static const struct ace2k_breach ace2k_breaches[] = {
 
 TEST(rule4_every_limit_broken_mid_lease_latches_its_reason_and_stops_the_gate)
 {
-    for (size_t i = 0; i < ACE2K_ARRAY_SIZE(ace2k_breaches); i++) {
+    for (size_t i = 0; i < ACE2K_ARRAY_SIZE(breaches); i++) {
         rig_reset(HALF_CYCLE_US_60);
         ASSERT_EQ(start_lease(90, 2000), 0);
         keep_leased(90);
         run_us(400000U);
         ASSERT_TRUE(R.fires > 0);
-        ace2k_breaches[i].apply(&R.in);
+        breaches[i].apply(&R.in);
         uint32_t offs = R.offs;
         run_us(TICK_US);
         uint32_t edge_seen = R.edges;
         run_us(2000000U); /* past the mains' bucket (1.5 s); the others latch on their tick */
-        if (R.h.state != ACE2K_HEAT_LATCHED || R.h.reason != ace2k_breaches[i].reason) {
-            printf("  breach: %s\n", ace2k_breaches[i].name);
+        if (R.h.state != ACE2K_HEAT_LATCHED || R.h.reason != breaches[i].reason) {
+            printf("  breach: %s\n", breaches[i].name);
         }
         ASSERT_EQ(R.h.state, ACE2K_HEAT_LATCHED);
-        ASSERT_EQ(R.h.reason, ace2k_breaches[i].reason);
+        ASSERT_EQ(R.h.reason, breaches[i].reason);
         ASSERT_TRUE(R.offs > offs);
         ASSERT_EQ(fires_after(edge_seen), 0);
         ASSERT_EQ(R.violations, 0);
@@ -479,9 +507,9 @@ TEST(rule4_every_limit_broken_mid_lease_latches_its_reason_and_stops_the_gate)
 
 TEST(rule4_each_limit_refuses_a_lease_from_idle)
 {
-    for (size_t i = 0; i < ACE2K_ARRAY_SIZE(ace2k_breaches); i++) {
+    for (size_t i = 0; i < ACE2K_ARRAY_SIZE(breaches); i++) {
         rig_reset(HALF_CYCLE_US_60);
-        ace2k_breaches[i].apply(&R.in);
+        breaches[i].apply(&R.in);
         ASSERT_TRUE(start_lease(20, 1000) != 0);
         run_us(200000U);
         ASSERT_EQ(R.fires, 0);
@@ -724,7 +752,7 @@ static void duty_run(uint32_t half_us, uint8_t duty)
     run_us((1200U * 2U * half_us) + half_us);
     uint32_t n = R.edges - first;
     uint32_t fired = fires_after(first);
-    uint32_t want = n * duty / ACE2K_HEAT_PERCENT;
+    uint32_t want = n * duty / ACE2K_PCT_FULL;
     uint32_t tol = n / 100U; /* 1 % of the half-cycles */
     ASSERT_TRUE(fired + tol >= want);
     ASSERT_TRUE(fired <= want + tol);
@@ -826,7 +854,7 @@ TEST(without_a_missed_edge_the_polarities_balance_exactly)
     ASSERT_TRUE(R.pos > 0U);
 }
 
-/* Q6: an outlet NTC reading invalid for 1–4 ticks stops the firing at once, latches nothing, and
+/* An outlet NTC reading invalid for 1–4 ticks stops the firing at once, latches nothing, and
  * the firing resumes inside the live lease when the reading comes back. */
 TEST(an_invalid_ntc_for_under_five_ticks_stops_firing_without_a_latch)
 {
@@ -931,7 +959,7 @@ TEST(a_live_lease_is_renewed_through_an_ntc_excursion_but_not_started_in_one)
     ASSERT_EQ(R.violations, 0);
 }
 
-/* Q7: a release between the two edges of a fired cycle lets its odd half fire, then nothing. */
+/* A release between the two edges of a fired cycle lets its odd half fire, then nothing. */
 TEST(a_release_between_the_halves_fires_the_odd_half_then_nothing)
 {
     for (uint32_t way = 0U; way < 2U; way++) {
@@ -1138,9 +1166,9 @@ TEST(a_rare_ntc_glitch_never_fills_the_bucket)
     ASSERT_EQ(R.violations, 0);
 }
 
-/* The mains read off-band for less than its bucket — one tick, 50 ticks, one whole
- * 1 s measurement window (101 ticks, the bench's case) — stops the firing on the tick that sees
- * it, latches nothing, and the firing resumes inside the live lease. */
+/* The mains read off-band for less than its bucket — one tick, 50 ticks, one whole 1 s measurement
+ * window (101 ticks, the case seen on the unit) — stops the firing on the tick that sees it,
+ * latches nothing, and the firing resumes inside the live lease. */
 TEST(a_mains_implausible_dip_under_its_bucket_stops_firing_without_a_latch)
 {
     static const uint32_t dip_ticks[] = { 1U, 50U, 101U };
@@ -1296,7 +1324,7 @@ static void noise_edge(uint32_t gap_us)
     R.drop_edges = 1U;
 }
 
-/* Round 2, items 1–2: at 50 and 60 Hz, a noise edge 7.2 ms — and just past the 7 ms lockout —
+/* At 50 and 60 Hz, a noise edge 7.2 ms — and just past the 7 ms lockout —
  * after the edge before it, at a cycle's even edge: it fires nothing and starts no cycle, and the
  * run keeps whole cycles only (no split pair, the polarities equal). */
 static void noise_at_even_run(uint32_t half_us, uint32_t gap_us)
@@ -1400,10 +1428,11 @@ TEST(the_first_edge_ever_starts_no_cycle)
     ASSERT_EQ(R.h.edge_parity, 0U);
 }
 
-/* Round 3, items 6–7 and 3: a clear judges the mains on its bucket, like a start: refused while
+/* A clear judges the mains on its bucket, like a start: refused while
  * the bucket is above ACE2K_HEAT_MAINS_RESTART_LEVEL — even with the mains plausible again —
  * granted at or below it, a dip then included; the clear never resets the bucket, and the next
- * lease still has the restart level's tolerance: at least 75 implausible ticks before it latches. */
+ * lease still has the restart level's tolerance: at least 75 implausible ticks before it
+ * latches. */
 TEST(a_mains_latch_clears_only_at_the_restart_level_and_keeps_its_bucket)
 {
     rig_reset(HALF_CYCLE_US_60);
@@ -1448,7 +1477,7 @@ TEST(a_mains_latch_clears_only_at_the_restart_level_and_keeps_its_bucket)
     ASSERT_EQ(R.violations, 0);
 }
 
-/* Round 3, item 1: an asymmetric input — the half-cycles alternating half ± 450 µs, 900 µs
+/* An asymmetric input — the half-cycles alternating half ± 450 µs, 900 µs
  * apart, beyond any half-period window — still fires normally: the period between edges of one
  * polarity is exact, so no edge is judged out of phase. */
 static void asymmetric_run(uint32_t half_us)
@@ -1474,7 +1503,7 @@ TEST(an_asymmetric_input_fires_normally_at_50_and_60_hz)
     asymmetric_run(HALF_CYCLE_US_50);
 }
 
-/* Round 1, item 6: an invalid NTC is reported ahead of an implausible mains — the verdict, the
+/* An invalid NTC is reported ahead of an implausible mains — the verdict, the
  * limits and a lease's refusal name the sensor, never the dip. */
 TEST(an_invalid_ntc_is_reported_ahead_of_an_implausible_mains)
 {
@@ -1499,7 +1528,7 @@ TEST(an_invalid_ntc_is_reported_ahead_of_an_implausible_mains)
     ASSERT_EQ(R.violations, 0);
 }
 
-/* Round 4, items 1 and 3: a lease from IDLE waits for the restart level; a cycle started right at
+/* A lease from IDLE waits for the restart level; a cycle started right at
  * it rides out one whole 101-tick off-band window without a latch. */
 TEST(a_lease_at_the_restart_level_rides_out_one_whole_window)
 {
@@ -1524,7 +1553,7 @@ TEST(a_lease_at_the_restart_level_rides_out_one_whole_window)
     ASSERT_EQ(R.violations, 0);
 }
 
-/* Round 4, item 2: the gate reading high ranks first — the heater may be on — ahead of an
+/* The gate reading high ranks first — the heater may be on — ahead of an
  * over-temperature; the cutout still refuses the clear outright. */
 TEST(a_gate_reading_high_ranks_first_among_what_holds_a_latch)
 {
@@ -1541,7 +1570,7 @@ TEST(a_gate_reading_high_ranks_first_among_what_holds_a_latch)
     ASSERT_EQ(ace2k_heat_clear_blocker(&R.h), ACE2K_HEAT_NTC_OVER);
 }
 
-/* Round 4, item 4: before the first window is measured (hz10 0, the boot) the bucket does not
+/* Before the first window is measured (hz10 0, the boot) the bucket does not
  * fill: a lease 1.2 s after boot on a clean line is granted. */
 TEST(no_window_measured_yet_does_not_fill_the_bucket)
 {
@@ -1554,7 +1583,7 @@ TEST(no_window_measured_yet_does_not_fill_the_bucket)
     ASSERT_EQ(ace2k_heat_lease(&R.h, 50, 2000, R.now_us / 1000U), 0);
 }
 
-/* Round 4, item 5: a latch for another cause is never held by the mains bucket — an NTC-invalid
+/* A latch for another cause is never held by the mains bucket — an NTC-invalid
  * latch clears once the NTC reads again, the bucket at 200 notwithstanding. */
 TEST(the_mains_bucket_holds_only_a_mains_latch)
 {
@@ -1903,6 +1932,92 @@ TEST(a_new_lease_waits_for_a_measured_mains_and_a_live_one_renews_through_it)
     run_us(TICK_US);
     ASSERT_EQ(ace2k_heat_lease(&R.h, 20, 1000, R.now_us / 1000U), 0);
     ASSERT_TRUE(ace2k_heat_leased(&R.h));
+}
+
+/* The whole chain, from a frozen ADC pass to the gate.  A real env is ticked before heat on
+ * every tick, as the board registers them.  A pass completes on every tick until the scan
+ * freezes, and from then on its age grows. */
+struct ace2k_chain {
+    struct ace2k_env env;
+    uint32_t stamp_ms; /* the last pass completed here */
+    bool frozen;       /* the scan publishes no more passes */
+};
+
+static struct ace2k_chain ace2k_chain;
+
+static int no_i2c_write(void *ctx, uint8_t addr, const uint8_t *data, uint8_t len)
+{
+    (void)ctx;
+    (void)addr;
+    (void)data;
+    (void)len;
+    return -1;
+}
+
+static int no_i2c_read(void *ctx, uint8_t addr, uint8_t *data, uint8_t len)
+{
+    (void)ctx;
+    (void)addr;
+    for (uint8_t i = 0; i < len; i++) {
+        data[i] = 0;
+    }
+    return -1;
+}
+
+static const struct ace2k_env_ops no_i2c_ops = {
+    .i2c_write = no_i2c_write,
+    .i2c_read = no_i2c_read,
+};
+
+/* env's output becomes heat's NTC inputs line for line as the heat binding's read_world() does:
+ * the two valid bits, and each reading only while its bit is set.  read_world() points back
+ * here; change both. */
+static void env_step(uint32_t now_ms)
+{
+    struct ace2k_chain *c = &ace2k_chain;
+    if (!c->frozen) {
+        c->stamp_ms = now_ms;
+    }
+    ace2k_env_tick(&c->env, now_ms, ace2k_time_since(now_ms, c->stamp_ms), 1650, 1650, 1489);
+    R.in.left_valid = ace2k_env_valid_bit(&c->env, ACE2K_ENV_VALID_NTC_LEFT);
+    R.in.right_valid = ace2k_env_valid_bit(&c->env, ACE2K_ENV_VALID_NTC_RIGHT);
+    if (R.in.left_valid) {
+        R.in.ntc_left_mc = c->env.ptc_left_mc;
+    }
+    if (R.in.right_valid) {
+        R.in.ntc_right_mc = c->env.ptc_right_mc;
+    }
+}
+
+TEST(a_frozen_adc_pass_stops_the_firing_and_latches_ntc_invalid)
+{
+    rig_reset(HALF_CYCLE_US_60);
+    ace2k_chain = (struct ace2k_chain){ 0 };
+    ace2k_env_init(&ace2k_chain.env, &no_i2c_ops, NULL, 0);
+    R.before_tick = env_step;
+    ASSERT_EQ(start_lease(90, 2000), 0);
+    keep_leased(90);
+    run_us(400000U);
+    uint32_t at_freeze = R.edges;
+    ace2k_chain.frozen = true;
+    /* the age reaches the limit: still fresh, still firing */
+    run_us(ACE2K_ENV_ADC_STALE_MS * 1000U);
+    ASSERT_EQ(R.h.state, ACE2K_HEAT_LEASED);
+    ASSERT_TRUE(fires_after(at_freeze) > 0U);
+    /* one tick past it: the firing stops on this tick */
+    run_us(TICK_US);
+    ASSERT_EQ(R.h.fire_mode, ACE2K_HEAT_FIRE_NONE);
+    uint32_t edge_seen = R.edges;
+    /* the invalid NTC's bucket latches after its ticks, as for an open NTC */
+    run_us((ACE2K_HEAT_NTC_INVALID_TICKS - 2U) * TICK_US);
+    ASSERT_EQ(R.h.state, ACE2K_HEAT_LEASED);
+    run_us(TICK_US);
+    ASSERT_EQ(R.h.state, ACE2K_HEAT_LATCHED);
+    ASSERT_EQ(R.h.reason, ACE2K_HEAT_NTC_INVALID);
+    /* and nothing fires after the stop, though the lease is renewed every second */
+    run_us(500000U);
+    ASSERT_EQ(fires_after(edge_seen), 0U);
+    ASSERT_EQ(R.violations, 0);
 }
 
 int main(int argc, char **argv)

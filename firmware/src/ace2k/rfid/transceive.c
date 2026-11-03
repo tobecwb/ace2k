@@ -21,7 +21,7 @@ int ace2k_rfid_transceive_configure(struct ace2k_rfid_transceive *self, uint8_t 
     if (reader >= ACE2K_RFID_READER_COUNT) {
         return -ACE2K_EINVAL;
     }
-    int rc = ace2k_rfid_reader_probe(self->reader, reader); /* the soft reset and the version */
+    int rc = ace2k_rfid_reader_probe(self->reader, reader); /* soft reset, then read the version */
     if (rc != 0) {
         self->configured[reader] = false;
         return rc;
@@ -101,8 +101,8 @@ int ace2k_rfid_transceive_start(struct ace2k_rfid_transceive *self, uint8_t read
     return 0;
 }
 
-/* The bits of ComIrqReg that end each command: a transceive ends on a reception (or idle), an
- * authentication on idle. */
+/* The bits of ComIrqReg that end each command.  A transceive ends on a reception or on idle.  An
+ * authentication ends on idle. */
 static uint32_t done_mask(uint8_t cmd)
 {
     if (cmd == ACE2K_RFID_CMD_MF_AUTHENT) {
@@ -131,7 +131,7 @@ static enum ace2k_rfid_poll read_fifo(struct ace2k_rfid_transceive *self, uint8_
 static enum ace2k_rfid_poll collision(struct ace2k_rfid_transceive *self, uint8_t reader,
                                       struct ace2k_rfid_rx *rx)
 {
-    (void)read_fifo(self, reader, rx); /* the bits before the collision are the tag's */
+    (void)read_fifo(self, reader, rx); /* the bits before the collision come from the tag */
     uint32_t coll = rd(self, reader, ACE2K_RFID_REG_COLL);
     if (coll & ACE2K_RFID_COLL_POS_NOT_VALID) {
         return ACE2K_RFID_POLL_ERROR;
