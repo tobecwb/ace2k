@@ -4,6 +4,7 @@ printer of test_ace2k_extras."""
 
 from __future__ import annotations
 
+import logging
 import pathlib
 import re
 import struct
@@ -329,6 +330,53 @@ def test_a_speed_outside_the_dictionary_bounds_is_a_config_error() -> None:
         mcu.config_callback()
 
 
+OLD_TOP = {**DEFAULT_CONSTANTS, "ACE2K_LANE_SPEED_MAX_UM_S": 70000}  # an image before 80 mm/s
+
+
+def test_the_default_unload_speed_follows_an_older_images_top_speed() -> None:
+    module, printer, mcu = make_feed(dict(RESPONSES), constants=OLD_TOP)
+    mcu.config_callback()  # no config error
+    assert feed_of(module).unload_speed_mm_s == 70.0
+
+
+def test_the_default_unload_speed_is_80_on_an_image_with_that_top_speed() -> None:
+    module, printer, mcu = make_feed(dict(RESPONSES))
+    mcu.config_callback()
+    assert feed_of(module).unload_speed_mm_s == 80.0
+
+
+def test_an_unload_speed_set_above_an_older_images_top_speed_is_a_config_error() -> None:
+    module, printer, mcu = make_feed(
+        dict(RESPONSES), options={"unload_speed": 80}, constants=OLD_TOP
+    )
+    with pytest.raises(Exception, match=r"unload_speed must be within 9\.\.70 mm/s"):
+        mcu.config_callback()
+
+
+@pytest.mark.parametrize(
+    ("duty", "constants", "warned"),
+    [
+        (11, DEFAULT_CONSTANTS, True),
+        (1, DEFAULT_CONSTANTS, True),
+        (12, DEFAULT_CONSTANTS, False),
+        (0, DEFAULT_CONSTANTS, False),
+        (11, OLD_TOP, False),
+    ],
+)
+def test_a_duty_guard_that_may_fire_at_the_top_speed_is_warned_about(
+    caplog: pytest.LogCaptureFixture, duty: int, constants: dict[str, int], warned: bool
+) -> None:
+    module, printer, mcu = make_feed(
+        dict(RESPONSES), options={"snag_duty_pct": duty}, constants=constants
+    )
+    with caplog.at_level(logging.WARNING):
+        mcu.config_callback()  # never refused
+    lines = [r.getMessage() for r in caplog.records if "snag_duty_pct" in r.getMessage()]
+    assert len(lines) == (1 if warned else 0)
+    if warned:
+        assert "may fire on healthy moves" in lines[0]
+
+
 def test_state_frame_lands_in_status() -> None:
     module, printer, mcu = make_feed(dict(RESPONSES))
     mcu.config_callback()
@@ -407,7 +455,7 @@ def test_the_start_arguments_are_micrometres_and_the_mode_number() -> None:
     feed.cmd_ACEK_ROLLBACK(FakeGcmd({"LANE": "2", "LENGTH": "10", "SPEED": "25"}))
     assert sent[-1] == [1, 1, 10000, 25000, 2, 0]
     feed.cmd_ACEK_UNLOAD(FakeGcmd({"LANE": "3"}))
-    assert sent[-1] == [2, 4, 0, 70000, 1, 0]
+    assert sent[-1] == [2, 4, 0, 80000, 1, 0]
     feed.cmd_ACEK_LOAD(FakeGcmd({"LANE": "4"}))
     assert sent[-1] == [3, 5, 300000, 60000, 1, 0]
     feed.cmd_ACEK_ASSIST(FakeGcmd({"LANE": "1"}))
@@ -2709,7 +2757,7 @@ FF_CONSTANTS = {
     "ACE2K_FEED_FF_CHUNK_UM_MAX": 10000,
     "ACE2K_FEED_FF_PULSE_UM_S": 15000,
     "ACE2K_FEED_FF_PULSE_UM_S_MIN": 9000,
-    "ACE2K_FEED_FF_PULSE_UM_S_MAX": 70000,
+    "ACE2K_FEED_FF_PULSE_UM_S_MAX": 80000,
 }
 WITH_FF = dict(WITH_FOLLOW, **FF_CONSTANTS)
 FF_SET_FMT = "ace2k_feed_ff_set chunk_um=%u pulse_um_s=%u"
@@ -2819,7 +2867,7 @@ def test_an_ff_key_out_of_the_dictionarys_bounds_is_a_config_error() -> None:
         ("ff_chunk_mm", 0.9),
         ("ff_chunk_mm", 10.001),
         ("ff_pulse", 8.9),
-        ("ff_pulse", 71),
+        ("ff_pulse", 81),
     ):
         module, printer, mcu = make_feed(dict(RESPONSES), options={key: value}, constants=WITH_FF)
         with pytest.raises(Exception, match=key):
@@ -2849,7 +2897,7 @@ def test_ff_set_sends_both_checks_the_bounds_and_tunes_the_host_side() -> None:
         {"CHUNK_MM": "0.5"},
         {"CHUNK_MM": "11"},
         {"PULSE": "8"},
-        {"PULSE": "71"},
+        {"PULSE": "81"},
         {"PULSE": "nan"},
         {"CHUNK_MM": "3", "PULSE": "100"},  # a good one beside a bad one
         {"WINDOW_MS": "10"},

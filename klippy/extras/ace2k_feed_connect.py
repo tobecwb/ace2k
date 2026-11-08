@@ -195,6 +195,13 @@ REPORT_GRID_MS = 100
 SNAP_EPSILON_HZ = 1e-9  # if the rate moved by more than this, a log line says it was snapped
 
 
+# The duty guard at the top speed: from DUTY_TOP_SPEED_MM_S a loaded lane can run at 100 % duty,
+# which is DUTY_TOP_HEADROOM_PCT points above the feed-forward's 89 % at 80 mm/s. A snag_duty_pct
+# of 1 to that many points is warned about at connect.
+DUTY_TOP_SPEED_MM_S = 80.0
+DUTY_TOP_HEADROOM_PCT = 11
+
+
 class FeedConnect(FeedBase):
     """The config keys and the connect step of ``Ace2kFeed``."""
 
@@ -343,6 +350,17 @@ class FeedConnect(FeedBase):
 
     # --- configuration -------------------------------------------------------------------
 
+    def _default_unload_speed(self) -> None:
+        """Lower an unload_speed left out to the unit's top speed, as on an older image (70)."""
+        assert self.speed_max is not None
+        if not self.unload_speed_set and self.unload_speed_mm_s > self.speed_max:
+            logging.info(
+                "%s unload_speed defaults to the unit's top speed, %g mm/s",
+                self.unit.head(),
+                self.speed_max,
+            )
+            self.unload_speed_mm_s = self.speed_max
+
     def _build_config(self) -> None:
         """Probe the firmware image and send its settings and subscriptions, if it has the feed.
 
@@ -388,6 +406,7 @@ class FeedConnect(FeedBase):
         self.has_search = self.mcu.try_lookup_command(SEARCH_FMT) is not None
         if self.search_mm is None:
             self.search_mm = firmware_search_mm(self.mcu)
+        self._default_unload_speed()
         for key, speed in (
             ("feed_speed", self.feed_speed_mm_s),
             ("unload_speed", self.unload_speed_mm_s),
@@ -469,11 +488,30 @@ class FeedConnect(FeedBase):
                 f" under snag_fwd_mm ({setting_text(self.snag['snag_fwd_mm'])}): a lag the watch"
                 " never reaches"
             )
+        self._warn_duty_at_top()
         self.mcu.add_config_cmd(self._load_set_cmd(), is_init=True)
         # All six go out at every connect, whether or not keys are set, like the load settings.
         # A config command reaches only an MCU that is not configured yet. After ACEK_SNAG_SET and
         # a RESTART, the unit would keep the live values while the host shows these.
         self.mcu.add_config_cmd(SNAG.cmd_text(self.snag), is_init=True)
+
+    def _warn_duty_at_top(self) -> None:
+        """Warn once when the duty guard may fire on healthy moves at the top speed.
+
+        At DUTY_TOP_SPEED_MM_S a loaded lane can run at 100 % duty, DUTY_TOP_HEADROOM_PCT points
+        above the feed-forward there, so a guard of that many points or fewer may end a healthy
+        move. Nothing is refused."""
+        assert self.speed_max is not None
+        duty = self.snag["snag_duty_pct"]
+        if 0 < duty <= DUTY_TOP_HEADROOM_PCT and self.speed_max >= DUTY_TOP_SPEED_MM_S:
+            logging.warning(
+                "%s snag_duty_pct %g: at the top speed, %g mm/s, a loaded lane runs at 100 %% duty,"
+                " %g points above the feed-forward, so this guard may fire on healthy moves there",
+                self.unit.head(),
+                duty,
+                self.speed_max,
+                DUTY_TOP_HEADROOM_PCT,
+            )
 
     def _judged(
         self, group: SettingGroup, defaults: Mapping[str, float], keys: Mapping[str, float]

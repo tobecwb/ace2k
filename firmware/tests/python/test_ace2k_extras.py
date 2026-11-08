@@ -98,7 +98,7 @@ class FakeCommand:
 DEFAULT_CONSTANTS = {
     "ACE2K_KEYS_AS_INIT": 1,  # an image that takes every key as an init command (v0.12.0 on)
     "ACE2K_LANE_SPEED_MIN_UM_S": 9000,
-    "ACE2K_LANE_SPEED_MAX_UM_S": 70000,
+    "ACE2K_LANE_SPEED_MAX_UM_S": 80000,
     "ACE2K_LANE_MOVE_MAX_UM": 2000000,
     "ACE2K_LANE_DUTY_MIN_PCT": 20,
     "ACE2K_LANE_LANDING_UM": 10000,

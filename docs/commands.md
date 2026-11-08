@@ -25,7 +25,7 @@ Conventions used in the entries:
 - **Lane** is `1`–`4`, the bay number.
 - **Speed** and **length** bounds come from the firmware the host is connected to. The host reads
   them from the firmware's dictionary when it connects. In the firmware as built: speed
-  9–70 mm/s, one move at most 2000 mm.
+  9–80 mm/s, one move at most 2000 mm.
 - A **refusal** is a G-code error with the message shown. `ace2k: ` starts the refusals the module
   raises itself. A number outside its range (LENGTH, PARK, TEMP, SECONDS, LANE and the like) is
   rejected earlier by Klipper's own parameter error, without that prefix.
@@ -267,7 +267,7 @@ measured on the lane's motor and checked against its encoder.
 |---|---|---|---|
 | `LANE` | required | 1–4 | the lane |
 | `LENGTH` | required | above 0, at most 2000 mm | mm to feed |
-| `SPEED` | `feed_speed` (30) | 9–70 mm/s | speed |
+| `SPEED` | `feed_speed` (30) | 9–80 mm/s | speed |
 | `FREE` | 0 | 0–1 | 1 when nothing holds the tip: a resistance that presses the plunger does not stop the push while the filament follows, a filament that stops does. It is not `ACEK_SNAG_SET`'s `FREE`, the reverse free travel in mm |
 | `WAIT` | 1 | integer | 0 returns at once |
 
@@ -286,7 +286,7 @@ runs a short extra move past it (the tail move). A waiting command counts that m
 |---|---|---|---|
 | `LANE` | required | 1–4 | the lane |
 | `LENGTH` | required | above 0, at most 2000 mm | mm to rewind |
-| `SPEED` | `feed_speed` (30) | 9–70 mm/s | speed |
+| `SPEED` | `feed_speed` (30) | 9–80 mm/s | speed |
 | `FREE` | 0 | 0–1 | 1 when nothing holds the tip (it is out of the extruder): each time the tip catches on its way back, the unit frees it and goes on, as long as the filament came back at least `snag_free_mm` since the last catch. Without it, the second catch stops the rollback with an error. Never use it with the tip still in the extruder. It is not `ACEK_SNAG_SET`'s `FREE`, the reverse free travel in mm |
 | `WAIT` | 1 | integer | 0 returns at once |
 
@@ -310,7 +310,7 @@ unload" below).
 |---|---|---|---|
 | `LANE` | required | 1–4 | the lane |
 | `LENGTH` | 0 | 0–2000 mm | the budget; 0 leaves it to the firmware's limit of 2000 mm |
-| `SPEED` | `unload_speed` (70) | 9–70 mm/s | speed |
+| `SPEED` | `unload_speed` (80, or the unit's top speed when lower) | 9–80 mm/s | speed |
 | `WAIT` | 1 | integer | 0 returns at once |
 
 Refused: the shared refusals above.
@@ -329,7 +329,7 @@ parking point and back.
 |---|---|---|---|
 | `LANE` | required | 1–4 | the lane |
 | `LENGTH` | `load_park_mm` (300) | above 0, at most 2000 mm | the parking distance |
-| `SPEED` | `load_speed` (60) | 9–70 mm/s | speed |
+| `SPEED` | `load_speed` (60) | 9–80 mm/s | speed |
 | `WAIT` | 1 | integer | 0 returns at once |
 
 Refused: the shared refusals above.
@@ -382,7 +382,7 @@ that ace2k arms by default uses `assist_speed`.
 | Parameter | Default | Range | Meaning |
 |---|---|---|---|
 | `LANE` | required | 1–4 | the lane |
-| `SPEED` | `feed_speed` (30) | 9–70 mm/s | the new speed. With `SPEED` absent the speed becomes the configured `feed_speed`, not "unchanged" |
+| `SPEED` | `feed_speed` (30) | 9–80 mm/s | the new speed. With `SPEED` absent the speed becomes the configured `feed_speed`, not "unchanged" |
 
 The unit confirms the new speed or refuses it. A refused speed is an error, and the unit keeps it
 for no later move.
@@ -453,7 +453,7 @@ out and put back.
 |---|---|---|---|
 | `LANE` | required | 1–4 | the lane |
 | `DIR` | forward | `FORWARD`, `BACK`, `BOTH` (case-insensitive) | the kind of assist |
-| `SPEED` | `assist_speed` (50) | 9–70 mm/s | assist speed |
+| `SPEED` | `assist_speed` (50) | 9–80 mm/s | assist speed |
 | `OFF` | 0 | integer, nonzero disarms | stop the lane's assist (sends a stop) |
 | `SOFT` | 0 | 0–1 | 1 reports a refusal as `ace2k: lane N not armed — <reason>` instead of raising, for print hooks; `OFF=1` is the same with or without it |
 
@@ -578,7 +578,7 @@ any is applied.
 | Parameter | Default | Range | Meaning |
 |---|---|---|---|
 | `CHUNK_MM` | 3 (`ff_chunk_mm`) | 1–10 mm | a dose's length (the unit's) |
-| `PULSE` | 15 (`ff_pulse`) | 9–70 mm/s | retired, the next version removes it: a reverse dose's least speed (the unit's); a forward dose runs at the unit's floor speed, as every move of 10 mm or less does |
+| `PULSE` | 15 (`ff_pulse`) | 9–80 mm/s | retired, the next version removes it: a reverse dose's least speed (the unit's); a forward dose runs at the unit's floor speed, as every move of 10 mm or less does |
 | `WINDOW_MS` | 500 (`ff_window_ms`) | 100–5000 ms, integer | the planner window the host meters over; one shorter than `ff_period_ms` counts as one period |
 | `LEAD_MS` | 0 (`ff_lead_ms`) | 0–5000 ms, integer | how far ahead of the extruder the doses run; a new lead drops each extruder's sweep, credit and open retraction; at any lead each planned move counts once, credited or taken back |
 | `DEADBAND` | 0.3 (`ff_deadband`) | 0.0–10.0 mm/s | the rate below which no dose is sent |
@@ -628,7 +628,7 @@ values in effect.
 |---|---|---|---|
 | `FWD` | 20 (`snag_fwd_mm`) | 5–50 mm | motor travel past a full before the touch |
 | `LAG` | 5 (`snag_lag_mm`) | 1.5–20 mm, under `FWD` | the filament behind the motor that counts as a jam |
-| `DUTY` | 0 (`snag_duty_pct`) | 0–100, integer | duty above the feed-forward that counts as a jam; 0 is off |
+| `DUTY` | 0 (`snag_duty_pct`) | 0–100, integer | duty above the feed-forward that counts as a jam; 0 is off. At the 80 mm/s top speed a loaded lane can run at 100 % duty, 11 points above the feed-forward's 89 %, so the guard is not usable there: a value of 11 or less fires on healthy moves at 80, and a larger one never fires at that speed. |
 | `BACK` | 5 (`snag_back_mm`) | 2–20 mm | the touch |
 | `REST` | 500 (`snag_rest_ms`) | 100–2000 ms, integer | the wait for the plunger at rest |
 | `FREE` | 50 (`snag_free_mm`) | 20–200 mm | in reverse, the filament back before a taut trip is forgiven |
@@ -838,7 +838,7 @@ staged for `SAVE_CONFIG`. The command sends the three values to the unit and pri
 | Parameter | Default | Range | Meaning |
 |---|---|---|---|
 | `PARK` | `load_park_mm` (300) | above 0, at most 2000 mm | the parking distance |
-| `SPEED` | `load_speed` (60) | 9–70 mm/s | the load speed |
+| `SPEED` | `load_speed` (60) | 9–80 mm/s | the load speed |
 | `AUTO` | `auto_load` (on) | 0–1 | 1 pulls an inserted filament in by itself |
 
 Refused: `ace2k: SPEED must be within MIN..MAX mm/s`;

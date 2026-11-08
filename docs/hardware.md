@@ -378,9 +378,15 @@ The constants chosen from this:
   9.7 mm/s. 15 % ran at ≈ 4.7 mm/s, but not steadily at the tach's resolution. 10 % and 5 % did
   not start the motor, nor did 10 % unloaded.
 - The speed floor is **9 mm/s**: the floor duty's loaded speed, rounded up.
-- The ceiling is **70 mm/s**: 90 % of the well-wound spool's maximum (79.4 → 71.5 mm/s), rounded
-  down to 5 mm/s. The badly wound spool's 76.9 mm/s leaves 9 % of headroom at it. Higher was
-  preferred, without much overshoot.
+- The ceiling is **80 mm/s**, the factory firmware's own top speed. It was **70 mm/s** up to
+  v0.13.0: 90 % of the well-wound spool's maximum (79.4 → 71.5 mm/s), rounded down to 5 mm/s,
+  which left the badly wound spool's 76.9 mm/s 9 % of headroom. Measured on the U1 on 2026-11-08,
+  through more than 2 m of tube to a head's sensor: ace2k asked 70 ran a steady 69.6–70.4 mm/s,
+  and the factory firmware asked 80 ran a steady ≈ 78 mm/s feeding (motor ≈ 79) and ≈ 80 mm/s
+  rolling back. 80 is chosen to match it, with no headroom: under a spool the speed loop often
+  sits at or near 100 % duty there and runs a little under the setpoint. The move's deadline
+  (3/2 of the expected time, plus a second) and the comparator, which compares motor with
+  filament travel, are not upset by that.
 
 With the initial straight-line feed-forward, the loaded closed loop converged too slowly: 100 mm
 at 30 / 50 / 70 mm/s ended 6–11 % under the setpoint after 2–4 s. The measured table removes most

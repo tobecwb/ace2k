@@ -58,7 +58,7 @@ FF_CONSTANTS = {
     "ACE2K_FEED_FF_CHUNK_UM_MAX": 10000,
     "ACE2K_FEED_FF_PULSE_UM_S": 15000,
     "ACE2K_FEED_FF_PULSE_UM_S_MIN": 9000,
-    "ACE2K_FEED_FF_PULSE_UM_S_MAX": 70000,
+    "ACE2K_FEED_FF_PULSE_UM_S_MAX": 80000,
     "ACE2K_FEED_FF_REVERSE": 1,
 }
 WITH_FF = dict(DEFAULT_CONSTANTS, **FF_CONSTANTS)
@@ -406,7 +406,7 @@ def test_a_rate_above_the_lanes_maximum_is_clamped() -> None:
     set_modes(mcu, [FOLLOWING, 0, 0, 0])
     extrude(extruder, 10.0, 1.0, 100.0)
     feed.ff._tick(10.0)
-    assert bases(mcu) == [[0, 70000, 0]]
+    assert bases(mcu) == [[0, 80000, 0]]
 
 
 def test_the_lead_shifts_the_window() -> None:

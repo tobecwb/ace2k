@@ -101,15 +101,15 @@ TEST(the_motor_outcomes_become_errors_or_stops)
     struct world w;
     world_init(&w);
     struct ace2k_feed_event e;
-    /* timeout: 100 mm at the ceiling, 70 mm/s — 90 mm at the ceiling is 1285 ms and the 10 mm
-     * landing at the floor speed 1111, expected 2396, the deadline 2396 × 3 / 2 + 1000 = 4594 ms
-     * after the start, the 460th tick; the tach creeping (1 pulse a tick, ≈ 8 mm/s, keeps the
+    /* timeout: 100 mm at the ceiling, 80 mm/s — 90 mm at the ceiling is 1125 ms and the 10 mm
+     * landing at the floor speed 1111, expected 2236, the deadline 2236 × 3 / 2 + 1000 = 4354 ms
+     * after the start, the 436th tick; the tach creeping (1 pulse a tick, ≈ 8 mm/s, keeps the
      * stall check quiet) with the strand keeping pace — a count every 12 ticks is ≈ 10 mm/s, so
-     * the comparator has nothing to say — and 38 of the 81 counts by the deadline */
+     * the comparator has nothing to say — and 36 of the 81 counts by the deadline */
     ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 100000, ACE2K_LANE_SPEED_MAX_UM_S,
                                51, w.now),
               ACE2K_FEED_ACCEPTED);
-    paced(&w, 459, 1, 12, 1);
+    paced(&w, 435, 1, 12, 1);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FEEDING);
     steps(&w, 1, 1, 0);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ERROR);
@@ -1646,15 +1646,15 @@ TEST(a_timeout_in_an_assists_second_burst_reports_both_bursts)
 {
     struct world w;
     world_init(&w);
-    /* at 70 mm/s a 100 mm burst has 4594 ms: burst 2 began 6 ticks before this paced run, so
-     * its deadline passes on the run's 454th tick.  A pulse a tick and a count every twelve keep
-     * the comparator quiet: 37 more counts and 454 more pulses */
+    /* at 80 mm/s a 100 mm burst has 4354 ms: burst 2 began 6 ticks before this paced run, so
+     * its deadline passes on the run's 430th tick.  A pulse a tick and a count every twelve keep
+     * the comparator quiet: 35 more counts and 430 more pulses */
     assist_two_bursts(&w, ACE2K_LANE_SPEED_MAX_UM_S, 244);
-    paced(&w, 453, 1, 12, 1);
+    paced(&w, 429, 1, 12, 1);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ASSISTING);
     step(&w, 1, 0);
     ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_TIMEOUT);
-    one_event(&w, ACE2K_FEED_TIMEOUT, ACE2K_FEED_ASSISTING, 108 + 454, 27 + 37);
+    one_event(&w, ACE2K_FEED_TIMEOUT, ACE2K_FEED_ASSISTING, 108 + 430, 27 + 35);
 }
 
 TEST(taut_and_still_under_command_in_an_assist_is_tangled_at_the_standstill_never_assist_stall)
@@ -3747,15 +3747,15 @@ TEST(a_timeout_in_the_follows_later_burst_reports_the_whole_follow)
 {
     struct world w;
     world_init(&w);
-    /* the same deadline as an assist's burst at 70 mm/s: burst 2 began 6 ticks before this paced
-     * run, so its deadline passes on the run's 454th tick, with 37 more counts and 454 more
+    /* the same deadline as an assist's burst at 80 mm/s: burst 2 began 6 ticks before this paced
+     * run, so its deadline passes on the run's 430th tick, with 35 more counts and 430 more
      * pulses */
     follow_two_bursts(&w, ACE2K_LANE_SPEED_MAX_UM_S, 72);
-    paced(&w, 453, 1, 12, 1);
+    paced(&w, 429, 1, 12, 1);
     ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_FOLLOWING);
     step(&w, 1, 0);
     ASSERT_EQ(ace2k_feed_error(&w.feed, 0), ACE2K_FEED_TIMEOUT);
-    one_event(&w, ACE2K_FEED_TIMEOUT, ACE2K_FEED_FOLLOWING, 108 + 454, 27 + 37);
+    one_event(&w, ACE2K_FEED_TIMEOUT, ACE2K_FEED_FOLLOWING, 108 + 430, 27 + 35);
 }
 
 TEST(arming_the_follow_reads_the_buffer_as_the_tick_does)
@@ -4282,8 +4282,8 @@ TEST(the_negative_debt_is_capped_and_the_base_bounds_hold_both_ways)
     struct world w;
     world_init(&w);
     ff_arm(&w, 174);
-    /* −70 mm/s: 700 µm a tick.  A reverse dose starts at −3000, but with the strand still it pays
-     * nothing until it ends, so the accrual meets the cap within 9 ticks */
+    /* −80 mm/s: 800 µm a tick.  A reverse dose starts at −3000, but with the strand still it pays
+     * nothing until it ends, so the accrual meets the cap within 8 ticks */
     ASSERT_EQ(ace2k_feed_base_set(&w.feed, 0, -(int32_t)ACE2K_LANE_SPEED_MAX_UM_S, false), 0);
     steps(&w, 20, 0, 0);
     ASSERT_EQ(w.feed.l[0].debt_um, -(int32_t)(2U * ACE2K_FEED_FF_CHUNK_UM));
