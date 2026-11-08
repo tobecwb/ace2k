@@ -644,7 +644,7 @@ def test_a_refused_unload_ends_the_pause_and_does_not_give_the_follow_back() -> 
     responses["ace2k_feed_start"] = {"lane": 0, "accepted": 1, "reason": 0}
     for _ in range(3):
         report(mcu)
-    assert started(mcu) == [(0, 6, 50000), (0, 4, 70000)]  # the follow is not armed again
+    assert started(mcu) == [(0, 6, 50000), (0, 4, 80000)]  # the follow is not armed again
 
 
 def test_the_busy_of_the_lane_winding_down_is_retried() -> None:

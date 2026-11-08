@@ -112,7 +112,7 @@ GCODE_REFUSALS = [
     ("FOLLOW", {"TAIL_MM": "2000.0006"}, "ace2k: TAIL_MM (2000.001) must be within 200..2000"),
     ("FF", {"CHUNK_MM": "0.5"}, "ace2k: CHUNK_MM (0.5) must be within 1..10"),
     ("FF", {"PULSE": "nan"}, "ace2k: PULSE (nan) must be a finite number"),
-    ("FF", {"PULSE": "70.0006"}, "ace2k: PULSE (70.001) must be within 9..70"),
+    ("FF", {"PULSE": "80.0006"}, "ace2k: PULSE (80.001) must be within 9..80"),
     ("FF", {"WINDOW_MS": "10"}, "ace2k: WINDOW_MS (10) must be within 100..5000"),
     ("FF", {"DEADBAND": "-0.1"}, "ace2k: DEADBAND (-0.1) must be within 0..10"),
     ("FF", {"RETRACT_MIN_MM": "20"}, "ace2k: RETRACT_MIN_MM (20) must be within 5..17"),
@@ -149,7 +149,7 @@ CONFIG_REFUSALS = [
     ({"follow_take_mm": 30.001}, "ace2k: follow_take_mm (30.001) must be within 5..30"),
     ({"follow_tail_mm": float("nan")}, "ace2k: follow_tail_mm (nan) must be a finite number"),
     ({"ff_chunk_mm": 0.9}, "ace2k: ff_chunk_mm (0.9) must be within 1..10"),
-    ({"ff_pulse": 71}, "ace2k: ff_pulse (71) must be within 9..70"),
+    ({"ff_pulse": 81}, "ace2k: ff_pulse (81) must be within 9..80"),
     (
         {"slip_allow_mm": 50},
         "ace2k: slip_allow_mm (50) must be under the image's default slip_check_mm (50): the"

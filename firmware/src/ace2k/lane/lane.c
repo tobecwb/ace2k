@@ -237,8 +237,8 @@ static void apply_setpoint(struct ace2k_lane *self, uint8_t lane)
  *   integral was frozen while P held the floor, not wound down, so nothing has to unwind.  With the
  *   window alone, the integral wound down to its lower bound, and the loop answered about 7 loops
  *   late.
- * - (c) A setpoint increase, for example 30 → 70 mm/s with ff 35 → 78 %, drops a large integral at
- *   once to what the new entry can absorb, (100 − 78) × 6000 = 132 000.  It does not unwind it over
+ * - (c) A setpoint increase, for example 30 → 80 mm/s with ff 35 → 89 %, drops a large integral at
+ *   once to what the new entry can absorb, (100 − 89) × 6000 = 66 000.  It does not unwind it over
  *   many loops.
  * A known residue is accepted.  The integral may sit up to the error of one loop past a bound
  * (about 3 % or less), and unwinds one loop late.  Landing it exactly on the bound was tried in two

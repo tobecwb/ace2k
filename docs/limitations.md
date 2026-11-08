@@ -10,9 +10,9 @@ them in more detail.
 
 ## What has not been tested yet
 
-- **One long-run test.** The long-run print test (burn-in) ran on the release candidate: two
-  prints, about 9 hours, with all four lanes of one unit in use. The changes since then were tested
-  on the bench, in shorter runs. Stay near the printer for the first prints.
+- **Long-run tests on one unit.** The long-run print tests have run many prints since the
+  release candidate, the longest over 40 hours, with all four lanes of one unit in use. Stay near
+  the printer for the first prints.
 - **Mains: 127 V / 60 Hz only.** Everything was tested on 127 V at 60 Hz. 220–240 V and 50 Hz have
   never been tried, and the dryer switches mains power. The firmware accepts both frequencies, but
   that comes from the design, not from a measurement. Do not leave a drying cycle unattended. If
@@ -102,7 +102,10 @@ them in more detail.
 - **The tip of the filament catches at the bay's entry.** The unit tolerates one such catch per
   move. Two catches in one move end as `stuck`. A crushed or kinked tube reads as a tangle. Free the
   filament or straighten the tube, then run [`ACEK_CLEAR`](commands.md#acek_clear). The duty guard
-  of the catch handling is off by default ([`ACEK_SNAG_SET`](commands.md#acek_snag_set)).
+  of the catch handling is off by default ([`ACEK_SNAG_SET`](commands.md#acek_snag_set)), and it
+  is not usable at the 80 mm/s top speed: a loaded lane can run there at 100 % duty, 11 points
+  above the feed-forward's 89 %, so a value of 11 or less fires on healthy moves at 80 and a
+  larger one never fires at that speed.
 
 ## Drying
 

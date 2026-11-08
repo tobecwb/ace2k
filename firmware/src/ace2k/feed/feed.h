@@ -253,7 +253,7 @@ _Static_assert((ACE2K_FEED_HELD_UM + ACE2K_FEED_COUNT_MAX_UM - 1U) / ACE2K_FEED_
 /* The base rate accrues for the time since the last tick of the follow, at most this long.  The
  * board's tick runs once for a stretch that it caught up on, with its clock several periods on.  A
  * gap longer than this is a stalled MCU, not filament to owe.  The debt is capped at two chunks
- * anyway.  The limit also keeps |base| × gap within 32 bits: 70 mm/s × 1 s is 7·10⁷ nm. */
+ * anyway.  The limit also keeps |base| × gap within 32 bits: 80 mm/s × 1 s is 8·10⁷ nm. */
 #define ACE2K_FEED_LEDGER_GAP_MAX_MS 1000U
 
 enum ace2k_feed_mode {

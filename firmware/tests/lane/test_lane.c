@@ -292,8 +292,10 @@ TEST(feed_forward_interpolates_the_table_and_clamps)
     ASSERT_EQ(ace2k_lane_feed_forward_pct(57500), 65);
     /* 20 000 between 15 384 (20 %) and 24 858 (30 %): 20 + 4616 × 10 / 9474 = 24 */
     ASSERT_EQ(ace2k_lane_feed_forward_pct(20000), 24);
-    /* 70 000, the ceiling, between 61 700 (70 %) and 71 255 (80 %): 70 + 8300 × 10 / 9555 = 78 */
-    ASSERT_EQ(ace2k_lane_feed_forward_pct(ACE2K_LANE_SPEED_MAX_UM_S), 78);
+    /* 80 000, the ceiling, between 71 255 (80 %) and 80 323 (90 %): 80 + 8745 × 10 / 9068 = 89 */
+    ASSERT_EQ(ace2k_lane_feed_forward_pct(ACE2K_LANE_SPEED_MAX_UM_S), 89);
+    /* 70 000, between 61 700 (70 %) and 71 255 (80 %): 70 + 8300 × 10 / 9555 = 78 */
+    ASSERT_EQ(ace2k_lane_feed_forward_pct(70000), 78);
     /* the floor setpoint, 9 000, lies under the first entry (15 384), so the table gives the
      * floor duty — the anti-windup's lower bound is 0 at the floor setpoint (lane.c) only while
      * it does; a probe image that lowers the floor duty moves SPEED_MIN together with the table's
@@ -337,12 +339,11 @@ TEST(the_landing_writes_the_floor_duty_on_the_tick_it_begins)
     struct ace2k_fake_counters f;
     primed(&l, &f);
     uint32_t now = 10;
-    /* The ceiling, 70 mm/s, is 865 pulses/s.  The fake runs 8 pulses a tick (≈ 65 mm/s) with a
-     * count every two ticks (≈ 62 mm/s: the strand 5 % behind).  100 mm is 81 counts.  The
-     * landing is decided on the encoder: it begins once 8 counts (9 874 µm ≤ 10 mm) remain, on
-     * the 73rd count, at tick 146. */
-    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, 100000, ACE2K_LANE_SPEED_MAX_UM_S, now),
-              0);
+    /* 70 mm/s is 865 pulses/s.  The fake runs 8 pulses a tick (≈ 65 mm/s) with a count every two
+     * ticks (≈ 62 mm/s: the strand 5 % behind).  100 mm is 81 counts.  The landing is decided on
+     * the encoder: it begins once 8 counts (9 874 µm ≤ 10 mm) remain, on the 73rd count, at tick
+     * 146. */
+    ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, 100000, 70000, now), 0);
     ASSERT_TRUE(!l.lane[0].move.landing);
     run_paced(&l, &f, &now, 145, 8, 2, 1); /* 72 counts: 9 remain, 11 107 µm > 10 mm */
     ASSERT_TRUE(!l.lane[0].move.landing);
@@ -401,7 +402,7 @@ TEST(a_move_no_longer_than_the_landing_runs_at_the_floor_duty_from_its_start)
     primed(&l, &f);
     uint32_t now = 10;
     /* 5 mm at the ceiling is 4 counts (4.05, rounded), 4 937 µm: all of it is landing.  The
-     * first duty is the floor's, not the 78 % the table gives the ceiling. */
+     * first duty is the floor's, not the 89 % the table gives the ceiling. */
     ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, 5000, ACE2K_LANE_SPEED_MAX_UM_S, now), 0);
     ASSERT_STR_EQ(f.order, "drp");
     ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
@@ -625,15 +626,15 @@ TEST(a_move_that_outlives_its_deadline_times_out)
     struct ace2k_fake_counters f;
     primed(&l, &f);
     uint32_t now = 10;
-    /* 100 mm at the ceiling, 70 mm/s: 90 mm at the ceiling, 90 000 × 1000 / 70 000 = 1285 ms,
-     * and the 10 mm landing at the floor speed, 10 000 × 1000 / 9000 = 1111 ms — expected 2396,
-     * the deadline 2396 × 3 / 2 + 1000 = 4594 ms after the start, i.e. the tick at 4600 ms (the
-     * 460th); the tach creeps (1 pulse per tick keeps the stall check quiet) and the strand
+    /* 100 mm at the ceiling, 80 mm/s: 90 mm at the ceiling, 90 000 × 1000 / 80 000 = 1125 ms,
+     * and the 10 mm landing at the floor speed, 10 000 × 1000 / 9000 = 1111 ms — expected 2236,
+     * the deadline 2236 × 3 / 2 + 1000 = 4354 ms after the start, i.e. the tick at 4360 ms (the
+     * 436th); the tach creeps (1 pulse per tick keeps the stall check quiet) and the strand
      * never moves: 0 of 81 counts */
     ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, 100000, ACE2K_LANE_SPEED_MAX_UM_S, now),
               0);
-    ASSERT_EQ(l.lane[0].move.deadline_ms, now + 4594);
-    run_ticks(&l, &f, &now, 459, 1, 0);
+    ASSERT_EQ(l.lane[0].move.deadline_ms, now + 4354);
+    run_ticks(&l, &f, &now, 435, 1, 0);
     ASSERT_TRUE(ace2k_lane_is_moving(&l, 0));
     run_ticks(&l, &f, &now, 1, 1, 0);
     ASSERT_TRUE(!ace2k_lane_is_moving(&l, 0));
@@ -754,13 +755,13 @@ TEST(a_setpoint_increase_drops_the_integral_to_what_the_new_table_entry_can_abso
     }
     ASSERT_EQ(l.lane[0].move.integ_um_s, ACE2K_LANE_INTEG_MAX_PCT * ACE2K_LANE_KI_DIV);
     ASSERT_EQ(f.duty[0], 99);
-    /* the ceiling asked: the table's 78 can absorb (100 − 78) × 6000 = 132 000 of integral, no
-     * more.  The next loop's error is 61 903 (P 41), the applied duty 78 + 41 + 50 = 169 is past
+    /* the ceiling asked: the table's 89 can absorb (100 − 89) × 6000 = 66 000 of integral, no
+     * more.  The next loop's error is 71 903 (P 47), the applied duty 89 + 47 + 50 = 186 is past
      * the ceiling so the error stays out, and the window drops the integral from 300 000 to
-     * 132 000 at once — instead of unwinding 168 000 over many loops */
+     * 66 000 at once — instead of unwinding 234 000 over many loops */
     ASSERT_EQ(ace2k_lane_set_speed(&l, 0, ACE2K_LANE_SPEED_MAX_UM_S, now), 0);
     run_ticks(&l, &f, &now, 10, 1, 0);
-    ASSERT_EQ(l.lane[0].move.integ_um_s, (100 - 78) * ACE2K_LANE_KI_DIV);
+    ASSERT_EQ(l.lane[0].move.integ_um_s, (100 - 89) * ACE2K_LANE_KI_DIV);
     ASSERT_TRUE(l.lane[0].move.integ_um_s <=
                 (100 - ace2k_lane_feed_forward_pct(ACE2K_LANE_SPEED_MAX_UM_S)) * ACE2K_LANE_KI_DIV);
     ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MAX_PCT);
@@ -784,13 +785,13 @@ TEST(set_speed_moves_the_deadline_to_what_remains_at_the_new_speed)
     struct ace2k_fake_counters f;
     primed(&l, &f);
     uint32_t now = 10;
-    /* 500 mm at the ceiling, 70 mm/s: 490 mm at the ceiling, 7000 ms, and the 10 mm landing at
-     * the floor speed, 1111 ms — expected 8111, the deadline 8111 × 3 / 2 + 1000 = 13 166 ms
+    /* 500 mm at the ceiling, 80 mm/s: 490 mm at the ceiling, 6125 ms, and the 10 mm landing at
+     * the floor speed, 1111 ms — expected 7236, the deadline 7236 × 3 / 2 + 1000 = 11 854 ms
      * after the start; 500 mm is 405 counts */
     ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, 500000, ACE2K_LANE_SPEED_MAX_UM_S, now),
               0);
     uint32_t old_deadline = l.lane[0].move.deadline_ms;
-    ASSERT_EQ(old_deadline, now + 13166);
+    ASSERT_EQ(old_deadline, now + 11854);
     run_paced(&l, &f, &now, 100, 8, 2, 1); /* one second: 50 of 405 counts (≈ 62 mm), 800 pulses */
     /* slowed to the floor, 9 mm/s: 355 counts = 438 141 µm remain on the encoder — 428 141 at
      * 9 mm/s is 47 571 ms and the 10 mm landing, at the same speed, 1111 — expected 48 682, so
@@ -906,18 +907,18 @@ TEST(a_short_move_at_the_ceiling_whose_landing_crawls_ends_before_its_deadline)
     primed(&l, &f);
     uint32_t now = 10;
     uint32_t start = now;
-    /* 15 mm at 70 mm/s: 5 mm at the ceiling (5000 × 1000 / 70 000 = 71 ms) and the 10 mm landing
-     * at the floor speed (10 000 × 1000 / 9000 = 1111 ms) — expected 1182, the deadline
-     * 1182 × 3 / 2 + 1000 = 2773 ms; the whole move budgeted at the ceiling would have given
-     * 15 000 × 1000 / 70 000 = 214 → 214 × 3 / 2 + 1000 = 1321 ms.  15 mm is 12 counts. */
+    /* 15 mm at 80 mm/s: 5 mm at the ceiling (5000 × 1000 / 80 000 = 62 ms) and the 10 mm landing
+     * at the floor speed (10 000 × 1000 / 9000 = 1111 ms) — expected 1173, the deadline
+     * 1173 × 3 / 2 + 1000 = 2759 ms; the whole move budgeted at the ceiling would have given
+     * 15 000 × 1000 / 80 000 = 187 → 187 × 3 / 2 + 1000 = 1280 ms.  15 mm is 12 counts. */
     ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, 15000, ACE2K_LANE_SPEED_MAX_UM_S, now), 0);
-    ASSERT_EQ(l.lane[0].move.deadline_ms, start + 2773);
+    ASSERT_EQ(l.lane[0].move.deadline_ms, start + 2759);
     run_paced(&l, &f, &now, 7, 8, 2, 1); /* 3 counts: 9 remain, 11 107 µm — no landing yet */
     ASSERT_TRUE(!l.lane[0].move.landing);
     run_ticks(&l, &f, &now, 1, 8, 1); /* the 4th: 8 remain, 9 874 µm — the landing begins */
     ASSERT_TRUE(l.lane[0].move.landing);
     /* tick 8, before the first loop: no loop has measured the motor, so the duty is the floor's
-     * feed-forward with no P term — the floor, not the ceiling's 78 % */
+     * feed-forward with no P term — the floor, not the ceiling's 89 % */
     ASSERT_EQ(f.duty[0], ACE2K_LANE_DUTY_MIN_PCT);
     /* a heavy spool: the landing crawls at 3 pulses per 4 ticks, ≈ 6 mm/s, under the floor
      * speed, the strand a count every 20 ticks (≈ 6.2 mm/s); the 8 counts take 160 ticks —
@@ -933,8 +934,8 @@ TEST(a_short_move_at_the_ceiling_whose_landing_crawls_ends_before_its_deadline)
     ASSERT_TRUE(ace2k_lane_pop_result(&l, 0, &r));
     ASSERT_EQ(r.outcome, ACE2K_LANE_DONE);
     ASSERT_EQ(r.duration_ms, 1680);
-    ASSERT_TRUE(ace2k_time_after(start + r.duration_ms, start + 1321));
-    ASSERT_TRUE(!ace2k_time_after(start + r.duration_ms, start + 2773));
+    ASSERT_TRUE(ace2k_time_after(start + r.duration_ms, start + 1280));
+    ASSERT_TRUE(!ace2k_time_after(start + r.duration_ms, start + 2759));
 }
 
 TEST(a_move_no_longer_than_the_landing_is_budgeted_whole_at_the_floor_speed)
@@ -945,7 +946,7 @@ TEST(a_move_no_longer_than_the_landing_is_budgeted_whole_at_the_floor_speed)
     uint32_t now = 10;
     /* 5 mm at the ceiling: shorter than the 10 mm landing, so nothing is budgeted at the
      * commanded speed — 5 000 × 1000 / 9000 = 555 ms at the floor speed, then 555 × 3 / 2 = 832
-     * (integer) + 1000 = 1832 ms; whole at the ceiling it would have been 71 → 1106 */
+     * (integer) + 1000 = 1832 ms; whole at the ceiling it would have been 62 → 1093 */
     ASSERT_EQ(ace2k_lane_move(&l, 0, ACE2K_LANE_FORWARD, 5000, ACE2K_LANE_SPEED_MAX_UM_S, now), 0);
     ASSERT_EQ(l.lane[0].move.deadline_ms, now + 1832);
     ace2k_lane_stop(&l, 0, now);

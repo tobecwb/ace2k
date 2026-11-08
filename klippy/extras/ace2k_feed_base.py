@@ -57,6 +57,7 @@ class FeedBase:
     lanes: list[LaneStatus]  # the status of each lane
     feed_speed_mm_s: float
     unload_speed_mm_s: float
+    unload_speed_set: bool  # False: the default, lowered at connect to the unit's top speed
     load_speed_mm_s: float
     load_park_mm: float
     search_mm: float | None  # from the config key, else the firmware default (set at connect)

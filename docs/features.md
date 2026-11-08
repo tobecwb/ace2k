@@ -34,7 +34,7 @@ For the Snapmaker U1, see the [`ace2k-u1`](https://github.com/tobecwb/ace2k-u1) 
     #uid: <the unit's UID>         # optional; refuse another unit on this serial: (ACEK_STATUS shows it)
     #lane1_insert_mv: 600, 1100    # optional; the factory calibration is used when absent
     #feed_speed: 30                # mm/s, the default of ACEK_FEED and ACEK_ROLLBACK
-    #unload_speed: 70
+    #unload_speed: 80             # mm/s; left out: 80, or the unit's top speed when lower
     #load_speed: 60
     #load_park_mm: 300             # the load's parking distance: the path from the drive to the outlet
     #                              # (323 mm on the development unit) minus a margin
@@ -65,7 +65,7 @@ For the Snapmaker U1, see the [`ace2k-u1`](https://github.com/tobecwb/ace2k-u1) 
     #feed_forward: True            # ACEK_FEED_FORWARD ON=1 / OFF=1 switches it live
     #ff_chunk_mm: 3                # the unit's dose (1–10)
     #ff_pulse: 15                  # retired, the next version removes it: mm/s, a reverse
-    #                              # dose's least speed (9–70); a forward dose runs at the floor
+    #                              # dose's least speed (9–80); a forward dose runs at the floor
     #ff_period_ms: 100             # how often the host works out the rate (20–1000)
     #ff_window_ms: 500             # the stretch of planned moves the rate is the mean of (100–5000)
     #ff_lead_ms: 0                 # how far ahead of now that stretch starts (0–5000)
@@ -82,7 +82,7 @@ For the Snapmaker U1, see the [`ace2k-u1`](https://github.com/tobecwb/ace2k-u1) 
 
 ## Commands in brief
 
-`LANE` is 1–4. Lengths are in mm. Speeds are in mm/s, within the unit's bounds (9–70).
+`LANE` is 1–4. Lengths are in mm. Speeds are in mm/s, within the unit's bounds (9–80).
 
 The motion commands ([`ACEK_FEED`](commands.md#acek_feed),
 [`ACEK_ROLLBACK`](commands.md#acek_rollback), [`ACEK_LOAD`](commands.md#acek_load),

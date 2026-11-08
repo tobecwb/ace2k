@@ -119,7 +119,10 @@ never retries a move on its own: a tolerance is a bounded, announced resume.
    `obstacle` return in the search (rule 8).
 2. The duty guard, once set, ends the tolerance at once. During the forward tolerance, a duty more
    than the guard's points above the feed-forward duty of the lane's setpoint ends the move as
-   rule 1's lag does. The guard is settable at run time and off by default.
+   rule 1's lag does. The guard is settable at run time and off by default. At the 80 mm/s top
+   speed a loaded lane can run at 100 % duty, 11 points above the feed-forward's 89 %, so the
+   guard is not usable there: a value of 11 or less fires on healthy moves at 80, and a larger
+   one never fires at that speed.
 3. The plunger must come back. After each release manoeuvre, the lane waits at most
    `ACE2K_FEED_SNAG_REST_MS` (initially 500 ms) for its rest reading. If it is not at rest by
    then, the motor stays stopped: forward, the move ends as rule 1's lag does; toward the spool,

@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.14.0 — 2026-11-08
+
+The unit's top speed is now 80 mm/s, the same as the factory firmware. The host interface is
+unchanged, at version 28.
+
+### Changed
+
+- **The top speed is 80 mm/s** (it was 70). The dictionary constants
+  `ACE2K_LANE_SPEED_MAX_UM_S` and `ACE2K_FEED_FF_PULSE_UM_S_MAX` are 80000. With a full spool, the
+  motor often runs at or near 100 % duty at 80 mm/s, and the lane then runs a little slower than
+  asked. Nothing stops a move for that
+  ([`hardware.md`](docs/hardware.md), "Motors").
+- **`unload_speed` defaults to 80 mm/s** (it was 70). If the unit's top speed is lower, the
+  default is that top speed. So an older image with a top speed of 70 mm/s unloads at 70, and
+  `klippy.log` says `unload_speed defaults to the unit's top speed, 70 mm/s`. A value you set is
+  still checked at connect. For example, `unload_speed: 80` with an older image stops Klipper
+  with `unload_speed must be within 9..70 mm/s`.
+- **A warning for a small `snag_duty_pct`.** At 80 mm/s a loaded lane can run at 100 % duty, 11
+  points above what the feed-forward asks. A `snag_duty_pct` from 1 to 11 may then stop healthy
+  moves. Klipper now warns about such a value at connect, in `klippy.log`. Nothing is refused.
+  The default, 0, turns this guard off.
+- **Tested on the paxx extended firmware `2.0.0-paxx12-24`** on the Snapmaker U1.
+
 ## v0.13.0 — 2026-11-03
 
 The changes since `v0.12.0-rc.1`. There was no final `v0.12.0`: this release follows the release

@@ -39,12 +39,14 @@
 /* The speed at the floor duty under a 1 kg spool.  The unit measured 8 502 µm/s, rounded up here to
  * the next 1 000.  Unloaded, the floor duty runs at about 15 mm/s. */
 #define ACE2K_LANE_SPEED_MIN_UM_S 9000U
-/* 90 % of the loaded maximum under a well-wound spool of about 950 g, rounded down to a multiple of
- * 5 000 (measured on the unit).  That spool ran 79 433 µm/s at 100 % duty, and 90 % of it is
- * 71 490.  A badly wound 1 kg spool ran 76 923 at 100 %, which leaves 9 % of headroom at this
- * limit.  A higher limit was preferred, as long as the overshoot stayed small.  Unloaded, 100 %
- * runs 91 173 (the table). */
-#define ACE2K_LANE_SPEED_MAX_UM_S 70000U
+/* The top speed matches the factory firmware's, 80 mm/s, with no headroom (measured on the unit,
+ * 2026-11-08: through a 2 m tube the factory firmware asked 80 and ran a steady 78 mm/s feeding and
+ * 80 rolling back).  Under a spool the loop often sits at or near 100 % duty there, and the lane
+ * then runs a little under the setpoint.  At 100 % duty a well-wound spool of about 950 g ran
+ * 79 433 µm/s and a badly wound 1 kg spool 76 923.  The limit was 70 000 before, 90 % of the first,
+ * rounded down.  The deadline's 3/2 covers the shortfall.  Unloaded, 100 % runs 91 173 (the
+ * table). */
+#define ACE2K_LANE_SPEED_MAX_UM_S 80000U
 #define ACE2K_LANE_MOVE_MAX_UM    2000000U /* the feed's rule 2: 2 000 mm per move */
 /* Measured on the unit (docs/hardware.md).  At 10 %, the motor does not start, even unloaded.  At
  * 15 %, it carries a 1 kg spool at about 4.7 mm/s, but not steadily at the tach's resolution.  One

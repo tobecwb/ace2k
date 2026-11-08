@@ -85,7 +85,7 @@ Example configuration::
 
     [ace2k]
     #feed_speed: 30             # mm/s, the default of ACEK_FEED and ACEK_ROLLBACK
-    #unload_speed: 70
+    #unload_speed: 80          # mm/s; left out: 80, or the unit's top speed when lower
     #load_speed: 60
     #load_park_mm: 300          # the parking distance of the load: the path from the motor to the
     #                           # outlet (323 mm on the development unit), minus a margin
@@ -120,7 +120,10 @@ the duty guard is off. The guard was built as a second check for a hold that the
 through, but it did not prove effective. The lag check ended every jam first, and a fixed excess
 over the feed-forward has no safe margin. A healthy lane shows up to 9 points of excess, and a
 jam shows 10 to 14. The key stays for a possible future case. A better signal would be the rise
-since the full signal, which cancels the drag of a spool. That is not built.
+since the full signal, which cancels the drag of a spool. That is not built. At the 80 mm/s top
+speed a loaded lane can run at 100 % duty, 11 points above the feed-forward's 89 %, so the guard
+is not usable there: a value of 11 or less fires on healthy moves at 80, and a larger one never
+fires at that speed.
 ``snag_lag_mm: 12`` is an option.
 
 With the tag reader (``ace2k_rfid.py``, whose ``rfid_search_mm`` this module also reads), a load
@@ -362,6 +365,8 @@ if TYPE_CHECKING:
     from .ace2k_feed_base import UnitProto
     from .ace2k_klipper_types import Command, Config, GCodeCommand, Params
 
+# The default of unload_speed, mm/s: the unit's top speed. An older image's top is lower.
+UNLOAD_SPEED_DEFAULT = 80.0
 # The DIR argument of ACEK_ASSIST. If it is missing or FORWARD, the assist goes forward.
 # BACK is the reverse and BOTH is the follow.
 ASSIST_DIRS = {"": "assist", "FORWARD": "assist", "BACK": "assist_back", "BOTH": "assist_both"}
@@ -417,7 +422,11 @@ class Ace2kFeed(FeedConnect, FeedMotion):
         self.mcu = unit.mcu  # the MCU of the unit, resolved once from the mcu key of its section
         self.section = config.get_name()
         self.feed_speed_mm_s = config.getfloat("feed_speed", 30.0, above=0.0)
-        self.unload_speed_mm_s = config.getfloat("unload_speed", 70.0, above=0.0)
+        # Left out, unload_speed is UNLOAD_SPEED_DEFAULT, or the unit's top speed when lower: the
+        # connect lowers it to an older image's top. A value that is set is checked at connect.
+        unload_speed = config.getfloat("unload_speed", None, above=0.0)
+        self.unload_speed_set = unload_speed is not None
+        self.unload_speed_mm_s = UNLOAD_SPEED_DEFAULT if unload_speed is None else unload_speed
         self.load_speed_mm_s = config.getfloat("load_speed", 60.0, above=0.0)
         self.assist_speed_mm_s = config.getfloat("assist_speed", 50.0, above=0.0)
         self.load_park_mm = config.getfloat("load_park_mm", 300.0, above=0.0)

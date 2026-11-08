@@ -31,8 +31,8 @@ brand.
 
 Nothing is ever written to a tag.
 
-**Status: `v0.13.0`.** The long-run print test (burn-in) ran on the release candidate: two
-prints, about 9 hours, with all four lanes of one unit in use.
+**Status: `v0.14.0`.** The long-run print tests have run many prints since the release
+candidate, the longest over 40 hours, with all four lanes of one unit in use.
 
 **How this was built.** AI tools were used in developing this firmware. Every feature and every
 change was verified on real hardware, over many hours of bench testing, before it was accepted.
@@ -74,7 +74,7 @@ printer, your filament or anything else that results from installing or running 
 may void your warranty. This project is not affiliated with or endorsed by Anycubic or Snapmaker.
 
 **Tested on.** One Anycubic ACE 2 Pro unit on a Snapmaker U1 running the paxx extended firmware
-`1.6.0-paxx12-22`, at 127 V / 60 Hz. Nothing else has been tested.
+`2.0.0-paxx12-24`, at 127 V / 60 Hz. Nothing else has been tested.
 
 > [!WARNING]
 > **Give each unit its own USB connection.** ace2k drives several ACE 2 Pro units, one per USB
