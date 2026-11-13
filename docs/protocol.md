@@ -94,15 +94,19 @@ firmware's public API: any change here is a versioned, documented change.
 | `ace2k_dryer_auto_query rest_ticks=%u` | periodic `ace2k_dryer_auto_state mode=%c limit=%c max=%c failures=%c flags=%c profile_c=%c profile_min=%hu cold=%c own=%c bound=%c rh=%hu above_s=%u` — the modes' state ("The dryer's modes"). `mode`, `limit` (%), `max` and `failures`: as stored. `flags`: 0x1 `stopped`, the humidity mode stopped on its failures. `profile_c` and `profile_min`: the profile. `cold`: 1 when the box reads cold. `own`: 1 while the running cycle is the humidity mode's. `bound`: 1 while the running cycle is bound to the host. `rh`: the last valid chamber RH read with the dryer idle, in tenths of a percent; a cycle does not refresh it. `above_s`: how long the cold box has been at or above the limit, in seconds, 0 when it is not. While the chamber or RH reading is invalid, `cold` and `above_s` read 0, so the host starts nothing on a bad reading; inside, the cold box and the hold run on through a glitch shorter than 60 s. The host asks for 1 Hz; phase 90 ms, the dryer's | v0.13.0 |
 | `ace2k_rfid_reader_query reader=%c` | `ace2k_rfid_reader_state reader=%c version=%c` — a soft reset of that reader, then a read of its version register: `0x18` on this unit's parts; 0 when the reset did not complete within 150 ms, which a bus that reads all ones also gives; `0x00` for a bus that reads all zeros. `reader`: 0 = A (lanes 3–4), 1 = B (lanes 1–2). The probe runs in task context and may take 150 ms. Since v0.13.0 a reader that the tag watch uses (its field wanted on, or an exchange with a tag running) is not reset, because the reset would cut a read. The answer then carries the version read at that reader's last soft reset, which is the watch's own configuration before its field came on. A reader whose switch-off has not read back off is not in use, so it is probed: the soft reset switches its field off too. The health self-test follows the same rule ("Health bits", bits 4 and 5) | v0.2.0 |
 | `ace2k_rfid_query rest_ticks=%u` | periodic `ace2k_rfid_state state=%*s field=%c` — `state`: one byte per lane, the lane's tag state ("Tag states", below). `field`: bits 0x01 / 0x02 the field on at reader A / B; 0x04 / 0x08 a field fault at A / B (the field read back on after it was switched off; latched until the MCU restarts); 0x10 / 0x20 reader A / B dead (three failed configurations in a row, [Tag states](#tag-states)). The UIDs are not in the report, because four 10-byte UIDs do not fit one frame; `ace2k_rfid_lane_query` gives one. The host asks for 1 Hz; phase 60 ms | v0.4.0 |
-| `ace2k_rfid_read lane=%c move=%c seq=%c` | `ace2k_rfid_read_response lane=%c accepted=%c reason=%c` — a read on command. `move` 0: an inventory of the lane's reader decides once the field's baseline is done, without motion ("The read on command"). `move` 1: the read with motion, the load's search from where the filament is, and back ("The read with motion"). `reason`: 0 ok; 1 `busy` (a session open on the lane, or a read on command pending on it; for `move=1` also the lane in a feed mode, moving or in error); 2 `no_filament`; 3 `no_link`; 4 `other_lane_moving` (`move=1`: another lane of the unit busy; since v0.13.0 a lane in the follow with its motor at rest does not count); 5 `unsupported` (`move=1` in an image without the feed, or with no search configured). A lane above 3 or a `move` above 1 is a host bug: `shutdown`. `seq` (since v0.13.0): the host's key for a read with motion, 1–255 per lane, a new one for each read; 0 is no key, and a read without motion ignores it. Klipper sends a query again, with the same bytes, when its answer is lost. A read with motion whose `seq` is the lane's last accepted one is that copy, not a second read: while the search it started runs, or within 1 s after that search ended (`ACE2K_FEED_RETRY_WINDOW_MS`) with no other mode entered on the lane since, it is answered `accepted=1`, and nothing else happens: no search starts, the lane's tag is not forgotten. A `seq` above 255 is a host bug: `shutdown`. An image before v0.13.0 has the command without `seq`: the host then sends it without one, and a lost answer can make the unit search twice | v0.4.0; `seq` v0.13.0 |
+| `ace2k_rfid_read lane=%c move=%c seq=%c` | `ace2k_rfid_read_response lane=%c accepted=%c reason=%c` — a read on command. `move` 0: an inventory of the lane's reader decides once the field's baseline is done, without motion ("The read on command"). `move` 1: the read with motion, the load's search from where the filament is, and back ("The read with motion"). `reason`: 0 ok; 1 `busy` (a session open on the lane, or a read on command pending on it; for `move=1` also the lane in a feed mode, moving or in error, and, since v0.15.0, a tie-break of the unit running on any lane, which the read sends back: the host sends the read again every 0.25 s for up to 30 s); 2 `no_filament`; 3 `no_link`; 4 `other_lane_moving` (`move=1`: another lane of the unit busy; since v0.13.0 a lane in the follow with its motor at rest does not count); 5 `unsupported` (`move=1` in an image without the feed, or with no search configured). A lane above 3 or a `move` above 1 is a host bug: `shutdown`. `seq` (since v0.13.0): the host's key for a read with motion, 1–255 per lane, a new one for each read; 0 is no key, and a read without motion ignores it. Klipper sends a query again, with the same bytes, when its answer is lost. A read with motion whose `seq` is the lane's last accepted one is that copy, not a second read: while the search it started runs, or within 1 s after that search ended (`ACE2K_FEED_RETRY_WINDOW_MS`) with no other mode entered on the lane since, it is answered `accepted=1`, and nothing else happens: no search starts, the lane's tag is not forgotten. A `seq` above 255 is a host bug: `shutdown`. An image before v0.13.0 has the command without `seq`: the host then sends it without one, and a lost answer can make the unit search twice | v0.4.0; `seq` v0.13.0 |
 | `ace2k_rfid_step lane=%c session=%c op=%c arg=%c blocks=%c key=%*s` | none; the unit answers with the step's `ace2k_rfid_data` frames. One step of the lane's open session ("RFID sessions"). `op` 0: read NTAG pages; `arg` is the first page (0–244), `blocks` the number of groups of four pages (1–3), `key` is ignored. `op` 1 / 2: authenticate MIFARE Classic sector `arg` (0–15) with key A / B (`key` is six bytes), then read the data blocks whose bits are set in `blocks` (bits 0–2, never the trailer). Host bugs (`shutdown`): an `op` above 2, a MIFARE step with a key of another length, a lane, sector, page or block mask out of bounds, a `session` above 255. A step for a session that is not open, or sent while the session's previous step waits or runs, comes from a stale host and is ignored. Each accepted step restarts the session's 500 ms idle timer | v0.4.0 |
 | `ace2k_rfid_done lane=%c session=%c result=%c` | none. The host ends the session. `result` 1: read (the lane becomes `read`). `result` 0: give up (back to `pending`, or to `searching` inside its load). A session that is not open is ignored. A lane above 3, a `session` above 255 or a `result` above 1 is a host bug (`shutdown`) | v0.4.0 |
-| `ace2k_rfid_forget lane=%c` | none. Returns a `read` or `no_tag` lane to `pending`, and forgets its UID: use it when the tag on the spool was swapped. The next move of the lane reads it again. On a `read` or `no_tag` lane, the state event (`pending`) also answers a read on command that waits on the lane. On a `pending` lane it drops the UID the lane keeps from a session that ended without a read, and a UID that waits for the reader's session: the lane stays `pending`, no event goes out, and a read on command that waits on the lane stays and is answered by the next inventory. After that, the lane's tag counts as an unknown tag: the lane's next move reads it again, and the neighbour may take it by the attribution rules (since v0.13.0; before, a no-op there). A `searching` or `reading` lane is left alone. A lane above 3 is a host bug (`shutdown`) | v0.4.0 |
+| `ace2k_rfid_forget lane=%c` | none. Returns a `read` or `no_tag` lane to `pending`, and forgets its UID: use it when the tag on the spool was swapped. The next move of the lane reads it again. On a `read` or `no_tag` lane, the state event (`pending`) also answers a read on command that waits on the lane. On a `pending` lane it drops the UID the lane keeps from a session that ended without a read, and a UID that waits for the reader's session: the lane stays `pending`, no event goes out, and a read on command that waits on the lane stays and is answered by the next inventory. After that, the lane's tag counts as an unknown tag: the lane's next move reads it again, and the neighbour may take it by the attribution rules (since v0.13.0; before, a no-op there). A `searching` or `reading` lane is left alone. Since v0.15.0 it also clears the lane's set-by-hand mark, whatever the lane's state, and the host stops wanting it set by hand: a forgotten lane can be given a tag again. The read with motion forgets without it. A lane above 3 is a host bug (`shutdown`) | v0.4.0 |
+| `ace2k_rfid_in_use mask=%c` | none. The lanes in use, one bit per lane (bit 0 is lane 1; a bit above the four lanes is a host bug: `shutdown`). A lane in use is one whose tip is in a head that prints, is paused or is otherwise in use. The unit never moves it on its own, and the mask never defines a lane or gives it a tag. The host sends the mask on every change and again every second. A mask older than `ACE2K_RFID_IN_USE_STALE_MS` is no mask, and so is none since the link came up: the unit then starts no tie-break ("The tie-break"), and one that runs is ended. The unit drops the mask on a link loss, so the host sends it again after every connect | v0.15.0 |
+| `ace2k_rfid_by_hand lane=%c` | none. The user named the lane's material by hand. The lane is *defined* until its strand leaves the insert sensor: no tag is given to it ("Watching and attribution"). It is taken whenever the lane's insert sensor reads filament, whatever the lane's tag state (right after an insertion the lane may not be `pending` yet); a lane with no filament takes no mark. A lane above 3 is a host bug: `shutdown`. The unit drops a mark only when the strand leaves the insert sensor, on `ace2k_rfid_forget`, and at a reset; a link loss keeps it. The unit announces its marks with `ace2k_rfid_by_hand_state mask=%c`, one bit per lane (bit 0 is lane 1), with every state report (every second) and on any change. The host keeps the lanes it wants set by hand: on each announcement it sends the mark again for a wanted lane the unit does not hold (an insertion where the unit had not latched the insert yet, a reset of the unit), and stops wanting a lane whose bit went from set to clear (its strand left, so a spool swapped between two announcements never gets the mark of the one before). A mark given while the strand goes in is sent though the bay still reads empty; a wanted lane whose bay still reads empty more than 5 s after it was wanted is dropped, so a mark the unit never took does not land on a strand put in later. A strand swapped while the link was down keeps the mark the unit held for the strand before: the unit drops a mark only when it sees the strand leave, and the host does not check. The host clears a mark on the unit only with `ace2k_rfid_forget`, which also ends its want; a Klipper restart drops no mark the unit holds. The host also sets by hand a lane whose read it restored after a restart (its bay full, its strand never left), so a spool changed while the printer was off keeps the old read until Read tag (`ACEK_RFID_FORGET`), or until its strand goes out and in again. At start-up the host forgets a lane the unit holds `read` with no record, but never one whose bit is set in the last announcement; before the first announcement it waits for it | v0.15.0 |
+| `ace2k_rfid_confirm_set leg_max_um=%u speed_um_s=%u passive_min_um=%u follows=%c window_um=%u passive_max_um=%u` | none, or `ace2k_rfid_confirm_set_refused` with the same six values. The numbers of the confirmation by following ("Watching and attribution", "The load's search", "The tie-break"): the longest single leg, the speed of every leg, the least lane travel between a tag's leave and return in passive watching, the reversals a tag must follow, the most lane travel between the two changes of one reversal followed, and the most lane travel between a tag's leave and return in passive watching. The host sends them at every connect, from `printer.cfg` or the constants below, and `ACEK_RFID_TUNE` sends new ones while the unit runs, with no reflash. A set with a value out of its bounds (the leg 10 000–600 000 µm; the speed within the bounds of a lane; the minimum 50 000–1 000 000 µm; `follows` 1–3; the window 5 000–100 000 µm; the maximum above the minimum, up to 2 000 000 µm) is ignored whole and answered with the refused report. It is not a `shutdown`: a tuning sent during a print must not stop it. The host checks the same ranges first, so a refusal means the host and the unit disagree on a bound | v0.15.0 |
 | `ace2k_rfid_lane_query lane=%c` | `ace2k_rfid_lane_state lane=%c state=%c uid=%*s` — the lane's tag state and, while the lane is `reading` or `read`, the attributed UID (4, 7 or 10 bytes; empty otherwise). A UID is per-unit data: it belongs in a log, never in a document | v0.4.0 |
 | `ace2k_rfid_search_set search_um=%u` | none. The reach of the load's search, as filament travelled since the load began ("The load's search"). The unit starts from `ACE2K_FEED_SEARCH_DEFAULT_UM`. The host sends it at every connect as an **init** command, `rfid_search_mm` or the default, so a change never resets the MCU (since v0.12.0, `ACE2K_KEYS_AS_INIT`; before, and with an older image, a config command sent only with the key). 0, or a value above `ACE2K_FEED_SEARCH_MAX_UM`, is a host bug (`shutdown`). Only in an image with the feed | v0.4.0 |
 | — | `ace2k_rfid_tag lane=%c session=%c uid=%*s atqa=%hu sak=%c` — a session opened on the lane: its number (1–255, never 0), the tag's UID, ATQA and SAK ("RFID sessions") | v0.4.0 |
 | — | `ace2k_rfid_data lane=%c session=%c block=%c status=%c data=%*s` — one frame per 16 bytes a step read (`status` 0, `block` the MIFARE block or the first of four NTAG pages, `data` 16 bytes), and one frame for a step that failed (`status` 1 `auth_failed`, 2 `tag_gone`, 3 `error`; `block` the step's first block or page; `data` empty) ("RFID sessions") | v0.4.0 |
 | — | `ace2k_rfid_event lane=%c kind=%c session=%c` — one of three things: the lane's new tag state (`kind` 0–5; the opening of a session is announced by its `ace2k_rfid_tag`, not here); the unchanged state, as the answer to a read on command that no inventory decided; or 6 `ambiguous` ("Tag states"). `session` is 0 in this release | v0.4.0 |
+| — | `ace2k_rfid_confirm_trace lane=%c what=%c travel_um=%i reverse=%c lost=%c` — one step of a confirmation by following, for the bench: the lane, what happened (`what` below), the lane's encoder travel (µm, + toward the printer) and whether the lane moved toward the spool then (`reverse` 1). `what`: 0 `start` (a confirmation starts on a candidate); 1 `flip` (a change of the candidate's presence, counted); 2 `wrong_way` (a change while the lane stood or moved the other way than asked: the confirmation ends); 3 `outside` (a change outside the window of the change before it: the confirmation ends); 4 `leg_out` (the leg ran out with no change: the confirmation ends); 5 `taken` (the candidate followed: it is the lane's); 6 `ended` (the confirmation ended for another reason: the load ended, the strand left, the link dropped, the field went off, the lane came into use, the UID became the neighbour's, or a session opened on the reader). Up to 8 traces wait for the link; one that finds them full is dropped and counted. `lost` is the count of the traces dropped since a trace was last sent, up to 255; it starts again at 0 once sent. The traces go only once no event waits for the link. The host logs each one as `ace2k <unit>: lane <x> confirm <what> at <mm> mm (reverse\|forward)`, after `ace2k <unit>: <n> confirm traces lost` when `lost` is not 0 | v0.15.0 |
 | `ace2k_health_query` | `ace2k_health_state now=%u latched=%u post_ms=%u reset_cause=%c` — `now` and `latched`: the two fault masks ("Health bits", below). `post_ms`: the tick time in milliseconds of the last full pass (0: none yet; the first runs 2 s after boot). `reset_cause`: the cause of the last reset | v0.2.0 |
 | `ace2k_health_run` | none. Takes a new snapshot of the counters, and runs the full pass again 2 s later: every bit, the reader probes included | v0.2.0 |
 | `ace2k_health_clear` | none. Sets `latched` to `now` | v0.2.0 |
@@ -208,6 +212,34 @@ An image with the reader's field and the feed adds the reach of the load's searc
   value for `rfid_search_mm` when `printer.cfg` does not set it. A waited `ACEK_LOAD`'s budget and a
   `MOVE=1` read's wait are computed from it.
 
+The tag attribution has these build values; `ace2k_rfid_confirm_set` changes the first six at run
+time, and the host's defaults are the same numbers (they are not published as constants):
+
+- `ACE2K_RFID_CONFIRM_LEG_MAX_UM` 150000: the longest single leg of a confirmation. It is the
+  Anycubic tag window (116 mm) and a margin;
+- `ACE2K_RFID_CONFIRM_SPEED_UM_S` 9000: the speed of every leg of a confirmation, the same as the
+  reacquire's floor speed;
+- `ACE2K_RFID_CONFIRM_FOLLOWS` 1: the reversals a candidate must follow before it is the lane's;
+- `ACE2K_RFID_PASSIVE_MIN_UM` 300000: the least lane travel between a UID's leave and its return
+  in passive watching. It is the shortest revolution (432 mm, Bambu Lab) less the longest window
+  (116 mm), rounded down;
+- `ACE2K_RFID_CONFIRM_WINDOW_UM` 30000: the most lane travel between the two changes of one
+  reversal followed. A tag on the lane's own spool changes at the same lane position both ways;
+- `ACE2K_RFID_PASSIVE_MAX_UM` 950000: the most lane travel between a UID's leave and its return in
+  passive watching: the minimum and about one revolution of the largest spool. A later return is no
+  single turn;
+- `ACE2K_RFID_IN_USE_STALE_MS` 3000: an in-use mask older than this is no mask. The host sends it
+  every second;
+- `ACE2K_RFID_TIEBREAK_QUIET_MS` 2000: the lanes of a reader that are not in use must have been
+  still this long before a tie-break starts on that reader;
+- `ACE2K_RFID_CONFIRM_PER_LOAD_MAX` 3: the confirmations of one load.
+
+The host looks up `ace2k_rfid_in_use`, `ace2k_rfid_by_hand` and `ace2k_rfid_confirm_set` with
+`try_lookup_command`, and `ace2k_rfid_by_hand_state` by its format; an image without all four,
+an older one, still connects and these calls do nothing.
+The first six values are the bench's to tune: the numbers above are the starting point, and the
+final ones come from the full and the near-empty spools of both brands that reach the coil.
+
 PC9, the cutout's latch-reset pin, is never driven or configured by any image. Every image
 reserves it exactly once, in `RESERVE_PINS_ace2k_cutout` (since v0.13.0), so no host section can
 claim it.
@@ -226,8 +258,8 @@ tick raises the report when the deadline passes, and a task sends it.
 **A full transmit buffer.** The unit's transmit buffer holds 96 bytes. Klipper refuses a frame that
 does not fit it, judged on the frame's real encoded length. The bindings try each report and event,
 and hold one that was refused for the next tick: a report by its due flag, an event in its ring.
-The due report goes before the events, and 24 bytes are kept free behind their frames for a command
-response. So the bindings' frames are held, not dropped. Two things can still be lost:
+The due report goes before the events, the feed's excepted (below), and 24 bytes are kept free
+behind their frames for a command response. So the bindings' frames are held, not dropped. Two things can still be lost:
 
 - events, when a ring overflows past 15 pending events. The firmware counts them, in a `dropped`
   counter per ring, but this build does not report them on the wire;
@@ -240,10 +272,12 @@ held report goes out one tick late. The feed's report, at 80 ms, then lands on 9
 report and the modes report, and the three are tried in turn on that tick; a frame that does not
 fit then leaves at 0 ms, beside the sensors' report. The dryer's events wait behind both of the
 dryer's reports. The rfid's report then lands on 70 with the mains report, and the two are tried
-in turn on that tick. Because the due report goes before the
-events, a state report can show a lane idle before that lane's terminal event has left. The event
-leaves on the first tick its frame fits: normally the same tick as the report, one tick later under
-buffer pressure. A host must not read "idle with no event yet" as a lost event.
+in turn on that tick. The feed sends its events first, and its due reports only once its ring is
+empty, so its state report never shows a lane idle before that lane's terminal event has left
+(since 2026-11-12; before, the report went first, and a report due on the tick a move ended showed
+the lane idle just before the move's final event). A host must still not read "idle with no event
+yet" as a lost event: an older image does it, and an event the tick raises while the task sends the
+report can still follow it.
 
 **Phases.** The phases keep the periodic reports on distinct ticks. They hold only for periods that
 are **multiples of 100 ms**: the host snaps a `feed_report_hz` that is off that grid onto it. The
@@ -1003,7 +1037,8 @@ How a lane moves between states:
 - A load starting on a `pending` or `no_tag` lane makes it `searching`. The load's end makes it
   `pending` again, or `no_tag` when the search ran its whole reach, no UID was ever attributed
   to the lane during this insertion, and no UID was in view during the search but the neighbour's
-  (rule 1, or one that the neighbour's reader waits for to open a session). **A lane that saw a tag is never `no_tag`.** Since v0.13.0 that includes a UID seen
+  (rule 4 of "Watching and attribution", or one that the neighbour's reader waits for to open a
+  session). **A lane that saw a tag is never `no_tag`.** Since v0.13.0 that includes a UID seen
   but not attributed, such as a spool at rest on the other bay; up to v0.12.0 such a search ended
   `no_tag`.
 - `ace2k_rfid_forget` and the read with motion return a `read` or `no_tag` lane to `pending`.
@@ -1043,30 +1078,65 @@ runs 10 ms after the field comes on (the tags' power-up). The first 3 inventorie
 (`ACE2K_RFID_BASELINE_POLLS`) are the baseline, failed ones included: a tag seen in any of them was
 there at rest (since v0.13.0; it was the first inventory alone, which can miss one of two tags in
 view). A resting tag that all 3 miss can still be taken for one that enters, the same margin as the
-re-entry below. Two lanes share each antenna (`hardware.md`, "RFID readers"). Take a lane *m* whose
-neighbour on the same reader is *n*. A new UID is given to *m* only when it is read while *m* moves;
-a lane that has not moved stays `pending`, whatever *n* holds (since v0.13.0):
+re-entry below. Two lanes share each antenna (`hardware.md`, "RFID readers"). A tag in the field
+cannot say which bay it came from: a hand that hangs a spool brings one in as surely as a turning
+spool. So, since v0.15.0, a tag is a lane's only when it **follows that lane's motion**.
+"Entered the field while the lane moved" (rule 4 up to v0.14.0) is removed: a field report on two
+units showed a spool hung on an empty bay, its tag taken by the neighbour that ran, and the two
+spools ended swapped. Take a lane *m* whose neighbour on the same reader is *n*:
 
-1. a UID attributed to *n* during this insertion (`read`, `reading`, kept from a session that
-   ended with *n* `pending`) is never *m*'s, even when it enters while only *m* moves (rule 4).
-   *m* goes on to the next tag of the same inventory (since v0.13.0; up to v0.12.0 only a tag
-   `read` or `reading` counted here, and for a kept UID the anticollision's order decided which
-   lane took it). A kept UID is held until *n*'s filament leaves its insert sensor, or until
-   `ace2k_rfid_forget` on *n* while *n* is `pending` (since v0.13.0; before, the forget left a
-   kept UID in place). After that forget, *n*'s tag counts as an unknown tag, and rules 2–5 apply
-   to it as to any other, so it can enter while only *m* moves and be *m*'s;
-2. *m*'s own UID, once known during this insertion, is *m*'s;
-3. removed in v0.13.0. Up to v0.12.0, with no filament at *n*'s insert sensor, any UID in the
-   field was *m*'s. An empty insert sensor does not mean an empty bay: a spool can sit on *n*'s
-   holder with its filament not in yet, and *m* took that spool's tag;
-4. a UID that **enters** the field while *m* moves and *n* does not is *m*'s. A UID never seen in
-   this field enters at its first inventory after the baseline; one that was seen re-enters only
-   after 3 inventories in a row without it (`ACE2K_RFID_DEBOUNCE_POLLS`, 150 ms, since v0.13.0). A
-   UID that stays in view through the whole motion is nobody's;
-5. with both lanes moving, a UID that enters is *m*'s only when *n*'s tag is `read`.
+1. **A defined lane does not change.** A lane is *defined* while its strand has not left the insert
+   sensor since it got its identity: by a tag read (`read`), or by the host's *set by hand*
+   (`ace2k_rfid_by_hand`; the host also sets by hand a lane whose read it restored after a
+   restart). A defined lane is given no tag. Being in use only forbids moves; it
+   does not define a lane. A set by hand on a `read` lane keeps its UID for the exclusion below,
+   and a set by hand wins over the antenna: the tag of that spool is ignored until the strand
+   leaves. When *n* is defined by a read, *n*'s UID is excluded from *m*, and any other UID that
+   enters while *m* moves is *m*'s at once, with no confirmation: the user's spool on *n*'s bay is
+   *n*'s, so a new one can only be *m*'s. So it is when *n* is set by hand and still: its tag, at
+   rest, does not enter. A set-by-hand *n* that moves (a print) may turn its tag in, so rules 2
+   and 3 apply then;
+2. **Confirmation by following**, where the unit drives the lane (the load and the tie-break). When
+   *n* is not defined by a read, a UID seen while *m* moves is *m*'s only after it follows *m*'s
+   reversal: *m* goes back until the reading changes (the tag leaves, or a tag that had left comes
+   back), then forward until it changes the other way. The tag must follow
+   `ACE2K_RFID_CONFIRM_FOLLOWS` reversals. A tag that appears and disappears in step with *m*'s
+   direction is *m*'s. A tag that does not follow is not: a neighbour's spool turning slowly one
+   way, a spool at rest, one just hung. A reading change counts only while the lane moves in the
+   asked direction; any other change ends the confirmation. Each change after the first must also
+   come within `ACE2K_RFID_CONFIRM_WINDOW_UM` of *m*'s travel at the change before it: a tag on
+   *m*'s spool changes at the same lane position both ways, while a spool lifted off its holder
+   and hung back, a neighbour's tag turning with its own lane (a swap at 50–60 mm/s), or a tag at
+   the edge of the field dropping out and back changes somewhere else. A change outside the window
+   ends the confirmation. A change that falls inside the window by chance (a flicker within about
+   3 s of a leg at 9 mm/s) can still count; `ACE2K_RFID_CONFIRM_FOLLOWS` is the lever against it.
+   The neighbour may move meanwhile: it turns one way and far slower. Only one confirmation runs
+   per reader; a second candidate waits, and if its lane keeps moving its own confirmation fails
+   and the tie-break takes it. No confirmation runs on a lane that the host has in use (a current
+   mask): a confirmation moves the lane back. A load runs at most 3 confirmations; past them the
+   lane is left to the tie-break;
+3. **Passive watching**, where the lane moves for another reason (a host feed, a rollback, an
+   assist) and the unit cannot reverse it. A UID is *m*'s only when it leaves the field and comes
+   back while *m* moves, with `ACE2K_RFID_PASSIVE_MIN_UM` to `ACE2K_RFID_PASSIVE_MAX_UM` of *m*'s
+   travel between the leave and the return, and *n* still from the leave to the return (when *n* is
+   defined by a read, rule 1 settles a new UID first). A leave while *n* moves is not recorded for
+   *m*, and *n* moving drops *m*'s records: *n*'s spool may have turned the tag. An edge flicker
+   (re-entry 5–17 mm), a spool on *n*'s bay turned by hand while the strand is threaded, or a return
+   after more than one turn does not count;
+4. a UID attributed to *n* in this insertion (`read`, `reading`, kept from a session that ended
+   with *n* `pending`) is never *m*'s. *m* goes on to the next tag of the same inventory. A kept
+   UID is held until *n*'s filament leaves its insert sensor, or until `ace2k_rfid_forget` on *n*
+   while *n* is `pending`. After that forget, *n*'s tag counts as an unknown tag and rules 1–3
+   apply to it.
 
-Anything else is ignored. No UID is attributed without a link. A UID attributed while the reader's
-session is busy with the other lane waits for that session to end.
+Anything else is ignored. A lane that has not moved stays `pending`, whatever *n* holds, and
+nothing is given by elimination at rest. No UID is attributed without a link. A UID attributed
+while the reader's session is busy with the other lane waits for that session to end. A lane's
+attribution (defined, set by hand, the mask) is forgotten when its strand leaves the insert sensor,
+and the unit drops the mask when the link is lost. A lane set by hand keeps its mark through a link
+loss: only its strand leaving, or a reset, clears it. The tie-break does not
+forget: a lane's kept UID, and a UID that waits for the reader's session, stay through its moves,
+so rule 4 keeps guarding them from the neighbour.
 
 **A pending lane on the move.** In any feed mode except the load (a feed, a rollback, an assist), a
 `pending` lane is watched, and its tag is read on the fly, without stopping the motor. A session
@@ -1148,7 +1218,9 @@ shutdown, a runout and the supervisors end it as they end any mode.
    window measured at 102–116 mm on an Anycubic tag. This applies in the search too. Then the phase
    resumes.
 2. **The search** runs when the pull reached the parking point with the lane's tag not read, the
-   reach is past the parking point, and **every other lane of the unit is idle**. It goes forward,
+   reach is past the parking point, and **every other lane of the unit is idle**. A lane set by
+   hand gets no search, because it is never given a tag: its load ends `loaded` after the pull
+   (since v0.15.0). The read with motion on such a lane still searches. It goes forward,
    watched, until the first of these:
    - the tag is read (the session pauses the search as it pauses the pull);
    - the lane's own buffer full, when the tip snag does not forgive it: the filament met
@@ -1168,6 +1240,91 @@ A comparator trip in the return or the reacquire is `stuck`, whatever the buffer
 any phase stops where the filament is (`stopped`), with the lane `pending` if its tag was not read.
 An error, a runout, a lost link and a shutdown end the load where they find it, as in any mode.
 
+**The confirmation inside the load** (since v0.15.0). When the pull or the search sees a candidate UID
+that rule 1 of "Watching and attribution" (a defined lane) does not settle, the load pauses its
+forward motion and runs the confirmation (sub-phase `CONFIRM`), then resumes or returns as before.
+The legs run at `ACE2K_RFID_CONFIRM_SPEED_UM_S`. Each leg runs until the reading changes, bounded by
+`ACE2K_RFID_CONFIRM_LEG_MAX_UM`. The back leg never goes behind the start of the phase it
+interrupted. The forward leg is capped at the end of that phase (the parking point or the grip in
+the pull, the reach in the search), so a confirmation near the end can run out. The tip is free in a
+load from the bay, so the load runs this with or without an in-use mask. A confirmation that fails
+(the tag does not follow within the bound, or there is no room to reverse) leaves the UID a
+candidate: if it shows again in the same load it is confirmed again, up to 3 confirmations in the
+load, and at the end of the load the lane is left to the tie-break. A lane the host has in use gets
+no confirmation (a host's read with motion on it included). A load whose tag rule 1 settles gets no
+confirmation and is no slower. The `CONFIRM` sub-phase is entered only from the pull or the search;
+elsewhere the watch's confirmation can only fail. A link loss or the lane's strand leaving the
+insert sensor clears the confirmation and leaves the sub-phase: the load ends or returns as for any
+stop. Each confirmation has an epoch that the feed sees: a new one gets a fresh leg even in the
+direction of the last one, and a leg that ran out counts only for the confirmation it served, so a
+new confirmation started just as the last one ran out is not ended by that old leg. In a load from
+the bay, a back leg sets the free tip's phase of the push aside ("The free tip"), and the next
+forward move of the load (a forward leg, or the phase resumed) takes it up again with a fresh
+window, unless the plunger is back at rest by then.
+
+A load whose pull ends while a tie-break of the unit runs on the other lane of its reader skips its
+search, as for any other busy lane: the lane stays `pending`, and the tie-break may pick it later.
+A tie-break on the other reader does not stop the search.
+
+**The search no longer yields to a neighbour in use.** Up to v0.14.0 the search started only with
+every other lane idle and yielded when another lane's motor started. Since v0.15.0 a lane of the
+same unit that the mask marks in use (its follow or assist during a print) neither blocks the
+search nor ends it. Any other motion of the other lanes keeps the old rule, and so do two loads in
+the same pair close together: the lane that yielded is left to the tie-break.
+
+## The tie-break
+
+Since v0.15.0, a lane that is `pending` and not in use is sorted out by the unit itself: a power-on
+with strands in, two spools inserted close together, a confirmation that failed, or a load that
+parked without a search. The unit moves the lane to see whether a tag follows it.
+
+**When it starts.** All of these hold: the link is up; the host's in-use mask is current (sent
+within `ACE2K_RFID_IN_USE_STALE_MS`); the lane is `pending`, has filament, is not in use and was not set by hand; no
+lane of the reader moves except one in use; the reader's lanes that are not in use have been still
+for `ACE2K_RFID_TIEBREAK_QUIET_MS`; and the lane has not been tried since the reader's last
+insertion. A printing lane may move meanwhile, on either reader: the lane in use is never moved.
+A lane of the other reader that is not in use is not quiet: while it is busy (any mode but idle, a
+follow at rest excepted) the tie-break does not start, and its motor starting ends a running one,
+as for the read with motion. Without a current mask nothing moves on its own, so a host that sends
+no mask gets no tie-break. An insert edge on the reader restarts its quiet time and clears the
+lanes' "tried"; the host's own read with motion on the lane is its request to start over, and
+clears it too. Nothing else does: a tie-break that started spends the lane's try, however it ends
+(it ran its reach, met an obstacle, was sent back, or stopped). A pending lane beside a print so
+runs at most one tie-break per insertion, not one at every swap.
+
+**What it does.** It takes an inventory, then moves one lane forward slowly, reading all the time,
+and runs the confirmation on any new UID. The unit cannot tell whether a tip is in a head, so every
+lane is treated as possibly there:
+
+- the move goes forward at the confirmation's speed (`ACE2K_RFID_CONFIRM_SPEED_UM_S`) until the
+  reading changes, and never farther than the confirmation's longest leg
+  (`ACE2K_RFID_CONFIRM_LEG_MAX_UM`) from where it began: far short of a shared head's splitter, and
+  never the 750 mm reach of the load's search;
+- a buffer full at any point means the lane is held at the head. The tie-break keeps the read with
+  motion's tip snag tolerance (the watch, the touch, the wait for rest, once per read), the
+  existing supervisor. The lane goes back exactly what it pushed and is left for now. Every back leg, the confirmation's included, stays within what the
+  tie-break pushed: the lane never goes behind the point it started from;
+- a change confirmed by following gives the UID to the lane;
+- a lane held at the head with a UID unconfirmed stays `pending`: the result is inconclusive and
+  nothing is attributed;
+- a lane whose moves change nothing within the leg stays `pending`, never `no_tag`: one leg is far
+  short of a spool's turn, so it cannot tell a spool with no tag. The user sees "waiting for tag",
+  and can set it by hand or eject.
+
+**What ends it.** A host start on either lane of the reader (in use or not), an insert edge on the
+reader, a print taking the lane, or the in-use mask going stale: the lane is brought back to where
+it started, the same way back as a yield of the read with motion. A stale mask pre-empts a running
+tie-break: no move without the host's word. A STOP, the link dropping and a shutdown end it where
+it is, as they end any mode: STOP means stop, so the lane is left where it stopped, at most one
+leg forward of where the tie-break began, and is not brought back. The lane's strand leaving the
+insert sensor ends it as a runout. A host start or an `ace2k_feed_stop_when` on the tie-break's
+own lane is refused `busy` and waits nowhere; a host's read with motion (`ace2k_rfid_read` with
+`move=1`) during a tie-break, on any lane, is refused `busy` too. Each sends the tie-break back
+(the start and the read at once, the stop's arming on the next tick), and it ends as its own
+(`seq` 0, mode `loading`). The host sends the arming, the start or the read again every 0.25 s for
+up to 30 s; once the lane is idle, it is taken as on any idle lane. The unit's own tie-break keeps the lane's kept UID: unlike the host's read, it
+forgets nothing. It keeps the lane's grip too.
+
 **The read on command** (`ace2k_rfid_read` with `move=0`). It is refused without a filament
 (`no_filament`), without a link (`no_link`), and while a session is open on the lane or a read on
 command already waits on it (`busy`). Once accepted, it turns the lane's field on. The inventory
@@ -1176,11 +1333,11 @@ seen in any inventory of the baseline counts (since v0.13.0). Since v0.13.0 it *
 nothing**: a tag goes to a lane only when it is read while that lane moves, and a lane that has not
 moved stays `pending`.
 
-- no UID but the neighbour's (`read`, `reading`, or kept, rule 1 above) answers the lane's
+- no UID but the neighbour's (`read`, `reading`, or kept, rule 4 above) answers the lane's
   unchanged state (since v0.13.0; up to v0.12.0 a kept UID of the neighbour's alone answered
   `ambiguous`);
 - the lane's own UID, attributed earlier by its motion (kept from a session that ended with the
-  lane `pending`), reopens its session, as an inventory would (rule 2 above);
+  lane `pending`), reopens its session, as an inventory would;
 - any other UID answers `ambiguous` and changes nothing. No session opens.
 
 Up to v0.12.0 one UID that was not the neighbour's opened a session when the neighbour had no
@@ -1201,7 +1358,9 @@ checked before anything else, so a refusal changes nothing. Then come the feed's
 (another lane of the unit busy), `unsupported` (no search configured). Once accepted, it is an
 **explicit re-read**. A `read` or `no_tag` lane forgets its tag and becomes `pending` (an
 `ace2k_rfid_event`), then `searching` as the unit's own load (`seq` 0, mode `loading`) starts at the
-search.
+search. A lane set by hand (`ace2k_rfid_by_hand`) stays defined: its read with motion still moves
+the filament, but finds nothing to attribute, and the lane keeps the material named by hand until
+its strand leaves.
 
 Since v0.13.0 a lane in the follow whose motor is at rest does not make the read with motion
 `other_lane_moving`: the search needs only its own motor and its reader, and a follow at rest holds
@@ -1810,7 +1969,7 @@ module is `klippy/extras/ace2k_feed.py`; the object is `printer.lookup_object("a
 
 `API_VERSION` names this interface. It is stable: what a caller can rely on, and how a change
 that would break one is announced, is in [What a caller can rely on](#what-a-caller-can-rely-on).
-It is now `28`:
+It is now `29`:
 
 - `1` until v0.8.0, which added `assist_both`;
 - `2` until v0.9.0, which added `set_lane_extruder`;
@@ -1896,7 +2055,16 @@ It is now `28`:
   the mode's fields in the dryer's status, and the events 8–13 of `ace2k:dryer` by name (below);
 - `28` when a read without motion (`rfid.start_read`, `ACEK_RFID_READ` with `MOVE=0`) stopped
   attributing a tag: it only reports what is in the field (an image since v0.13.0, "The read on
-  command").
+  command");
+- `29` (v0.15.0) with the tag attribution by following: the `ace2k_rfid` object's
+  `set_in_use(mask)` (a 4-bit mask, bit 0 is lane 1) and `set_by_hand(lane_index)` (0 to 3), the
+  G-codes `ACEK_RFID_BY_HAND` and `ACEK_RFID_TUNE`, the keys `rfid_confirm_leg_mm`,
+  `rfid_confirm_speed`, `rfid_passive_min_mm`, `rfid_confirm_follows`, `rfid_confirm_window_mm`
+  and `rfid_passive_max_mm` ("Watching and attribution"), and the busy retry. All do nothing on an
+  image without the commands and the message of the tag attribution (above). The host's G-code
+  starts and its read with motion send a start refused `busy` again every 0.25 s for up to 30 s
+  while this host has no move open on the lane: the busy is then the unit's own work, such as its
+  tie-break, which the refusal sends back.
 
 **Several units.** A config with one unnamed `[ace2k]` is unchanged: the objects keep the names
 `ace2k`, `ace2k_feed`, `ace2k_rfid`, `ace2k_dryer` and `ace2k_dryer_mode`. A named section
@@ -1962,7 +2130,9 @@ unit's section first: it takes over the old tag cache. The other units start wit
 Beside each cache, `<cache>.lanes.json` keeps the last read of each lane (the lane number to its
 record). After a restart that reset the unit, a `pending` lane with a kept read takes it back,
 with `source` `restored`, and `lane_status` shows it `read` while the unit holds the lane
-`pending`; `"ace2k:tag_read"` is sent for it. A lane the unit still holds `read` takes its kept
+`pending`; `"ace2k:tag_read"` is sent for it. The lane is set by hand on the unit, so a spool
+changed while the printer was off keeps the old read until Read tag (`ACEK_RFID_FORGET`), or until
+its strand goes out and in again. A lane the unit still holds `read` takes its kept
 read when the cache has no record of that UID (a tag read by its UID alone). A caller that must
 know whether the unit has seen the tag since the restart checks `source`: the unit's next load
 still searches. The read goes when the unit's sensor report shows the bay empty, on the
@@ -2159,6 +2329,12 @@ a caller that holds only the object reads `printer.lookup_object("ace2k").feed.A
   another extruder returns its rate to 0 first. Several lanes may name one extruder. A plain call:
   it sends nothing but that 0, and never yields. Raises `ValueError` for a lane outside 0–3. On an
   image without the feed-forward the map is kept and nothing is hooked.
+- `feed.ff.note_move(extruder_name, print_time, duration_s, e_mm)` (since v0.15.0, API_VERSION
+  29; a caller checks for it with `hasattr`) records one move of an extruder that
+  the extruder's own move does not plan, such as a move of a parked head. The lanes that follow
+  that extruder meter it out as a planned move, and a long retraction is taken back ("The
+  feed-forward"). It returns `False`, with nothing recorded, when the extruder is not hooked, and
+  `True` otherwise. A plain call that never yields.
 - `feed.set_lane_grip(lane_index, grip_mm)` (since `API_VERSION` 6) sets the grip of `lane_index`
   (0–3) ("The grip"). Its next automatic load pulls only `grip_mm`, without the tag search, and
   ends `loaded`. That load uses up the grip, and any start on the lane, or a read with motion,

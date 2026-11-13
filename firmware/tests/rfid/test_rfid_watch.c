@@ -1,5 +1,6 @@
 #include "test.h"
 #include "rfid/watch.h"
+#include "rfid/watch_internal.h"
 #include "fake_field.h"
 
 /* The world: the fake field of each reader behind the real iso14443a engine, the reader-level
@@ -18,6 +19,11 @@ struct wworld {
     struct ace2k_rfid_watch_inputs in;
     uint32_t now;
     int max_iso_calls, max_configures;
+    /* ww_drive: each lane's own speed in um/s (+ toward the printer) while no confirmation runs on
+     * it, and where the confirmation's current leg began. */
+    int32_t own_um_s[ACE2K_LANE_COUNT];
+    int32_t leg_from_um[ACE2K_LANE_COUNT];
+    uint8_t confirm_last, reverse_last;
 };
 
 static int ww_configure(void *ctx, uint8_t r)
@@ -134,6 +140,18 @@ static void drain(struct wworld *ww)
     }
 }
 
+/* The next confirmation trace of the kind, the others before it dropped; false when none. */
+static bool ww_trace(struct wworld *ww, uint8_t what, struct ace2k_rfid_confirm_trace *t)
+{
+    while (ace2k_rfid_watch_peek_trace(&ww->w, t)) {
+        ace2k_rfid_watch_drop_trace(&ww->w);
+        if (t->what == what) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static const uint8_t ua[4] = { 0x01, 0x02, 0x03, 0x04 };
 static const uint8_t ub[4] = { 0x11, 0x22, 0x33, 0x44 };
 static const uint8_t ud[4] = { 0x21, 0x32, 0x43, 0x54 };
@@ -149,6 +167,116 @@ static struct ftag *tag_b(struct wworld *ww, const uint8_t uid[4], bool present)
         t->absent = false;
     }
     return t;
+}
+
+/* Advances the lane's travel by um, evenly over the given task runs. */
+static void ww_travel(struct wworld *ww, uint8_t lane, int32_t um, int steps)
+{
+    int32_t start = ww->in.travel_um[lane];
+    for (int i = 1; i <= steps; i++) {
+        ww->in.travel_um[lane] = start + (int32_t)(((int64_t)um * i) / steps);
+        ww_steps(ww, 1);
+    }
+}
+
+/* The lane moves alone, outside a load.  Tag t comes into view and leaves, and the lane travels a
+ * full turn of its spool.  Tag t is left away: its return is the lane's (passive watching). */
+static void turn_out(struct wworld *ww, uint8_t lane, struct ftag *t)
+{
+    ww->in.moving = (uint8_t)(1U << lane);
+    t->absent = false;
+    ww_steps(ww, 30);
+    t->absent = true;
+    ww_steps(ww, 40); /* the leave takes ACE2K_RFID_DEBOUNCE_POLLS inventories */
+    ww_travel(ww, lane, ACE2K_RFID_PASSIVE_MIN_UM, 10);
+}
+
+/* turn_out, then tag t comes back. */
+static void turn_in(struct wworld *ww, uint8_t lane, struct ftag *t)
+{
+    turn_out(ww, lane, t);
+    t->absent = false;
+}
+
+/* A tag on a lane's spool: it is in view while the lane's travel is within [in_lo_um, in_hi_um]. */
+// NOLINTNEXTLINE(readability-identifier-naming)
+struct lanetag {
+    struct ftag *t;
+    uint8_t lane;
+    int32_t in_lo_um, in_hi_um;
+};
+
+/* The mask with the bit set or cleared. */
+static uint8_t with_bit(uint8_t mask, uint8_t bit, bool on)
+{
+    return (uint8_t)(on ? (mask | bit) : (mask & (uint8_t)~bit));
+}
+
+/* The feed echoes the epoch of the confirmation its legs serve, with its confirm_out. */
+static void ww_out_epoch(struct wworld *ww)
+{
+    ww->in.confirm_out_epoch = ace2k_rfid_watch_confirm_epoch_bits(&ww->w);
+}
+
+/* One lane's 10 ms of ww_drive: its speed, its travel, its moving and reverse bits, and its
+ * confirm_out when a confirmation leg reached its longest. */
+static void ww_drive_lane(struct wworld *ww, uint8_t lane, uint8_t conf, uint8_t rev)
+{
+    const struct ace2k_rfid_confirm_cfg *cfg = &ww->w.cfg;
+    uint8_t bit = (uint8_t)(1U << lane);
+    bool confirming = (conf & bit) != 0U;
+    int32_t v = ww->own_um_s[lane];
+    if (confirming) {
+        bool r = (rev & bit) != 0U;
+        bool was_rev = (ww->reverse_last & bit) != 0U;
+        if ((ww->confirm_last & bit) == 0U || r != was_rev) {
+            ww->leg_from_um[lane] = ww->in.travel_um[lane]; /* a new leg */
+        }
+        v = r ? -cfg->speed_um_s : cfg->speed_um_s;
+    }
+    ww->in.travel_um[lane] += v / 100; /* 10 ms */
+    ww->in.moving = with_bit(ww->in.moving, bit, v != 0);
+    ww->in.reverse = with_bit(ww->in.reverse, bit, v < 0);
+    int32_t leg = ww->in.travel_um[lane] - ww->leg_from_um[lane];
+    bool out = (bool)(leg >= cfg->leg_max_um || leg <= -cfg->leg_max_um);
+    ww->in.confirm_out = with_bit(ww->in.confirm_out, bit, (bool)(confirming && out));
+}
+
+/* The feed, as the confirmation sees it, for the given task runs.  A lane with a confirmation
+ * moves at cfg.speed_um_s in the asked direction; a leg that reaches cfg.leg_max_um raises its
+ * confirm_out for one run.  Any other lane moves at its own speed.  Then each tag bound to a lane
+ * is in view or not by that lane's travel.  A tag bound to no lane keeps what the test set. */
+static void ww_drive(struct wworld *ww, const struct lanetag *tags, int n, int steps)
+{
+    for (int s = 0; s < steps; s++) {
+        uint8_t conf = ace2k_rfid_watch_confirm_bits(&ww->w);
+        uint8_t rev = ace2k_rfid_watch_confirm_reverse_bits(&ww->w);
+        ww->in.confirm_out = 0;
+        ww_out_epoch(ww); /* this feed sees each confirmation at once */
+        for (uint8_t lane = 0; lane < ACE2K_LANE_COUNT; lane++) {
+            ww_drive_lane(ww, lane, conf, rev);
+        }
+        ww->confirm_last = conf;
+        ww->reverse_last = rev;
+        for (int i = 0; i < n; i++) {
+            int32_t at = ww->in.travel_um[tags[i].lane];
+            tags[i].t->absent = (bool)(at < tags[i].in_lo_um || at > tags[i].in_hi_um);
+        }
+        ww_steps(ww, 1);
+    }
+}
+
+/* ww_drive until an event of the type is out, at most max task runs. */
+static bool ww_drive_until(struct wworld *ww, const struct lanetag *tags, int n, uint8_t type,
+                           int max, struct ace2k_rfid_event *e)
+{
+    for (int i = 0; i < max; i++) {
+        ww_drive(ww, tags, n, 1);
+        if (ww_next(ww, type, e)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 TEST(a_lane_with_a_strand_is_pending_and_nothing_turns_a_field_on_until_it_moves)
@@ -177,23 +305,33 @@ TEST(a_lane_with_a_strand_is_pending_and_nothing_turns_a_field_on_until_it_moves
     ASSERT_TRUE(ww.max_configures <= 1);
 }
 
-TEST(the_load_reads_a_tag_that_enters_while_the_lane_moves)
+/* A tag that enters during the load is only a candidate.  The lane is asked back, the tag leaves,
+ * the lane is asked forward, the tag comes back: it followed, and it is the lane's. */
+TEST(the_load_reads_a_tag_once_it_follows_the_lanes_reversal)
 {
     struct wworld ww;
     ww_init(&ww);
     struct ftag *t = tag_b(&ww, ua, false);
+    struct lanetag lt = { t, 0, 100000, 216000 }; /* in view over 116 mm of the lane's travel */
     ww.in.insert = 0x01;
     ww_steps(&ww, 1);
     ww.in.loading = 0x01;
-    ww.in.moving = 0x01;
-    ww_steps(&ww, 20); /* the field on, inventories of an empty field: the baseline */
+    ww.own_um_s[0] = 20000;
+    ww_drive(&ww, &lt, 1, 20); /* the field on, inventories of an empty field: the baseline */
     struct ace2k_rfid_event e;
     ASSERT_TRUE(ww_next(&ww, ACE2K_RFID_EV_STATE, &e));
     ASSERT_EQ(e.kind, ACE2K_RFID_PENDING);
     ASSERT_TRUE(ww_next(&ww, ACE2K_RFID_EV_STATE, &e));
     ASSERT_EQ(e.kind, ACE2K_RFID_SEARCHING);
-    t->absent = false; /* the spool turned the tag in front of the antenna */
-    ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
+    for (int i = 0; i < 1000 && ace2k_rfid_watch_confirm_bits(&ww.w) == 0; i++) {
+        ww_drive(&ww, &lt, 1, 1); /* the spool turns the tag in front of the antenna */
+    }
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0x01);
+    ASSERT_EQ(ace2k_rfid_watch_confirm_reverse_bits(&ww.w), 0x01);
+    ASSERT_TRUE(!t->absent);
+    ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e)); /* it only entered: not yet the lane's */
+    ASSERT_TRUE(ww_drive_until(&ww, &lt, 1, ACE2K_RFID_EV_TAG, 500, &e));
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0);
     ASSERT_EQ(e.lane, 0);
     ASSERT_EQ(e.tag.uid_len, 4);
     ASSERT_TRUE(memcmp(e.tag.uid, ua, 4) == 0);
@@ -227,7 +365,9 @@ TEST(the_load_reads_a_tag_that_enters_while_the_lane_moves)
     ASSERT_TRUE(ww.max_iso_calls <= 2);
 }
 
-TEST(the_neighbours_resting_tag_is_never_taken_and_a_new_one_is)
+/* A new tag that only enters while lane 1 moves is nobody's.  Once it has left and come back
+ * after a turn of lane 1's spool, it is lane 1's. */
+TEST(the_neighbours_resting_tag_is_never_taken_and_one_that_turns_in_is)
 {
     struct wworld ww;
     ww_init(&ww);
@@ -241,15 +381,18 @@ TEST(the_neighbours_resting_tag_is_never_taken_and_a_new_one_is)
     ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
     mine->absent = false;
     ww_steps(&ww, 30);
-    ASSERT_TRUE(ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
+    ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e)); /* it only entered */
+    turn_in(&ww, 0, mine);
+    ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
     ASSERT_EQ(e.lane, 0);
     ASSERT_TRUE(memcmp(e.tag.uid, ua, 4) == 0);
 }
 
 /* The bench, 2026-11-02: a spool sat on bay 2's holder with no strand in bay 2 yet, its tag in
  * the field.  Bay 1's strand went in.  An empty insert sensor does not mean no spool on the bay, so
- * the resting tag is nobody's.  Only the tag that enters while lane 1 moves is lane 1's. */
-TEST(with_the_neighbour_empty_a_resting_tag_is_not_the_lanes_and_an_entering_one_is)
+ * the resting tag is nobody's.  Only the tag that comes back after a turn of lane 1's spool is
+ * lane 1's. */
+TEST(with_the_neighbour_empty_a_resting_tag_is_not_the_lanes_and_one_that_turns_in_is)
 {
     struct wworld ww;
     ww_init(&ww);
@@ -263,25 +406,37 @@ TEST(with_the_neighbour_empty_a_resting_tag_is_not_the_lanes_and_an_entering_one
     ww_steps(&ww, 60); /* lane 1 moves, the resting tag stays */
     ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
     ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 0), ACE2K_RFID_PENDING);
-    mine->absent = false; /* lane 1's spool turns its tag in */
+    turn_in(&ww, 0, mine); /* lane 1's spool turns its tag in, out, and in again */
     ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
     ASSERT_EQ(e.lane, 0);
     ASSERT_TRUE(memcmp(e.tag.uid, ua, 4) == 0);
 }
 
-/* Lane 2 reads its own tag first (moving alone, its tag entering), so that lane 1 can be judged
- * with a read neighbour. */
+/* Lane 2 reads its own tag first (moving alone, its tag back after a turn of its spool), so that
+ * lane 1 can be judged with a read neighbour. */
 static uint8_t read_lane2(struct wworld *ww, struct ftag *t2)
 {
-    ww->in.moving = 0x02;
-    ww_steps(ww, 20);
-    t2->absent = false;
+    turn_in(ww, 1, t2);
     struct ace2k_rfid_event e;
     ASSERT_TRUE(ww_until(ww, ACE2K_RFID_EV_TAG, 30, &e));
     ASSERT_EQ(e.lane, 1);
     ASSERT_EQ(ace2k_rfid_watch_done(&ww->w, 1, e.session, true), 0);
     drain(ww);
     return e.session;
+}
+
+/* Lanes 1 and 2 inserted, lane 2 read and its tag turned out of view, then both still until
+ * reader B's field is off: the next move starts a new baseline of an empty field. */
+static void lane2_read_and_still(struct wworld *ww)
+{
+    struct ftag *z = tag_b(ww, ud, false);
+    ww->in.insert = 0x03;
+    ww_steps(ww, 1);
+    (void)read_lane2(ww, z);
+    z->absent = true;
+    ww->in.moving = 0;
+    ww_steps(ww, 5);
+    ASSERT_TRUE(!ww->field[1]);
 }
 
 /* Runs task steps until the job in progress on reader B, if any, has ended, then until k more
@@ -329,8 +484,10 @@ TEST(a_resting_tag_missing_from_fewer_than_the_debounce_inventories_is_not_attri
         ww.in.moving = 0x01;
         ww_steps(&ww, 30);
         absent_for(&ww, t, k);
+        ww.in.travel_um[0] += ACE2K_RFID_PASSIVE_MIN_UM; /* a whole turn, had it left */
         ww_steps(&ww, 30);
         absent_for(&ww, t, k);
+        ww.in.travel_um[0] += ACE2K_RFID_PASSIVE_MIN_UM;
         ww_steps(&ww, 30);
         struct ace2k_rfid_event e;
         ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
@@ -339,7 +496,8 @@ TEST(a_resting_tag_missing_from_fewer_than_the_debounce_inventories_is_not_attri
     }
 }
 
-/* Absent from ACE2K_RFID_DEBOUNCE_POLLS inventories in a row, it left, and its return enters. */
+/* Absent from ACE2K_RFID_DEBOUNCE_POLLS inventories in a row, it left, and its return enters.  The
+ * lane travelled a turn meanwhile, so the return is the lane's. */
 TEST(a_tag_absent_for_the_debounce_inventories_left_and_its_return_enters)
 {
     struct wworld ww;
@@ -350,21 +508,21 @@ TEST(a_tag_absent_for_the_debounce_inventories_left_and_its_return_enters)
     ww.in.moving = 0x01;
     ww_steps(&ww, 30);
     absent_for(&ww, t, (int)ACE2K_RFID_DEBOUNCE_POLLS);
+    ww.in.travel_um[0] += ACE2K_RFID_PASSIVE_MIN_UM;
     struct ace2k_rfid_event e;
     ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
     ASSERT_EQ(e.lane, 0);
     ASSERT_TRUE(memcmp(e.tag.uid, ub, 4) == 0);
 }
 
-/* A tag never seen in this field enters at its first inventory after the baseline, and is lane
- * 1's while lane 1 moves alone. */
+/* A tag never seen in this field enters at its first inventory after the baseline.  With lane 2
+ * read, it is lane 1's at once while lane 1 moves. */
 TEST(a_tag_first_seen_after_the_baseline_enters_and_is_the_moving_lanes)
 {
     struct wworld ww;
     ww_init(&ww);
     struct ftag *t = tag_b(&ww, ua, false);
-    ww.in.insert = 0x03;
-    ww_steps(&ww, 1);
+    lane2_read_and_still(&ww);
     ww.in.moving = 0x01;
     inventories_b(&ww, (int)ACE2K_RFID_BASELINE_POLLS);
     t->absent = false;
@@ -375,14 +533,14 @@ TEST(a_tag_first_seen_after_the_baseline_enters_and_is_the_moving_lanes)
 }
 
 /* Failed inventories count toward the baseline too: a run of them does not stretch it.  A tag
- * first seen after BASELINE_POLLS failed inventories enters. */
+ * first seen after BASELINE_POLLS failed inventories enters, and with lane 2 read it is lane
+ * 1's. */
 TEST(failed_inventories_count_toward_the_baseline)
 {
     struct wworld ww;
     ww_init(&ww);
     struct ftag *t = tag_b(&ww, ua, false);
-    ww.in.insert = 0x03;
-    ww_steps(&ww, 1);
+    lane2_read_and_still(&ww);
     ww.in.moving = 0x01;
     ww.ff.rd[1].override_frame = ACE2K_FAKE_FRAME_WAKE;
     ww.ff.rd[1].override_poll = ACE2K_RFID_POLL_ERROR;
@@ -396,8 +554,8 @@ TEST(failed_inventories_count_toward_the_baseline)
 }
 
 /* A lone spool whose tag was in front of the antenna when the field came on: the tag is in the
- * baseline.  The spool turns it away for more than ACE2K_RFID_DEBOUNCE_POLLS inventories and back
- * while only lane 1 moves: it re-enters, and is lane 1's. */
+ * baseline.  The spool turns it away for more than ACE2K_RFID_DEBOUNCE_POLLS inventories and back,
+ * after a whole turn, while only lane 1 moves: it re-enters, and is lane 1's. */
 TEST(a_baseline_tag_that_leaves_and_returns_while_only_this_lane_moves_is_the_lanes)
 {
     struct wworld ww;
@@ -410,6 +568,7 @@ TEST(a_baseline_tag_that_leaves_and_returns_while_only_this_lane_moves_is_the_la
     struct ace2k_rfid_event e;
     ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
     absent_for(&ww, mine, (int)ACE2K_RFID_DEBOUNCE_POLLS);
+    ww.in.travel_um[0] += ACE2K_RFID_PASSIVE_MIN_UM;
     ASSERT_TRUE(!ww.w.l[0].has_tag); /* leaving alone gives nothing */
     ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
     ASSERT_EQ(e.lane, 0);
@@ -473,9 +632,7 @@ TEST(a_neighbours_spool_lifted_off_during_this_lanes_motion_is_attributed_to_nob
     struct ace2k_rfid_event e;
     ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
     ASSERT_TRUE(!ww.w.l[0].has_tag);
-    ww.in.moving = 0x02; /* lane 2 moves alone, its spool back on the holder */
-    ww_steps(&ww, 20);
-    theirs->absent = false;
+    turn_in(&ww, 1, theirs); /* back on the holder, lane 2 moves alone and turns it */
     ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
     ASSERT_EQ(e.lane, 1);
 }
@@ -492,7 +649,9 @@ TEST(a_baseline_tag_that_leaves_while_the_neighbour_moves_too_is_nobodys)
     ww.in.moving = 0x03;
     ww_steps(&ww, 30);
     t->absent = true;
-    ww_steps(&ww, 30);
+    ww_steps(&ww, 40);
+    ww.in.travel_um[0] += ACE2K_RFID_PASSIVE_MIN_UM; /* a whole turn of either spool */
+    ww.in.travel_um[1] += ACE2K_RFID_PASSIVE_MIN_UM;
     t->absent = false;
     ww_steps(&ww, 30);
     struct ace2k_rfid_event e;
@@ -522,8 +681,9 @@ TEST(a_search_that_saw_a_uid_it_could_not_attribute_ends_pending_not_no_tag)
     ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 0), ACE2K_RFID_PENDING);
 }
 
-/* Lane 1's search is paused (not moving) while lane 2 moves alone and takes a tag that enters.
- * That tag was the neighbour's in the same inventory, so lane 1 did not see a UID of its own. */
+/* Lane 1's search is paused (not moving) while lane 2 moves alone and takes a tag that comes back
+ * after a turn of its spool.  That tag was the neighbour's in the same inventory, so lane 1 did
+ * not see a UID of its own. */
 TEST(a_tag_the_neighbour_takes_in_the_same_inventory_does_not_count_as_seen)
 {
     struct wworld ww;
@@ -531,9 +691,9 @@ TEST(a_tag_the_neighbour_takes_in_the_same_inventory_does_not_count_as_seen)
     struct ftag *z = tag_b(&ww, ud, false);
     ww.in.insert = 0x03;
     ww_steps(&ww, 1);
+    turn_out(&ww, 1, z);
     ww.in.loading = 0x01; /* lane 1 searching, its motor paused */
-    ww.in.moving = 0x02;
-    ww_steps(&ww, 20);
+    ww_steps(&ww, 2);
     z->absent = false;
     struct ace2k_rfid_event e;
     ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
@@ -700,9 +860,7 @@ static uint8_t open_session_on_lane1(struct wworld *ww, struct ftag **t)
     *t = tag_b(ww, ua, false);
     ww->in.insert = 0x01;
     ww_steps(ww, 1);
-    ww->in.moving = 0x01;
-    ww_steps(ww, 20);
-    (*t)->absent = false;
+    turn_in(ww, 0, *t);
     struct ace2k_rfid_event e;
     ASSERT_TRUE(ww_until(ww, ACE2K_RFID_EV_TAG, 30, &e));
     drain(ww);
@@ -748,14 +906,14 @@ TEST(a_read_on_command_that_sees_the_lanes_own_kept_uid_reopens_its_session)
 }
 
 /* The reader's table full of UIDs inside their debounce window: none is dropped, and a new UID
- * is not tracked, so it does not enter in that inventory.  Once the others are gone, it does. */
+ * is not tracked, so it does not enter in that inventory.  Once the others are gone, it does, and
+ * with lane 2 read it is lane 1's. */
 TEST(a_new_uid_with_the_table_full_does_not_enter_until_there_is_room)
 {
     struct wworld ww;
     ww_init(&ww);
     struct ftag *t = tag_b(&ww, ua, false);
-    ww.in.insert = 0x01;
-    ww_steps(&ww, 1);
+    lane2_read_and_still(&ww);
     ww.in.moving = 0x01;
     ww_steps(&ww, 30); /* the baseline: an empty field */
     for (int i = 0; i < 20 && ace2k_iso14443a_busy(&ww.iso, ACE2K_RFID_READER_B); i++) {
@@ -846,15 +1004,13 @@ TEST(the_load_ends_no_tag_only_when_its_search_ran_out_and_no_uid_was_seen)
     ww_steps(&ww, 1);
     ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 0), ACE2K_RFID_UNKNOWN);
     struct ftag *t = tag_b(&ww, ua, false);
+    struct lanetag lt = { t, 0, 100000, 216000 };
     ww.in.insert = 0x01;
     ww_steps(&ww, 1);
     ww.in.loading = 0x01;
-    ww.in.moving = 0x01;
-    ww_steps(&ww, 20);
-    t->absent = false;
-    ww_steps(&ww, 30);
+    ww.own_um_s[0] = 20000;
     struct ace2k_rfid_event e;
-    ASSERT_TRUE(ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
+    ASSERT_TRUE(ww_drive_until(&ww, &lt, 1, ACE2K_RFID_EV_TAG, 1000, &e)); /* it followed */
     ASSERT_EQ(ace2k_rfid_watch_done(&ww.w, 0, e.session, false), 0);
     ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 0), ACE2K_RFID_SEARCHING); /* back to the search */
     ww.in.loading = 0;
@@ -1039,8 +1195,7 @@ TEST(an_inventory_that_straddles_a_reset_is_dropped)
     struct ftag *t = tag_b(&ww, ua, false);
     ww.in.insert = 0x01;
     ww_steps(&ww, 1);
-    ww.in.moving = 0x01;
-    ww_steps(&ww, 20); /* the field on, the baseline taken: an empty field */
+    turn_out(&ww, 0, t); /* the tag's return would be the lane's */
     drain(&ww);
     for (int i = 0; i < 20 && !ace2k_iso14443a_busy(&ww.iso, ACE2K_RFID_READER_B); i++) {
         ww_steps(&ww, 1);
@@ -1066,6 +1221,7 @@ TEST(an_inventory_that_straddles_a_reset_is_dropped)
     ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
     t->absent = true;
     ww_steps(&ww, 30); /* away for more than ACE2K_RFID_DEBOUNCE_POLLS inventories */
+    ww.in.travel_um[0] += ACE2K_RFID_PASSIVE_MIN_UM;
     t->absent = false;
     ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
     ASSERT_EQ(e.lane, 0);
@@ -1222,9 +1378,7 @@ TEST(an_ntag_session_reads_twelve_pages_in_one_step)
     t->absent = true;
     ww.in.insert = 0x01;
     ww_steps(&ww, 1);
-    ww.in.moving = 0x01;
-    ww_steps(&ww, 20);
-    t->absent = false;
+    turn_in(&ww, 0, t);
     ww_steps(&ww, 40);
     struct ace2k_rfid_event e;
     ASSERT_TRUE(ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
@@ -1276,8 +1430,7 @@ TEST(a_malformed_inventory_takes_no_tag_and_the_tag_is_taken_once_it_answers_wel
     struct ftag *t = tag_b(&ww, ua, false);
     ww.in.insert = 0x01;
     ww_steps(&ww, 1);
-    ww.in.moving = 0x01;
-    ww_steps(&ww, 20); /* the baseline: an empty field */
+    turn_out(&ww, 0, t); /* the tag's return will be the lane's */
     ww.ff.rd[1].hostile = ACE2K_FAKE_HOSTILE_BCC;
     t->absent = false;
     ww_steps(&ww, 60);
@@ -1493,11 +1646,9 @@ TEST(a_read_with_motion_asks_the_search_only_on_a_free_lane_and_forgets_only_aft
     ww_steps(&ww, 30);
     drain(&ww);
     ww.ff.rd[1].t[0].absent = true;
-    /* lane 1 moves and its own tag enters: a session */
+    /* lane 1 moves and its own tag comes back after a turn: a session */
     struct ftag *mine = tag_b(&ww, ua, false);
-    ww.in.moving = 0x01;
-    ww_steps(&ww, 20);
-    mine->absent = false;
+    turn_in(&ww, 0, mine);
     struct ace2k_rfid_event e;
     ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
     ww.in.moving = 0;
@@ -1523,6 +1674,31 @@ TEST(a_read_with_motion_asks_the_search_only_on_a_free_lane_and_forgets_only_aft
 }
 
 /* The ring keeps the oldest events: once full, a new event is dropped and counted. */
+/* The distance check of the confirmation's window and of passive watching, both ways. */
+TEST(two_positions_apart_within_bounds_either_way)
+{
+    ASSERT_TRUE(ace2k_rfid_watch_apart(100, 110, 0, 20));
+    ASSERT_TRUE(ace2k_rfid_watch_apart(110, 100, 0, 20));
+    ASSERT_TRUE(!ace2k_rfid_watch_apart(100, 130, 0, 20));
+    ASSERT_TRUE(!ace2k_rfid_watch_apart(130, 100, 0, 20));
+    ASSERT_TRUE(ace2k_rfid_watch_apart(100, 150, 30, 60));
+    ASSERT_TRUE(ace2k_rfid_watch_apart(150, 100, 30, 60));
+    ASSERT_TRUE(!ace2k_rfid_watch_apart(100, 110, 30, 60));
+    ASSERT_TRUE(!ace2k_rfid_watch_apart(110, 100, 30, 60));
+    ASSERT_TRUE(ace2k_rfid_watch_apart(INT32_MAX, INT32_MIN, 0, INT32_MAX) == false);
+}
+
+/* A read with motion on a lane out of range that the search answered ok forgets nothing. */
+TEST(a_read_with_motion_out_of_range_touches_no_lane)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ace2k_fake_search f = { .answer = ACE2K_RFID_READ_OK };
+    ASSERT_EQ(ace2k_rfid_watch_read_with_motion(&ww.w, ACE2K_LANE_COUNT, fake_search_start, &f),
+              ACE2K_RFID_READ_OK);
+    ASSERT_EQ(f.calls, 1);
+}
+
 TEST(a_full_event_ring_keeps_the_oldest_events_and_counts_the_dropped_ones)
 {
     struct wworld ww;
@@ -1786,9 +1962,7 @@ static void lane2s_kept_tag_returns_as_lane1_moves(struct wworld *ww, const uint
     *x = tag_b(ww, fresh, false);
     ww->in.insert = 0x03;
     ww_steps(ww, 1);
-    ww->in.moving = 0x02;
-    ww_steps(ww, 20);
-    (*y)->absent = false;
+    turn_in(ww, 1, *y);
     struct ace2k_rfid_event first;
     ASSERT_TRUE(ww_until(ww, ACE2K_RFID_EV_TAG, 30, &first));
     ASSERT_EQ(first.lane, 1);
@@ -1796,8 +1970,7 @@ static void lane2s_kept_tag_returns_as_lane1_moves(struct wworld *ww, const uint
     ww_steps(ww, 60);
     ASSERT_EQ(ace2k_rfid_watch_state(&ww->w, 1), ACE2K_RFID_PENDING);
     drain(ww);
-    ww->in.moving = 0x01;
-    ww_steps(ww, 20);
+    turn_out(ww, 0, *x);
     (*x)->absent = false;
     (*y)->absent = false;
     ASSERT_TRUE(ww_until(ww, ACE2K_RFID_EV_TAG, 30, e));
@@ -1891,9 +2064,7 @@ TEST(a_read_on_command_that_sees_only_the_neighbours_kept_uid_answers_the_unchan
     struct ftag *kept = tag_b(&ww, ua, false);
     ww.in.insert = 0x03;
     ww_steps(&ww, 1);
-    ww.in.moving = 0x02;
-    ww_steps(&ww, 20);
-    kept->absent = false;
+    turn_in(&ww, 1, kept);
     struct ace2k_rfid_event e;
     ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
     ASSERT_EQ(e.lane, 1);
@@ -1925,9 +2096,7 @@ static void lane1_keeps_x_while_lane2_loads(struct wworld *ww, struct ftag **x)
     *x = tag_b(ww, ua, false);
     ww->in.insert = 0x03;
     ww_steps(ww, 1);
-    ww->in.moving = 0x01;
-    ww_steps(ww, 20);
-    (*x)->absent = false;
+    turn_in(ww, 0, *x);
     struct ace2k_rfid_event e;
     ASSERT_TRUE(ww_until(ww, ACE2K_RFID_EV_TAG, 30, &e));
     ASSERT_EQ(e.lane, 0);
@@ -1952,9 +2121,9 @@ static void lane1_keeps_x_while_lane2_loads(struct wworld *ww, struct ftag **x)
     drain(ww);
 }
 
-/* A forget on lane 1 also drops the UID it keeps.  The next time X enters while lane 2 moves, X is
- * lane 2's by rule 4.  Up to v0.12.0 the forget did nothing on a pending lane, and lane 1 took X
- * again. */
+/* A forget on lane 1 also drops the UID it keeps.  The next time X enters while lane 2 loads, X is
+ * a candidate of lane 2, and lane 2's once it follows lane 2's reversal.  Up to v0.12.0 the forget
+ * did nothing on a pending lane, and lane 1 took X again. */
 TEST(a_forget_releases_the_kept_uid_and_the_neighbour_can_then_take_it)
 {
     struct wworld ww;
@@ -1967,8 +2136,11 @@ TEST(a_forget_releases_the_kept_uid_and_the_neighbour_can_then_take_it)
     ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 0), ACE2K_RFID_PENDING);
     ASSERT_EQ(ace2k_rfid_watch_tag(&ww.w, 0)->uid_len, 0);
     ww_steps(&ww, 30); /* X away for more than ACE2K_RFID_DEBOUNCE_POLLS inventories */
-    x->absent = false; /* X turns past the antenna again */
-    ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
+    /* X left while lane 2 moved, so it is already a candidate: lane 2 goes back a whole leg without
+     * it, then forward until X follows. */
+    struct lanetag lt = { x, 1, 20000, 136000 }; /* X on lane 2's spool, turned past the antenna */
+    ww.own_um_s[1] = 20000;
+    ASSERT_TRUE(ww_drive_until(&ww, &lt, 1, ACE2K_RFID_EV_TAG, 4000, &e));
     ASSERT_EQ(e.lane, 1);
     ASSERT_TRUE(memcmp(e.tag.uid, ua, 4) == 0);
     ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 1), ACE2K_RFID_READING);
@@ -1987,9 +2159,7 @@ TEST(a_forget_on_the_other_lane_leaves_the_kept_uid_where_it_is)
     struct ftag *y = tag_b(&ww, ub, false);
     ww.in.insert = 0x03;
     ww_steps(&ww, 1);
-    ww.in.moving = 0x01;
-    ww_steps(&ww, 20);
-    x->absent = false;
+    turn_in(&ww, 0, x);
     struct ace2k_rfid_event e;
     ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
     ASSERT_EQ(e.lane, 0);
@@ -2000,9 +2170,7 @@ TEST(a_forget_on_the_other_lane_leaves_the_kept_uid_where_it_is)
     ww_steps(&ww, 30);
     ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 0), ACE2K_RFID_PENDING);
     ASSERT_EQ(ace2k_rfid_watch_lost_bits(&ww.w), 0x01);
-    ww.in.moving = 0x02;
-    ww_steps(&ww, 20);
-    y->absent = false;
+    turn_in(&ww, 1, y);
     ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
     ASSERT_EQ(e.lane, 1);
     y->absent = true;
@@ -2041,11 +2209,10 @@ TEST(a_forget_on_a_searching_lane_changes_nothing_and_its_search_never_ends_no_t
     ww.in.insert = 0x01;
     ww_steps(&ww, 1);
     ww.in.loading = 0x01;
-    ww.in.moving = 0x01;
-    ww_steps(&ww, 20);
-    x->absent = false;
+    ww.own_um_s[0] = 20000;
+    struct lanetag lt = { x, 0, 100000, 216000 };
     struct ace2k_rfid_event e;
-    ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
+    ASSERT_TRUE(ww_drive_until(&ww, &lt, 1, ACE2K_RFID_EV_TAG, 1000, &e)); /* it followed */
     x->absent = true;
     ASSERT_EQ(ace2k_rfid_watch_done(&ww.w, 0, e.session, false), 0);
     ww_steps(&ww, 5);
@@ -2144,9 +2311,10 @@ TEST(lane_3_moving_turns_on_reader_as_field_never_reader_bs_and_its_tag_is_lane_
     ASSERT_TRUE(ace2k_rfid_watch_field(&ww.w, ACE2K_RFID_READER_A));
     ASSERT_TRUE(!ace2k_rfid_watch_field(&ww.w, ACE2K_RFID_READER_B));
     ww_steps(&ww, 20); /* inventories of an empty field: the baseline */
-    t->absent = false;
+    ww.own_um_s[2] = 20000;
+    struct lanetag lt = { t, 2, 100000, 216000 };
     struct ace2k_rfid_event e;
-    ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
+    ASSERT_TRUE(ww_drive_until(&ww, &lt, 1, ACE2K_RFID_EV_TAG, 1000, &e)); /* it followed */
     ASSERT_EQ(e.lane, 2);
     ASSERT_TRUE(memcmp(e.tag.uid, ua, 4) == 0);
     ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 2), ACE2K_RFID_READING);
@@ -2219,6 +2387,7 @@ TEST(with_the_insert_unknown_no_tag_is_taken_no_state_moves_and_a_read_is_busy)
     ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
     ww.ff.rd[1].t[0].absent = true;
     ww_steps(&ww, 30); /* away for more than ACE2K_RFID_DEBOUNCE_POLLS inventories */
+    ww.in.travel_um[0] += ACE2K_RFID_PASSIVE_MIN_UM; /* a whole turn of the spool */
     ww.ff.rd[1].t[0].absent = false;
     ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 40, &e));
     ASSERT_EQ(e.lane, 0);
@@ -2251,6 +2420,1120 @@ TEST(a_session_on_a_reader_that_stops_answering_still_ends_after_half_a_second_w
     const uint8_t *k = ww.w.r[ACE2K_RFID_READER_B].step_job.key;
     ASSERT_TRUE(k[0] == 0 && k[1] == 0 && k[2] == 0 && k[3] == 0 && k[4] == 0 && k[5] == 0);
     ASSERT_EQ(ww.ff.rd[1].starts, starts); /* the step never ran */
+}
+
+/* Lane 2 (index 1) has filament and moves alone while its tag comes back after a turn of its
+ * spool.  True when a TAG came. */
+static bool lane2_tag_turns_in(bool by_hand)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *t = tag_b(&ww, ua, false);
+    ww.in.insert = 0x02;
+    ww_steps(&ww, 1);
+    if (by_hand) {
+        ace2k_rfid_watch_set_by_hand(&ww.w, 1);
+    }
+    turn_in(&ww, 1, t);
+    struct ace2k_rfid_event e;
+    bool got = ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e);
+    if (by_hand) {
+        ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 1), ACE2K_RFID_PENDING);
+        ww.in.insert = 0;
+        ww_steps(&ww, 1);
+        ww.in.insert = 0x02;
+        ww_steps(&ww, 1);
+        ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 1), ACE2K_RFID_PENDING);
+        ASSERT_TRUE(!ww.w.l[1].by_hand);
+        ASSERT_TRUE(ace2k_rfid_watch_eligible(&ww.w, 1));
+        /* a lane with no filament, or out of range, is refused */
+        ace2k_rfid_watch_set_by_hand(&ww.w, 0);
+        ace2k_rfid_watch_set_by_hand(&ww.w, 9);
+        ASSERT_TRUE(!ww.w.l[0].by_hand);
+    }
+    return got;
+}
+
+TEST(a_lane_set_by_hand_takes_no_tag_until_its_strand_leaves)
+{
+    ASSERT_TRUE(lane2_tag_turns_in(false)); /* the same sequence, not by hand: the tag is taken */
+    ASSERT_TRUE(!lane2_tag_turns_in(true));
+}
+
+/* The host names lane 2 by hand while the watch has not yet made the lane pending
+ * (here the insert readings are frozen, so the lane stays unknown).  The insert sensor reads
+ * filament, so the mark is taken, and the lane takes no tag once it moves.  The mark still goes
+ * when the strand leaves. */
+TEST(by_hand_is_taken_while_the_lane_is_still_unknown)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *t = tag_b(&ww, ua, false);
+    ww.in.insert = 0x02;
+    ww.in.insert_unknown = true;
+    ww_steps(&ww, 1);
+    ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 1), ACE2K_RFID_UNKNOWN);
+    ace2k_rfid_watch_set_by_hand(&ww.w, 1);
+    ASSERT_TRUE(ww.w.l[1].by_hand);
+    ww.in.insert_unknown = false;
+    ww_steps(&ww, 1);
+    ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 1), ACE2K_RFID_PENDING);
+    turn_in(&ww, 1, t);
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(!ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
+    ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 1), ACE2K_RFID_PENDING);
+    ww.in.insert = 0;
+    ww_steps(&ww, 1);
+    ASSERT_TRUE(!ww.w.l[1].by_hand);
+}
+
+/* A link loss keeps a lane set by hand, so a host that stays up through it does
+ * not lose the mark.  Only the strand leaving clears it.  The in-use mask still dies with the
+ * link. */
+TEST(a_link_loss_keeps_a_lane_set_by_hand)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *t = tag_b(&ww, ua, false);
+    ww.in.insert = 0x02;
+    ww_steps(&ww, 1);
+    ace2k_rfid_watch_set_by_hand(&ww.w, 1);
+    ace2k_rfid_watch_set_in_use(&ww.w, 0x02);
+    ww.in.link_ok = false;
+    ww_steps(&ww, 1);
+    ww.in.link_ok = true;
+    ww_steps(&ww, 1);
+    ASSERT_TRUE(ww.w.l[1].by_hand);
+    uint8_t m = 0xFF;
+    ASSERT_TRUE(!ace2k_rfid_watch_in_use(&ww.w, &m));
+    turn_in(&ww, 1, t);
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(!ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
+    ww.in.insert = 0;
+    ww_steps(&ww, 1);
+    ASSERT_TRUE(!ww.w.l[1].by_hand);
+}
+
+/* The marks: a by-hand command on a lane with no filament is refused, and only the strand
+ * leaving clears a mark. */
+TEST(a_mark_needs_filament_and_goes_only_when_its_strand_leaves)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    ww_steps(&ww, 1);
+    ASSERT_EQ(ace2k_rfid_watch_by_hand_bits(&ww.w), 0);
+    ace2k_rfid_watch_set_by_hand(&ww.w, 1); /* no filament: refused */
+    ASSERT_EQ(ace2k_rfid_watch_by_hand_bits(&ww.w), 0);
+    ww.in.insert = 0x06;
+    ww_steps(&ww, 1);
+    ace2k_rfid_watch_set_by_hand(&ww.w, 1);
+    ace2k_rfid_watch_set_by_hand(&ww.w, 2);
+    ASSERT_EQ(ace2k_rfid_watch_by_hand_bits(&ww.w), 0x06);
+    ww.in.insert = 0x04; /* lane 2's strand leaves: its mark goes */
+    ww_steps(&ww, 1);
+    ASSERT_EQ(ace2k_rfid_watch_by_hand_bits(&ww.w), 0x04);
+}
+
+TEST(by_hand_on_a_read_lane_keeps_its_uid_from_the_neighbour)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *t;
+    uint8_t session = open_session_on_lane1(&ww, &t);
+    ASSERT_EQ(ace2k_rfid_watch_done(&ww.w, 0, session, true), 0);
+    ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 0), ACE2K_RFID_READ);
+    ace2k_rfid_watch_set_by_hand(&ww.w, 0);
+    ASSERT_TRUE(ww.w.l[0].by_hand);
+    ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 0), ACE2K_RFID_READ);
+    ASSERT_TRUE(ace2k_rfid_watch_tag(&ww.w, 0)->uid_len == 4);
+    ASSERT_TRUE(memcmp(ace2k_rfid_watch_tag(&ww.w, 0)->uid, ua, 4) == 0);
+    /* the neighbour moves with the same tag in view: it is not the neighbour's */
+    ww.in.insert = 0x03;
+    ww.in.moving = 0x02;
+    ww_steps(&ww, 60);
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
+    ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 1), ACE2K_RFID_PENDING);
+    ASSERT_TRUE(ww.w.l[0].by_hand);
+    ASSERT_TRUE(!ace2k_rfid_watch_eligible(&ww.w, 0));
+    ASSERT_TRUE(memcmp(ace2k_rfid_watch_tag(&ww.w, 0)->uid, ua, 4) == 0);
+}
+
+/* Bench 2026-11-12: the host's forget (ACEK_RFID_FORGET, the U1's Read tag) drops the lane's
+ * by-hand mark too: a forgotten lane can be read again. */
+TEST(the_hosts_forget_clears_the_by_hand_mark)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    ww.in.insert = 0x02;
+    ww_steps(&ww, 1);
+    ace2k_rfid_watch_set_by_hand(&ww.w, 1);
+    ASSERT_EQ(ace2k_rfid_watch_by_hand_bits(&ww.w), 0x02);
+    ace2k_rfid_watch_host_forget(&ww.w, 1);
+    ASSERT_TRUE(!ww.w.l[1].by_hand);
+    ASSERT_EQ(ace2k_rfid_watch_by_hand_bits(&ww.w), 0);
+    ASSERT_TRUE(ace2k_rfid_watch_eligible(&ww.w, 1));
+    ace2k_rfid_watch_host_forget(&ww.w, 9); /* out of range: nothing */
+}
+
+/* Bench 2026-11-12: lane 2 is set by hand (the host restored its read after a restart) and
+ * still.  Lane 1 loads, and a new UID enters: it can only be lane 1's, so it is taken at once,
+ * with no confirmation. */
+TEST(beside_a_still_lane_set_by_hand_a_new_uid_is_the_loading_lanes_at_once)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct lanetag lt = { tag_b(&ww, ua, false), 0, 100000, 216000 };
+    ww.in.insert = 0x03;
+    ww_steps(&ww, 1);
+    ace2k_rfid_watch_set_by_hand(&ww.w, 1);
+    ww.in.loading = 0x01;
+    ww.own_um_s[0] = 20000;
+    struct ace2k_rfid_event e;
+    bool got = false;
+    for (int i = 0; i < 1000 && !got; i++) {
+        got = ww_drive_until(&ww, &lt, 1, ACE2K_RFID_EV_TAG, 1, &e);
+        ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0);
+    }
+    ASSERT_TRUE(got);
+    ASSERT_EQ(e.lane, 0);
+    ASSERT_TRUE(memcmp(e.tag.uid, ua, 4) == 0);
+    ASSERT_TRUE(ww.w.l[1].by_hand);
+}
+
+TEST(the_in_use_mask_ages_out_and_dies_with_the_link)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    uint8_t m = 0xFF;
+    ww_steps(&ww, 1);
+    ASSERT_TRUE(!ace2k_rfid_watch_in_use(&ww.w, &m));
+    ASSERT_EQ(m, 0);
+    uint32_t t = ww.now;
+    ace2k_rfid_watch_set_in_use(&ww.w, 0x05);
+    ace2k_rfid_watch_step(&ww.w, t + 2999, &ww.in);
+    ASSERT_TRUE(ace2k_rfid_watch_in_use(&ww.w, &m));
+    ASSERT_EQ(m, 0x05);
+    ace2k_rfid_watch_step(&ww.w, t + 3001, &ww.in);
+    ASSERT_TRUE(!ace2k_rfid_watch_in_use(&ww.w, &m));
+    ASSERT_EQ(m, 0);
+    ww.now = t + 3010;
+    ace2k_rfid_watch_step(&ww.w, ww.now, &ww.in);
+    ace2k_rfid_watch_set_in_use(&ww.w, 0x02);
+    ASSERT_TRUE(ace2k_rfid_watch_in_use(&ww.w, &m));
+    ww.in.link_ok = false;
+    ww_steps(&ww, 1);
+    ww.in.link_ok = true;
+    ww_steps(&ww, 1);
+    ASSERT_TRUE(!ace2k_rfid_watch_in_use(&ww.w, &m));
+    ASSERT_EQ(m, 0);
+}
+
+/* The field report: lane 1 runs (a print's assist) with its own tag at rest in the field.  A spool
+ * is hung on bay 2, no strand in bay 2 yet, and its tag enters the field.  It is not lane 1's: a
+ * tag that only enters proves nothing about the bay it came from. */
+TEST(a_spool_hung_on_the_neighbour_bay_while_this_lane_runs_is_not_this_lanes)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    tag_b(&ww, ua, true);                      /* lane 1's own spool, at rest */
+    struct ftag *hung = tag_b(&ww, ub, false); /* the spool about to be hung on bay 2 */
+    ww.in.insert = 0x01;
+    ww_steps(&ww, 1);
+    ww.in.moving = 0x01; /* lane 1 runs (a print's assist) */
+    ww_steps(&ww, 60);
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
+    hung->absent = false; /* hung on bay 2 */
+    ww_steps(&ww, 30);
+    ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
+    ASSERT_TRUE(!ww.w.l[0].has_tag);
+}
+
+/* Passive watching: lane 1 moves alone, outside a load.  Its tag leaves the field and comes back
+ * after the lane travelled the minimum: a full turn of its spool.  It is lane 1's. */
+TEST(
+    a_tag_that_leaves_and_returns_after_the_minimum_travel_while_only_this_lane_moves_is_this_lanes)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *mine = tag_b(&ww, ua, true);
+    ww.in.insert = 0x01;
+    ww_steps(&ww, 1);
+    ww.in.moving = 0x01;
+    ww_steps(&ww, 30);
+    mine->absent = true;
+    ww_steps(&ww, 40); /* it left */
+    ww_travel(&ww, 0, ACE2K_RFID_PASSIVE_MIN_UM, 30);
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
+    ASSERT_TRUE(!ww.w.l[0].has_tag); /* leaving alone gives nothing */
+    mine->absent = false;
+    ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
+    ASSERT_EQ(e.lane, 0);
+    ASSERT_TRUE(memcmp(e.tag.uid, ua, 4) == 0);
+}
+
+/* A tag that comes back before the minimum travel is nobody's.  Its next leave is measured anew,
+ * so two short absences do not add up to a turn. */
+TEST(a_tag_that_flickers_back_before_the_minimum_travel_is_nobodys)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *t = tag_b(&ww, ua, true);
+    ww.in.insert = 0x01;
+    ww_steps(&ww, 1);
+    ww.in.moving = 0x01;
+    ww_steps(&ww, 30);
+    for (int k = 0; k < 2; k++) {
+        t->absent = true;
+        ww_steps(&ww, 40); /* it left */
+        ww_travel(&ww, 0, ACE2K_RFID_PASSIVE_MIN_UM - 1, 30);
+        t->absent = false;
+        ww_steps(&ww, 30);
+    }
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
+    ASSERT_TRUE(!ww.w.l[0].has_tag);
+    ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 0), ACE2K_RFID_PENDING);
+}
+
+/* A leave is measured within one insertion of the lane and one spell of the field.  The lane's
+ * strand leaving its insert sensor drops its records, and so does the field going off. */
+TEST(a_leave_before_the_strand_left_or_the_field_went_off_does_not_count)
+{
+    for (int field_off = 0; field_off < 2; field_off++) {
+        struct wworld ww;
+        ww_init(&ww);
+        struct ftag *t = tag_b(&ww, ua, true);
+        ww.in.insert = 0x01;
+        ww_steps(&ww, 1);
+        ww.in.moving = 0x01;
+        ww_steps(&ww, 30);
+        t->absent = true;
+        ww_steps(&ww, 40); /* it left */
+        ASSERT_EQ(ww.w.r[ACE2K_RFID_READER_B].gone_count, 1);
+        if (field_off != 0) {
+            ww.in.moving = 0;
+            ww_steps(&ww, 5);
+            ASSERT_TRUE(!ww.field[1]);
+            ww.in.moving = 0x01;
+            ww_steps(&ww, 40); /* a new baseline, the tag still away */
+        } else {
+            ww.in.insert = 0;
+            ww_steps(&ww, 1);
+            ww.in.insert = 0x01;
+            ww_steps(&ww, 1);
+        }
+        ASSERT_EQ(ww.w.r[ACE2K_RFID_READER_B].gone_count, 0);
+        ww.in.travel_um[0] += ACE2K_RFID_PASSIVE_MIN_UM;
+        t->absent = false;
+        ww_steps(&ww, 30);
+        struct ace2k_rfid_event e;
+        ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
+        ASSERT_TRUE(!ww.w.l[0].has_tag);
+    }
+}
+
+/* The table of leaves is full.  One record is of a UID back in view: it waits for no return, so a
+ * new leave gives it up, not the oldest.  The oldest, a tag still away, later comes back after a
+ * turn and is the lane's. */
+TEST(a_full_table_of_leaves_gives_up_a_uid_back_in_view_before_the_oldest)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *mine = tag_b(&ww, ua, true);
+    tag_b(&ww, ub, true); /* in view throughout */
+    struct ftag *other = tag_b(&ww, ud, true);
+    ww.in.insert = 0x01;
+    ww_steps(&ww, 1);
+    ww.in.moving = 0x01;
+    ww_steps(&ww, 40);
+    mine->absent = true;
+    ww_steps(&ww, 40); /* it left: the oldest record */
+    struct ace2k_rfid_watch_reader *rd = &ww.w.r[ACE2K_RFID_READER_B];
+    ASSERT_EQ(rd->gone_count, 1);
+    /* the rest of the table: a record of ub, back in view, then UIDs away */
+    rd->gone[1] = (struct ace2k_iso14443a_tag){ .uid_len = 4, .uid = { 0x11, 0x22, 0x33, 0x44 } };
+    rd->gone_at_um[1] = 0;
+    rd->gone_lane[1] = 0;
+    for (uint8_t j = 2; j < ACE2K_RFID_TRACKED_MAX; j++) {
+        rd->gone[j] = (struct ace2k_iso14443a_tag){ .uid_len = 4, .uid = { 0xA0, j, 0, 0 } };
+        rd->gone_at_um[j] = 0;
+        rd->gone_lane[j] = 0;
+    }
+    rd->gone_count = ACE2K_RFID_TRACKED_MAX;
+    other->absent = true;
+    ww_steps(&ww, 40); /* a new leave, the table full */
+    ASSERT_EQ(rd->gone_count, ACE2K_RFID_TRACKED_MAX);
+    bool ub_kept = false;
+    bool ud_kept = false;
+    for (uint8_t j = 0; j < rd->gone_count; j++) {
+        ub_kept = (bool)(ub_kept || memcmp(rd->gone[j].uid, ub, 4) == 0);
+        ud_kept = (bool)(ud_kept || memcmp(rd->gone[j].uid, ud, 4) == 0);
+    }
+    ASSERT_TRUE(!ub_kept && ud_kept);
+    ASSERT_TRUE(memcmp(rd->gone[0].uid, ua, 4) == 0); /* the oldest survives */
+    ww.in.travel_um[0] += ACE2K_RFID_PASSIVE_MIN_UM;
+    mine->absent = false;
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
+    ASSERT_EQ(e.lane, 0);
+    ASSERT_TRUE(memcmp(e.tag.uid, ua, 4) == 0);
+}
+
+/* Lane 2 read and printing, lane 1 inserted.  A new UID that enters while lane 1 moves can only be
+ * lane 1's: lane 2's spool holds lane 2's tag.  It is taken at once, in a load or outside one. */
+TEST(with_the_neighbour_read_a_new_uid_entering_while_this_lane_moves_is_taken_at_once)
+{
+    for (int loading = 0; loading < 2; loading++) {
+        struct wworld ww;
+        ww_init(&ww);
+        struct ftag *z = tag_b(&ww, ud, false);
+        struct ftag *y = tag_b(&ww, ub, false);
+        ww.in.insert = 0x03;
+        ww_steps(&ww, 1);
+        (void)read_lane2(&ww, z); /* lane 2 read, its tag stays in view */
+        ww.in.moving = 0x03;      /* lane 2 prints, lane 1 moves */
+        ww.in.loading = loading != 0 ? 0x01 : 0;
+        ww_steps(&ww, 20);
+        y->absent = false;
+        struct ace2k_rfid_event e;
+        ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
+        ASSERT_EQ(e.lane, 0);
+        ASSERT_TRUE(memcmp(e.tag.uid, ub, 4) == 0);
+    }
+}
+
+/* A tag in reader A's field (lanes 3–4), present or not yet. */
+static struct ftag *tag_a(struct wworld *ww, const uint8_t uid[4], bool present)
+{
+    struct ftag *t = add_mifare(&ww->ff.rd[ACE2K_RFID_READER_A], uid);
+    t->absent = (bool)!present;
+    return t;
+}
+
+/* S4.  Lane 3 prints with its black tag, its material set by hand, so it is not read.  Lane 4 loads
+ * with a yellow tag.  Black is in view the whole time, or lane 3's slow print brings it to the edge
+ * of the field during lane 4's load, or it is out of reach.  Yellow follows lane 4's reversals and
+ * is lane 4's.  Black never follows lane 4, so it is never lane 4's. */
+TEST(s4_the_tag_that_follows_the_lane_is_its_own_the_neighbours_turning_one_is_not)
+{
+    for (int where = 0; where < 3; where++) {
+        struct wworld ww;
+        ww_init(&ww);
+        struct ftag *yellow = tag_a(&ww, ua, false);
+        struct ftag *black = tag_a(&ww, ub, where == 0);
+        ww.in.insert = 0x0C;
+        ww_steps(&ww, 1);
+        ace2k_rfid_watch_set_by_hand(&ww.w, 2);
+        ww.in.loading = 0x08;
+        ww.own_um_s[2] = 1000;  /* lane 3's print: slow, one way */
+        ww.own_um_s[3] = 20000; /* lane 4's load */
+        struct lanetag tags[2] = {
+            { yellow, 3, 200000, 316000 },
+            { black, 2, 5000, 121000 }, /* lane 3 brings black into view after 5 s */
+        };
+        int n = where == 1 ? 2 : 1;
+        bool black_tried = false;
+        struct ace2k_rfid_event e = { 0 };
+        bool got = false;
+        for (int i = 0; i < 8000 && !got; i++) {
+            got = ww_drive_until(&ww, tags, n, ACE2K_RFID_EV_TAG, 1, &e);
+            const struct ace2k_rfid_confirm *c = &ww.w.r[ACE2K_RFID_READER_A].confirm;
+            if (c->on && c->uid.uid_len == 4 && memcmp(c->uid.uid, ub, 4) == 0) {
+                black_tried = true;
+            }
+        }
+        ASSERT_TRUE(got);
+        ASSERT_EQ(e.lane, 3);
+        ASSERT_TRUE(memcmp(e.tag.uid, ua, 4) == 0);
+        ASSERT_EQ(black_tried, where == 1); /* at the edge, black entered: tried, never followed */
+        ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 2), ACE2K_RFID_PENDING);
+        ASSERT_EQ(ace2k_rfid_watch_tag(&ww.w, 2)->uid_len, 0);
+    }
+}
+
+/* S7.  Lane 3 loads with its green tag in view at rest.  A spool hung on bay 4, with no strand,
+ * holds a black tag: in view from the start, or hung during the load.  Green follows lane 3 and is
+ * lane 3's.  Black never follows, so it is nobody's; hung during the load, it is a candidate that
+ * lane 3 runs a whole leg back for, in vain. */
+TEST(s7_a_hung_tag_that_does_not_follow_is_nobodys)
+{
+    for (int hung_late = 0; hung_late < 2; hung_late++) {
+        struct wworld ww;
+        ww_init(&ww);
+        struct ftag *green = tag_a(&ww, ua, true);
+        struct ftag *black = tag_a(&ww, ub, hung_late == 0);
+        ww.in.insert = 0x04;
+        ww_steps(&ww, 1);
+        ww.in.loading = 0x04;
+        ww.own_um_s[2] = 20000;
+        struct lanetag lt = { green, 2, -50000, 66000 };
+        ww_drive(&ww, &lt, 1, 100);
+        if (hung_late != 0) {
+            black->absent = false; /* a hand hangs the spool while lane 3 moves */
+            ww_drive(&ww, &lt, 1, 20);
+            const struct ace2k_rfid_confirm *c = &ww.w.r[ACE2K_RFID_READER_A].confirm;
+            ASSERT_TRUE(c->on && memcmp(c->uid.uid, ub, 4) == 0);
+        }
+        struct ace2k_rfid_event e;
+        ASSERT_TRUE(ww_drive_until(&ww, &lt, 1, ACE2K_RFID_EV_TAG, 6000, &e));
+        ASSERT_EQ(e.lane, 2);
+        ASSERT_TRUE(memcmp(e.tag.uid, ua, 4) == 0);
+        ASSERT_TRUE(!black->absent);
+        ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 3), ACE2K_RFID_UNKNOWN);
+    }
+}
+
+/* Review: the neighbour's spool comes into view while lane 4 loads, so its tag is a candidate.  It
+ * is lifted off its holder while lane 4 goes back: a change, but lane 4's forward leg never brings
+ * it back.  The leg runs out and the tag is nobody's. */
+TEST(a_neighbours_spool_lifted_off_during_a_confirmation_is_not_attributed)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *other = tag_a(&ww, ub, false);
+    ww.in.insert = 0x0C;
+    ww_steps(&ww, 1);
+    ww.in.loading = 0x08;
+    ww.own_um_s[3] = 20000;
+    ww_drive(&ww, NULL, 0, 30);
+    other->absent = false; /* lane 3's spool turned by hand: its tag comes into view */
+    for (int i = 0; i < 50 && ace2k_rfid_watch_confirm_bits(&ww.w) == 0; i++) {
+        ww_drive(&ww, NULL, 0, 1);
+    }
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0x08);
+    ASSERT_EQ(ace2k_rfid_watch_confirm_reverse_bits(&ww.w), 0x08);
+    ww_drive(&ww, NULL, 0, 50);
+    other->absent = true; /* lifted off while lane 4 goes back */
+    for (int i = 0; i < 100 && ace2k_rfid_watch_confirm_reverse_bits(&ww.w) != 0; i++) {
+        ww_drive(&ww, NULL, 0, 1);
+    }
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0x08); /* asked forward now */
+    ASSERT_EQ(ace2k_rfid_watch_confirm_reverse_bits(&ww.w), 0);
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(!ww_drive_until(&ww, NULL, 0, ACE2K_RFID_EV_TAG, 2500, &e));
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0); /* the forward leg ran out */
+    ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 3), ACE2K_RFID_SEARCHING);
+    struct ace2k_rfid_confirm_trace t;
+    ASSERT_TRUE(ww_trace(&ww, ACE2K_RFID_TRACE_LEG_OUT, &t));
+    ASSERT_EQ(t.lane, 3);
+    ASSERT_TRUE(!ww.w.l[3].has_tag && !ww.w.l[2].has_tag);
+}
+
+/* The tags the test's lanes got on this run: each one is lifted away from its bay, and its session
+ * is given up. */
+static void take_tags(struct wworld *ww, struct lanetag tags[2], uint8_t *got)
+{
+    struct ace2k_rfid_event e;
+    while (ww_next(ww, ACE2K_RFID_EV_TAG, &e)) {
+        ASSERT_TRUE(e.lane == 2 || e.lane == 3);
+        ASSERT_TRUE(memcmp(e.tag.uid, e.lane == 2 ? ua : ub, 4) == 0);
+        *got = (uint8_t)(*got | (1U << e.lane));
+        struct lanetag *mine = &tags[e.lane - 2U];
+        mine->in_lo_um = 1; /* lifted away: never in view again */
+        mine->in_hi_um = 0;
+        mine->t->absent = true;
+        ASSERT_EQ(ace2k_rfid_watch_done(&ww->w, e.lane, e.session, false), 0);
+    }
+}
+
+/* The test's feed: a lane whose candidate waits, or that has its tag, holds still. */
+static void hold_waiting(struct wworld *ww, const struct ace2k_rfid_confirm *w, uint8_t got)
+{
+    for (uint8_t lane = 2; lane < 4; lane++) {
+        bool held = (bool)((w->on && w->lane == lane) || (got & (1U << lane)) != 0U);
+        ww->own_um_s[lane] = held ? 0 : 20000;
+    }
+}
+
+/* Review: lanes 3 and 4 both load, and both their tags come into view, in the same inventory or
+ * one just after the other.  One confirmation runs on the reader at a time, and the other lane's
+ * candidate waits for it; this test's feed holds a lane still while its candidate waits.  In the
+ * same inventory the first lane may try the other lane's tag first: that tag does not follow it,
+ * the leg runs out, and the waiting lane gets its turn.  Each tag ends up with its own lane.  Once
+ * a lane has its tag, the host gives up on the read with the spool lifted away, so its kept UID
+ * stays out of the field. */
+TEST(two_candidates_on_one_reader_are_confirmed_one_at_a_time)
+{
+    for (int staggered = 0; staggered < 2; staggered++) {
+        struct wworld ww;
+        ww_init(&ww);
+        struct ftag *t3 = tag_a(&ww, ua, false);
+        struct ftag *t4 = tag_a(&ww, ub, false);
+        ww.in.insert = 0x0C;
+        ww_steps(&ww, 1);
+        ww.in.loading = 0x0C;
+        int32_t lo4 = staggered != 0 ? 102000 : 100000;
+        struct lanetag tags[2] = { { t3, 2, 100000, 216000 }, { t4, 3, lo4, lo4 + 116000 } };
+        const struct ace2k_rfid_confirm *w = &ww.w.r[ACE2K_RFID_READER_A].waiting;
+        uint8_t got = 0;
+        uint8_t waited = 0;
+        for (int i = 0; i < 12000 && got != 0x0C; i++) {
+            hold_waiting(&ww, w, got);
+            ww_drive(&ww, tags, 2, 1);
+            uint8_t bits = ace2k_rfid_watch_confirm_bits(&ww.w);
+            ASSERT_TRUE(bits != 0x0C);
+            if (w->on) {
+                waited = (uint8_t)(waited | (1U << w->lane));
+                ASSERT_TRUE((bits & (1U << w->lane)) == 0U);
+            }
+            take_tags(&ww, tags, &got);
+        }
+        ASSERT_EQ(got, 0x0C);
+        ASSERT_TRUE(waited != 0);
+        if (staggered != 0) {
+            ASSERT_EQ(waited, 0x08); /* lane 3 had its candidate first; lane 4's waited */
+        }
+    }
+}
+
+/* Review: the link drops mid-confirmation.  It ends at once, and nothing restarts it while the lane
+ * makes no change. */
+TEST(a_link_drop_clears_the_confirmation)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *t = tag_b(&ww, ua, false);
+    struct lanetag lt = { t, 0, 100000, 216000 };
+    ww.in.insert = 0x01;
+    ww_steps(&ww, 1);
+    ww.in.loading = 0x01;
+    ww.own_um_s[0] = 20000;
+    for (int i = 0; i < 1000 && ace2k_rfid_watch_confirm_bits(&ww.w) == 0; i++) {
+        ww_drive(&ww, &lt, 1, 1);
+    }
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0x01);
+    ww.in.link_ok = false;
+    ww_drive(&ww, &lt, 1, 1);
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0);
+    ASSERT_EQ(ace2k_rfid_watch_confirm_reverse_bits(&ww.w), 0);
+    ww.in.link_ok = true;
+    ww.own_um_s[0] = 0; /* the feed stops the load on the link drop */
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(!ww_drive_until(&ww, &lt, 1, ACE2K_RFID_EV_TAG, 200, &e));
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0);
+    ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 0), ACE2K_RFID_SEARCHING);
+}
+
+/* A leg that runs out (confirm_out) ends the confirmation, and the tag is not the lane's.  It stays
+ * a candidate: when it leaves the field later in the same load, a confirmation starts again, and
+ * this time the tag follows. */
+TEST(confirm_out_fails_the_confirmation_and_a_later_change_starts_it_again)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *t = tag_b(&ww, ua, false);
+    struct lanetag lt = { t, 0, 100000, 216000 };
+    ww.in.insert = 0x01;
+    ww_steps(&ww, 1);
+    ww.in.loading = 0x01;
+    ww.own_um_s[0] = 20000;
+    for (int i = 0; i < 1000 && ace2k_rfid_watch_confirm_bits(&ww.w) == 0; i++) {
+        ww_drive(&ww, &lt, 1, 1);
+    }
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0x01);
+    ww.in.confirm_out = 0x01; /* the feed had no room to go back */
+    ww_out_epoch(&ww);
+    ww_steps(&ww, 1);
+    ww.in.confirm_out = 0;
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0);
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
+    /* the load goes on forward, the tag in view, until it leaves the far side of its window */
+    for (int i = 0; i < 1000 && ace2k_rfid_watch_confirm_bits(&ww.w) == 0; i++) {
+        ww_drive(&ww, &lt, 1, 1);
+    }
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0x01);
+    ASSERT_TRUE(ww.in.travel_um[0] > 216000);
+    ASSERT_TRUE(!ww.w.r[ACE2K_RFID_READER_B].confirm.present);
+    ASSERT_TRUE(ww_drive_until(&ww, &lt, 1, ACE2K_RFID_EV_TAG, 1000, &e));
+    ASSERT_EQ(e.lane, 0);
+    ASSERT_TRUE(memcmp(e.tag.uid, ua, 4) == 0);
+}
+
+/* A confirmation on lane 1 ends on its leg running out, and a new one starts on
+ * the same lane in the same step.  The feed still shows the old leg out until it has seen the new
+ * confirmation: that stale out does not end the new one, nor burn another try. */
+TEST(a_stale_confirm_out_does_not_end_the_next_confirmation)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *t = tag_b(&ww, ua, false);
+    struct lanetag lt = { t, 0, 100000, 216000 };
+    ww.in.insert = 0x01;
+    ww_steps(&ww, 1);
+    ww.in.loading = 0x01;
+    ww.own_um_s[0] = 20000;
+    for (int i = 0; i < 1000 && ace2k_rfid_watch_confirm_bits(&ww.w) == 0; i++) {
+        ww_drive(&ww, &lt, 1, 1);
+    }
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0x01);
+    ASSERT_EQ(ww.w.l[0].confirms, 1);
+    ww.in.confirm_out = 0x01; /* the first confirmation's leg ran out */
+    ww_out_epoch(&ww);
+    ww_steps(&ww, 1);
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0);
+    /* the same step, a new candidate: a second confirmation starts */
+    struct ace2k_iso14443a_tag cand = { .uid_len = 4 };
+    memcpy(cand.uid, ua, 4);
+    ASSERT_TRUE(ace2k_rfid_watch_confirm_offer(&ww.w, 0, &cand));
+    ASSERT_EQ(ww.w.l[0].confirms, 2);
+    /* the feed has not seen it yet: its out is the first one's */
+    ww_steps(&ww, 1);
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0x01);
+    ASSERT_EQ(ww.w.l[0].confirms, 2);
+    /* the feed's own leg for it runs out: that ends it */
+    ww_out_epoch(&ww);
+    ww_steps(&ww, 1);
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0);
+}
+
+/* Lanes 1 and 2 have strands in, lane 1 loads, and its tag t enters: a confirmation runs on lane 1,
+ * asking it back. */
+static void confirm_running_on_lane1(struct wworld *ww, const struct lanetag *lt)
+{
+    ww->in.insert = 0x03;
+    ww_steps(ww, 1);
+    ww->in.loading = 0x01;
+    ww->own_um_s[0] = 20000;
+    for (int i = 0; i < 1000 && ace2k_rfid_watch_confirm_bits(&ww->w) == 0; i++) {
+        ww_drive(ww, lt, 1, 1);
+    }
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww->w), 0x01);
+    ASSERT_EQ(ace2k_rfid_watch_confirm_reverse_bits(&ww->w), 0x01);
+    ww_drive(ww, lt, 1, 5); /* well inside the first leg */
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww->w), 0x01);
+}
+
+/* After the confirmation ended, the lane is driven on so the tag would have followed: nothing is
+ * attributed and no confirmation comes back. */
+static void nothing_follows(struct wworld *ww, const struct lanetag *lt)
+{
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(!ww_drive_until(ww, lt, 1, ACE2K_RFID_EV_TAG, 300, &e));
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww->w), 0);
+    ASSERT_TRUE(!ww->w.l[0].has_tag);
+}
+
+/* The bench's trace of a confirmation: its start, each change counted with the lane's travel and
+ * direction, and its success. */
+TEST(a_confirmation_traces_its_start_each_counted_change_and_its_success)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct lanetag lt = { tag_b(&ww, ua, false), 0, 100000, 216000 };
+    ww.in.insert = 0x01;
+    ww_steps(&ww, 1);
+    ww.in.loading = 0x01;
+    ww.own_um_s[0] = 20000;
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(ww_drive_until(&ww, &lt, 1, ACE2K_RFID_EV_TAG, 3000, &e));
+    struct ace2k_rfid_confirm_trace t;
+    ASSERT_TRUE(ace2k_rfid_watch_peek_trace(&ww.w, &t));
+    ASSERT_EQ(t.what, ACE2K_RFID_TRACE_START);
+    ASSERT_EQ(t.lane, 0);
+    ace2k_rfid_watch_drop_trace(&ww.w);
+    ASSERT_TRUE(ace2k_rfid_watch_peek_trace(&ww.w, &t));
+    ASSERT_EQ(t.what, ACE2K_RFID_TRACE_FLIP); /* the tag left while the lane went back */
+    ASSERT_TRUE(t.reverse);
+    int32_t first = t.travel_um;
+    ace2k_rfid_watch_drop_trace(&ww.w);
+    ASSERT_TRUE(ace2k_rfid_watch_peek_trace(&ww.w, &t));
+    ASSERT_EQ(t.what, ACE2K_RFID_TRACE_FLIP); /* and came back as it went forward */
+    ASSERT_TRUE(!t.reverse);
+    ASSERT_TRUE(ace2k_rfid_watch_apart(t.travel_um, first, 0, ww.w.cfg.window_um));
+    ace2k_rfid_watch_drop_trace(&ww.w);
+    ASSERT_TRUE(ace2k_rfid_watch_peek_trace(&ww.w, &t));
+    ASSERT_EQ(t.what, ACE2K_RFID_TRACE_TAKEN);
+    ace2k_rfid_watch_drop_trace(&ww.w);
+    ASSERT_TRUE(!ace2k_rfid_watch_peek_trace(&ww.w, &t));
+}
+
+/* A confirmation (4 traces: start, two changes, taken) run with the trace ring already full and
+ * `lost` traces counted before it; returns the first trace waiting after it. */
+static struct ace2k_rfid_confirm_trace confirm_with_full_traces(uint8_t lost)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    ww.w.trace_head = (uint8_t)(ACE2K_RFID_TRACE_RING - 1U); /* full: the next slot is the tail */
+    ww.w.trace_tail = 0;
+    ww.w.trace_lost = lost;
+    struct lanetag lt = { tag_b(&ww, ua, false), 0, 100000, 216000 };
+    ww.in.insert = 0x01;
+    ww_steps(&ww, 1);
+    ww.in.loading = 0x01;
+    ww.own_um_s[0] = 20000;
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(ww_drive_until(&ww, &lt, 1, ACE2K_RFID_EV_TAG, 3000, &e));
+    struct ace2k_rfid_confirm_trace t;
+    ASSERT_TRUE(ace2k_rfid_watch_peek_trace(&ww.w, &t));
+    ace2k_rfid_watch_drop_trace(&ww.w);
+    struct ace2k_rfid_confirm_trace next;
+    ASSERT_TRUE(ace2k_rfid_watch_peek_trace(&ww.w, &next));
+    ASSERT_EQ(next.lost, 0); /* the count went with the trace sent */
+    return t;
+}
+
+/* A trace that finds the ring full is counted, and the count goes with the next trace sent. */
+TEST(a_trace_dropped_on_a_full_ring_is_counted_and_told_with_the_next_one)
+{
+    ASSERT_EQ(confirm_with_full_traces(0).lost, 4);
+}
+
+/* The count of the lost traces stops at 255. */
+TEST(the_count_of_lost_traces_saturates)
+{
+    ASSERT_EQ(confirm_with_full_traces(253).lost, 255);
+}
+
+/* A change that the lane did not make (here the lane stands still) is traced as rejected, and the
+ * confirmation ends. */
+TEST(a_change_while_the_lane_stands_is_traced_as_the_wrong_way)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct lanetag lt = { tag_b(&ww, ua, false), 0, 100000, 216000 };
+    confirm_running_on_lane1(&ww, &lt);
+    ww.in.moving = 0;
+    lt.t->absent = true;
+    ww_steps(&ww, 30);
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0);
+    struct ace2k_rfid_confirm_trace t;
+    ASSERT_TRUE(ww_trace(&ww, ACE2K_RFID_TRACE_WRONG_WAY, &t));
+    ASSERT_EQ(t.lane, 0);
+    ASSERT_EQ(t.travel_um, ww.in.travel_um[0]);
+}
+
+/* The feed's load of the lane ends mid-confirmation: the confirmation ends with it. */
+TEST(the_load_ending_clears_the_confirmation)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct lanetag lt = { tag_b(&ww, ua, false), 0, 100000, 216000 };
+    confirm_running_on_lane1(&ww, &lt);
+    ww.in.loading = 0;
+    ww_drive(&ww, &lt, 1, 1);
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0);
+    ASSERT_EQ(ace2k_rfid_watch_confirm_reverse_bits(&ww.w), 0);
+    ww.own_um_s[0] = -9000; /* the lane still goes back and forth: it is not a load any more */
+    ww_drive(&ww, &lt, 1, 100);
+    ww.own_um_s[0] = 9000;
+    nothing_follows(&ww, &lt);
+    ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 0), ACE2K_RFID_PENDING);
+}
+
+/* The strand of the lane leaves the insert sensor mid-confirmation: the confirmation ends, and the
+ * lane forgets everything. */
+TEST(the_strand_leaving_clears_the_confirmation)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct lanetag lt = { tag_b(&ww, ua, false), 0, 100000, 216000 };
+    confirm_running_on_lane1(&ww, &lt);
+    ww.in.insert = 0x02;
+    ww_drive(&ww, &lt, 1, 1);
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0);
+    ASSERT_EQ(ace2k_rfid_watch_state(&ww.w, 0), ACE2K_RFID_UNKNOWN);
+    nothing_follows(&ww, &lt);
+}
+
+/* The neighbour comes to hold the candidate's UID mid-confirmation (here a UID it keeps from a
+ * session that ended without a read).  Rule 1 decides: the UID is never this lane's, so the
+ * confirmation ends. */
+TEST(the_neighbour_taking_the_candidate_clears_the_confirmation)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *t = tag_b(&ww, ua, false);
+    struct lanetag lt = { t, 0, 100000, 216000 };
+    confirm_running_on_lane1(&ww, &lt);
+    ww.w.l[1].tag = (struct ace2k_iso14443a_tag){ .uid_len = 4, .sak = 0x08 };
+    memcpy(ww.w.l[1].tag.uid, ua, 4);
+    ww.w.l[1].has_tag = true;
+    ww_drive(&ww, &lt, 1, 1);
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0);
+    /* The lane is driven on; its own UID in view, the neighbour may reopen a session on it, but
+     * this lane never gets it and no confirmation comes back. */
+    for (int i = 0; i < 300; i++) {
+        ww_drive(&ww, &lt, 1, 1);
+        struct ace2k_rfid_event e;
+        while (ww_next(&ww, ACE2K_RFID_EV_TAG, &e)) {
+            ASSERT_EQ(e.lane, 1);
+        }
+        ASSERT_TRUE((ace2k_rfid_watch_confirm_bits(&ww.w) & 0x01U) == 0U);
+    }
+    ASSERT_TRUE(!ww.w.l[0].has_tag);
+}
+
+/* Lane 4 loads with nothing of its own in view, and lane 3's tag t comes into view: a confirmation
+ * runs on lane 4, asking it back. */
+static void confirm_running_on_lane4(struct wworld *ww, struct ftag *t)
+{
+    ww_drive(ww, NULL, 0, 30);
+    t->absent = false;
+    for (int i = 0; i < 50 && ace2k_rfid_watch_confirm_bits(&ww->w) == 0; i++) {
+        ww_drive(ww, NULL, 0, 1);
+    }
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww->w), 0x08);
+    ASSERT_EQ(ace2k_rfid_watch_confirm_reverse_bits(&ww->w), 0x08);
+}
+
+/* The neighbour's spool is lifted off while lane 4 goes back, and hung again
+ * once lane 4's forward leg has passed the window of that change.  The tag came back at another
+ * lane position, so it did not follow lane 4, and no later confirmation makes it lane 4's. */
+TEST(a_spool_lifted_and_hung_again_away_from_the_window_is_not_attributed)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *other = tag_a(&ww, ub, false);
+    ww.in.insert = 0x0C;
+    ww_steps(&ww, 1);
+    ww.in.loading = 0x08;
+    ww.own_um_s[3] = 20000;
+    confirm_running_on_lane4(&ww, other);
+    ww_drive(&ww, NULL, 0, 50);
+    other->absent = true; /* lifted off while lane 4 goes back */
+    for (int i = 0; i < 100 && ace2k_rfid_watch_confirm_reverse_bits(&ww.w) != 0; i++) {
+        ww_drive(&ww, NULL, 0, 1);
+    }
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0x08); /* asked forward now */
+    int32_t lifted_at = ww.in.travel_um[3];
+    while (ww.in.travel_um[3] < lifted_at + ww.w.cfg.window_um + 10000) {
+        ww_drive(&ww, NULL, 0, 1);
+    }
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0x08); /* the leg has not run out */
+    other->absent = false;                                 /* hung again */
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(!ww_drive_until(&ww, NULL, 0, ACE2K_RFID_EV_TAG, 3000, &e));
+    ASSERT_TRUE(!ww.w.l[3].has_tag && !ww.w.l[2].has_tag);
+    struct ace2k_rfid_confirm_trace t;
+    ASSERT_TRUE(ww_trace(&ww, ACE2K_RFID_TRACE_OUTSIDE, &t)); /* the change came elsewhere */
+    ASSERT_EQ(t.lane, 3);
+}
+
+/* The tag on a spool that turns with a lane: in view over the first window_um of each rev_um of
+ * that lane's travel. */
+static void spin_tag(struct ftag *t, int32_t travel_um, int32_t window_um, int32_t rev_um)
+{
+    int32_t at = travel_um % rev_um;
+    if (at < 0) {
+        at += rev_um;
+    }
+    t->absent = (bool)(at >= window_um);
+}
+
+/* Lane 3, set by hand, runs a swap at 50 or 60 mm/s while lane 4 loads.  Lane
+ * 3's tag (a 116 mm window on the shortest spool, 432 mm round) comes and goes on lane 3's time,
+ * so its changes never come twice within the window of lane 4's travel with the tag in view.  It
+ * is never lane 4's. */
+TEST(a_neighbours_tag_turning_fast_is_never_attributed_to_the_loading_lane)
+{
+    for (int32_t speed = 50000; speed <= 60000; speed += 10000) {
+        struct wworld ww;
+        ww_init(&ww);
+        struct ftag *t3 = tag_a(&ww, ub, false);
+        ww.in.insert = 0x0C;
+        ww_steps(&ww, 1);
+        ace2k_rfid_watch_set_by_hand(&ww.w, 2);
+        ww.in.loading = 0x08;
+        ww.own_um_s[3] = 20000;
+        ww.own_um_s[2] = speed;
+        int confirms = 0;
+        for (int i = 0; i < 6000; i++) {
+            spin_tag(t3, ww.in.travel_um[2], 116000, 432000);
+            uint8_t before = ace2k_rfid_watch_confirm_bits(&ww.w);
+            ww_drive(&ww, NULL, 0, 1);
+            if (before == 0 && ace2k_rfid_watch_confirm_bits(&ww.w) != 0) {
+                confirms++;
+            }
+            struct ace2k_rfid_event e;
+            ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
+        }
+        ASSERT_TRUE(confirms > 0); /* lane 4 did try the tag */
+        ASSERT_TRUE(!ww.w.l[3].has_tag);
+    }
+}
+
+/* A tag hung on bay 3 with no strand sits at the edge of the field, and drops
+ * out and back every 5 s, whatever lane 4 does.  Lane 4, loading, reverses for it each time, but
+ * its changes come 45 mm of lane 4's travel apart: it never follows. */
+TEST(a_tag_at_the_edge_dropping_out_and_back_is_not_attributed)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *edge = tag_a(&ww, ub, false);
+    ww.in.insert = 0x08;
+    ww_steps(&ww, 1);
+    ww.in.loading = 0x08;
+    ww.own_um_s[3] = 20000;
+    ww_drive(&ww, NULL, 0, 30);
+    int confirms = 0;
+    for (int i = 0; i < 4000; i++) {
+        if (i % 500 == 0) {
+            edge->absent = (bool)!edge->absent;
+        }
+        uint8_t before = ace2k_rfid_watch_confirm_bits(&ww.w);
+        ww_drive(&ww, NULL, 0, 1);
+        if (before == 0 && ace2k_rfid_watch_confirm_bits(&ww.w) != 0) {
+            confirms++;
+        }
+        struct ace2k_rfid_event e;
+        ASSERT_TRUE(!ww_next(&ww, ACE2K_RFID_EV_TAG, &e));
+    }
+    ASSERT_TRUE(confirms > 0);
+    ASSERT_TRUE(!ww.w.l[3].has_tag);
+}
+
+/* Lane 1 moves alone outside a load, with tag t in view, and lane 2 has a strand in. */
+static void passive_lane1(struct wworld *ww, struct ftag **t)
+{
+    *t = tag_b(ww, ua, true);
+    ww->in.insert = 0x03;
+    ww_steps(ww, 1);
+    ww->in.moving = 0x01;
+    ww_steps(ww, 30);
+}
+
+/* The tag leaves while lane 2 moves too.  Lane 2's spool may have turned it
+ * away, so no leave is recorded for lane 1, and its return after a full turn of lane 1, lane 2
+ * still by then, is nobody's. */
+TEST(a_leave_while_the_neighbour_moves_is_not_recorded_for_passive_watching)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *t = NULL;
+    passive_lane1(&ww, &t);
+    ww.in.moving = 0x03;
+    t->absent = true;
+    ww_steps(&ww, 40); /* it left, both lanes moving */
+    ASSERT_EQ(ww.w.r[ACE2K_RFID_READER_B].gone_count, 0);
+    ww.in.moving = 0x01;
+    ww_travel(&ww, 0, ACE2K_RFID_PASSIVE_MIN_UM, 30);
+    t->absent = false;
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(!ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
+    ASSERT_TRUE(!ww.w.l[0].has_tag);
+}
+
+/* The tag leaves with lane 2 still, then lane 2 moves before it comes back.
+ * Lane 2's motion drops lane 1's record, so the return, lane 2 still again, is nobody's. */
+TEST(the_neighbour_moving_between_the_leave_and_the_return_drops_the_record)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *t = NULL;
+    passive_lane1(&ww, &t);
+    t->absent = true;
+    ww_steps(&ww, 40); /* it left, lane 2 still */
+    ASSERT_EQ(ww.w.r[ACE2K_RFID_READER_B].gone_count, 1);
+    ww.in.moving = 0x03;
+    ww_steps(&ww, 1); /* lane 2 moves for one run */
+    ww.in.moving = 0x01;
+    ASSERT_EQ(ww.w.r[ACE2K_RFID_READER_B].gone_count, 0);
+    ww_travel(&ww, 0, ACE2K_RFID_PASSIVE_MIN_UM, 30);
+    t->absent = false;
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(!ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
+    ASSERT_TRUE(!ww.w.l[0].has_tag);
+}
+
+/* A return after more than cfg.passive_max_um of lane 1's travel is no single
+ * turn of its spool, so it is nobody's; one just within it is lane 1's. */
+TEST(a_return_past_the_passive_maximum_is_nobodys)
+{
+    for (int past = 0; past < 2; past++) {
+        struct wworld ww;
+        ww_init(&ww);
+        struct ftag *t = NULL;
+        passive_lane1(&ww, &t);
+        t->absent = true;
+        ww_steps(&ww, 40); /* it left */
+        int32_t over = past != 0 ? 1000 : -1000;
+        ww_travel(&ww, 0, ww.w.cfg.passive_max_um + over, 30);
+        t->absent = false;
+        struct ace2k_rfid_event e;
+        ASSERT_EQ(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e), past == 0);
+        ASSERT_EQ(ww.w.l[0].has_tag, past == 0);
+    }
+}
+
+/* The host reads lane 1 with motion while it has lane 1 in use.  A candidate
+ * comes into view, but nothing in this watch moves an in-use lane: no confirmation, so the feed
+ * gets no reverse leg.  And a confirmation that runs ends once the lane is in use. */
+TEST(no_confirmation_runs_on_a_lane_the_host_has_in_use)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct lanetag lt = { tag_b(&ww, ua, false), 0, 100000, 216000 };
+    ww.in.insert = 0x01;
+    ww_steps(&ww, 1);
+    ww.in.loading = 0x01; /* the read with motion's search */
+    ww.own_um_s[0] = 20000;
+    for (int i = 0; i < 1500; i++) {
+        ace2k_rfid_watch_set_in_use(&ww.w, 0x01); /* the host's refresh */
+        ww_drive(&ww, &lt, 1, 1);
+        ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0);
+        ASSERT_EQ(ace2k_rfid_watch_confirm_reverse_bits(&ww.w), 0);
+    }
+    ASSERT_TRUE(!ww.w.l[0].has_tag);
+    /* the same without the mask: a confirmation runs; the mask then ends it */
+    struct wworld w2;
+    ww_init(&w2);
+    struct lanetag lt2 = { tag_b(&w2, ua, false), 0, 100000, 216000 };
+    confirm_running_on_lane1(&w2, &lt2);
+    ace2k_rfid_watch_set_in_use(&w2.w, 0x01);
+    ww_drive(&w2, &lt2, 1, 1);
+    ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&w2.w), 0);
+}
+
+/* A load runs at most ACE2K_RFID_CONFIRM_PER_LOAD_MAX confirmations.  A tag at
+ * the edge that never follows would otherwise make the lane go back and forth for the whole load;
+ * past the cap the lane is left to the tie-break.  The next load starts the count again. */
+TEST(a_load_runs_at_most_the_capped_number_of_confirmations)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *edge = tag_a(&ww, ub, false);
+    ww.in.insert = 0x08;
+    ww_steps(&ww, 1);
+    for (int load = 0; load < 2; load++) {
+        ww.in.loading = 0x08;
+        ww.own_um_s[3] = 20000;
+        ww_drive(&ww, NULL, 0, 30);
+        for (int i = 0; i < 9000; i++) {
+            if (i % 500 == 0) {
+                edge->absent = (bool)!edge->absent;
+            }
+            ww_drive(&ww, NULL, 0, 1);
+            if (i >= 7000) { /* the cap is reached by then: no confirmation any more */
+                ASSERT_EQ(ace2k_rfid_watch_confirm_bits(&ww.w), 0);
+            }
+        }
+        ASSERT_EQ(ww.w.l[3].confirms, ACE2K_RFID_CONFIRM_PER_LOAD_MAX);
+        ww.in.loading = 0; /* the load ends */
+        ww.own_um_s[3] = 0;
+        ww_drive(&ww, NULL, 0, 5);
+    }
+}
+
+/* Passive watching measures the travel both ways: a lane rolled back a full turn (a host rollback)
+ * gets its tag that leaves and comes back, as one fed forward does. */
+TEST(a_return_after_a_full_turn_backwards_is_the_lanes)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    struct ftag *t = NULL;
+    passive_lane1(&ww, &t);
+    ww.in.reverse = 0x01;
+    t->absent = true;
+    ww_steps(&ww, 40); /* it left */
+    ww_travel(&ww, 0, -ACE2K_RFID_PASSIVE_MIN_UM, 30);
+    t->absent = false;
+    struct ace2k_rfid_event e;
+    ASSERT_TRUE(ww_until(&ww, ACE2K_RFID_EV_TAG, 30, &e));
+    ASSERT_EQ(e.lane, 0);
 }
 
 // NOLINTNEXTLINE(readability-identifier-naming)

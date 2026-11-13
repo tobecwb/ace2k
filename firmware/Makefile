@@ -390,9 +390,9 @@ TOOLS_PY             := tools
 TOOLS_XENON          := --max-absolute C --max-modules A --max-average A
 TOOLS_COVERAGE_MIN   := 97.0
 # The C core's floors are the last measurement of `make coverage` rounded down to 0.1 (lines
-# 98.46 %, branches 95.64 %).  Raise them when tests add coverage; never lower them.
-C_COVERAGE_LINES    := 98.4
-C_COVERAGE_BRANCHES := 95.6
+# 98.59 %, branches 95.76 %).  Raise them when tests add coverage; never lower them for a gap.
+C_COVERAGE_LINES    := 98.5
+C_COVERAGE_BRANCHES := 95.7
 
 .PHONY: quality
 quality:

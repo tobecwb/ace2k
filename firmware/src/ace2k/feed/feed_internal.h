@@ -45,6 +45,13 @@ static inline bool ace2k_feed_mode_rewinds(uint8_t mode)
     return (bool)(mode == ACE2K_FEED_ROLLING_BACK || mode == ACE2K_FEED_UNLOADING);
 }
 
+/* The phase of a load that its supervisors judge.  A leg of a confirmation belongs to the phase it
+ * interrupted, the pull or the search, so it ends as that phase would. */
+static inline uint8_t ace2k_feed_load_phase(const struct ace2k_feed_lane *l)
+{
+    return l->sub == ACE2K_FEED_SUB_CONFIRM ? l->resume_sub : l->sub;
+}
+
 /* feed.c: a mode the feed entered whose motor may run.  That is every mode but idle and error. */
 bool ace2k_feed_mode_runs(uint8_t mode);
 
@@ -165,7 +172,8 @@ void ace2k_feed_follow_step(struct ace2k_feed *self, uint8_t lane,
                             const struct ace2k_feed_inputs *in, uint32_t now_ms);
 
 /* feed_assist.c: the assist commands, which are the forward assist, the reverse assist and the
- * follow.  The speed must be within the lane's bounds, else the answer is bounds.  The lane is
+ * follow.  The speed must be within the lane's bounds (ace2k_lane_speed_in_bounds), else the answer
+ * is bounds.  The lane is
  * armed.  Its first move starts at once when the readings of the last tick ask for one.  That is a
  * burst on taut with no shared full, or a take-up on this lane's full.  The follow takes either. */
 enum ace2k_feed_refusal ace2k_feed_assist_start(struct ace2k_feed *self, uint8_t lane,
@@ -220,8 +228,22 @@ bool ace2k_feed_load_move_done(struct ace2k_feed *self, uint8_t lane,
                                const struct ace2k_feed_inputs *in, uint32_t now_ms);
 
 /* feed_load.c: a start given to `lane` makes the search of any other lane yield (the tag search's
- * rule 4). */
+ * rule 4).  A lane in use does not: its follow or assist is a print's, and the search goes on. */
 void ace2k_feed_yield_others(struct ace2k_feed *self, uint8_t lane);
+/* feed_load.c: a host start, or a strand going in, on the lane ends a tie-break on the other lane
+ * of its reader, whether the lane is in use or not. */
+void ace2k_feed_yield_neighbour_tiebreak(struct ace2k_feed *self, uint8_t lane);
+
+/* feed_load.c: the tie-break on the lane goes back at once to where it began, ending as a yield.
+ * Any phase of the tip snag ends first.  Unlike the yield, it does not wait for a read session to
+ * release the lane.  A tie-break already on its way back goes on. */
+void ace2k_feed_load_preempt(struct ace2k_feed *self, uint8_t lane, uint32_t now_ms);
+
+/* The unit's own read with motion, the tie-break, runs on the lane, going or on its way back. */
+static inline bool ace2k_feed_tiebreak_on(const struct ace2k_feed_lane *l)
+{
+    return (bool)(l->mode == ACE2K_FEED_LOADING && l->autonomous);
+}
 
 /* feed_assist.c: the tick of the autonomous behaviours for one lane, after the lane result and the
  * link were handled.  First the automatic load on the insert's rising edge.  rose is that edge, on
@@ -268,6 +290,10 @@ bool ace2k_feed_snag_on_result(struct ace2k_feed *self, uint8_t lane,
  * and the tolerance unused. */
 bool ace2k_feed_snag_reverse(struct ace2k_feed *self, uint8_t lane,
                              const struct ace2k_feed_inputs *in, uint32_t now_ms);
+
+/* feed_snag.c: the free phase that a reverse leg of a confirmation set aside goes on, with a fresh
+ * window, as a forward move of the load starts. */
+void ace2k_feed_snag_free_resume(struct ace2k_feed *self, uint8_t lane);
 
 /* feed_load.c: the phase that the watch of the read with motion interrupted, its tag search, goes
  * on for what is left of it.  This is the snag's resume in a load.  A load from the bay never makes

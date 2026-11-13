@@ -126,7 +126,7 @@ BASE_FMT_FORWARD = "ace2k_feed_base lane=%c rate_um_s=%u clear=%c"
 REVERSE_CONSTANT = "ACE2K_FEED_FF_REVERSE"
 # The version of the host interface below. It goes up on any change a caller must check for,
 # including a new call or a new mode. docs/protocol.md, "Host interface", lists each version.
-API_VERSION = 28
+API_VERSION = 29
 
 
 class Move:

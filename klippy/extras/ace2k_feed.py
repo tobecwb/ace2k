@@ -757,17 +757,19 @@ class Ace2kFeed(FeedConnect, FeedMotion):
 
     def cmd_ACEK_ASSIST(self, gcmd: GCodeCommand) -> None:
         # SOFT=1 is for print hooks. A lane that cannot be armed is named in a message and no error
-        # is raised, so the print goes on. Disarming (OFF=1) works the same with or without it.
+        # is raised, so the print goes on. A busy lane is not waited for. Disarming (OFF=1) works
+        # the same with or without it.
         if not gcmd.get_int("SOFT", 0, minval=0, maxval=1) or gcmd.get_int("OFF", 0):
             self._assist(gcmd)
             return
         index = self._lane(gcmd)
         try:
-            self._assist(gcmd)
+            self._assist(gcmd, retry=False)
         except gcmd.error as e:
             gcmd.respond_info(f"ace2k: lane {index + 1} not armed — {unprefixed(e)}")
 
-    def _assist(self, gcmd: GCodeCommand) -> None:
+    def _assist(self, gcmd: GCodeCommand, *, retry: bool = True) -> None:
+        """Arm or disarm the assist. ``retry`` False (SOFT=1) answers a busy refusal at once."""
         self._require(gcmd)
         index = self._lane(gcmd)
         if gcmd.get_int("OFF", 0):
@@ -783,7 +785,7 @@ class Ace2kFeed(FeedConnect, FeedMotion):
             why = self.not_active_text(index)
             if why is not None:
                 raise gcmd.error(why)
-        self._start(gcmd, index, Start(mode, 0.0, speed), False)
+        self._start(gcmd, index, Start(mode, 0.0, speed), False, retry=retry)
 
     def lane_unavailable(self, index: int, allow: tuple[str, ...] | None = ("idle",)) -> str | None:
         """Return the reason why the lane takes no new motion, or None if it does.

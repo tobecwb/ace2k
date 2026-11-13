@@ -155,6 +155,11 @@ enum ace2k_feed_refusal ace2k_feed_start_tip(struct ace2k_feed *self, uint8_t la
         self->grip_um[lane] = 0;
         return ACE2K_FEED_ACCEPTED;
     }
+    if (lane < ACE2K_LANE_COUNT && ace2k_feed_tiebreak_on(&self->l[lane])) {
+        /* The unit's own tie-break goes back, and the host sends the start again, as a read. */
+        ace2k_feed_load_preempt(self, lane, now_ms);
+        return ACE2K_FEED_REFUSED_BUSY;
+    }
     enum ace2k_feed_refusal verdict = ace2k_feed_start_refusal(self, lane, cmd);
     if (verdict != ACE2K_FEED_ACCEPTED) {
         return verdict;
@@ -198,6 +203,7 @@ enum ace2k_feed_refusal ace2k_feed_start_tip(struct ace2k_feed *self, uint8_t la
         l->last_free_tip = tip;
         l->stop_on = stop;                   /* the entry cleared the mode's: this start's own */
         ace2k_feed_yield_others(self, lane); /* a start on this lane: a search elsewhere yields */
+        ace2k_feed_yield_neighbour_tiebreak(self, lane); /* in use or not */
     }
     return verdict;
 }

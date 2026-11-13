@@ -323,6 +323,7 @@ def test_the_ready_seeding_takes_the_cache_or_forgets() -> None:
     with open(rfid.cache_path, "w") as f:
         json.dump({uid_hex: {"format": "bambu", "uid": uid_hex}}, f)
     rfid.cache = rfid._load_cache()
+    by_hand_state(mcu, 0)  # the connect's answer: no lane set by hand
     fire_ready(printer)
     assert rfid.lane_status(0)["source"] == "cached"
     forgets = [data for fmt, data in mcu.commands if fmt.startswith("ace2k_rfid_forget")]
@@ -532,6 +533,50 @@ def test_a_read_with_motion_logs_its_search_and_no_tag_not_a_load(
     lines = log_lines(caplog)
     assert lines.count(SEARCH_LINE) == 1
     assert not [line for line in lines if "loaded (loading)" in line]
+
+
+def read_sends(mcu: FakeMcu) -> int:
+    return len([q for q in mcu.queries if q[0] == "ace2k_rfid_read"])
+
+
+def test_a_read_with_motion_refused_busy_is_sent_again_every_quarter_second_until_taken() -> None:
+    """The unit refuses a read with motion as busy while its own tie-break runs, and sends the
+    tie-break back: the G-code sends the read again 0.25 s later, until the unit takes it."""
+    busy = {"lane": 0, "accepted": 0, "reason": 1}
+    module, printer, mcu = make_rfid(
+        {"ace2k_rfid_read": [busy, busy, {"lane": 0, "accepted": 1, "reason": 0}]}
+    )
+    start = printer.reactor.now
+    gcmd = FakeGcmd({"LANE": "1", "MOVE": "1", "WAIT": "0"})
+    printer.lookup_object("gcode").commands["ACEK_RFID_READ"](gcmd)
+    assert read_sends(mcu) == 3
+    assert printer.reactor.now == start + 0.5
+    assert gcmd.lines == ["ace2k: lane 1 tag read started"]
+    assert rfid_of(module).feed.motion[0].tag_search
+
+
+def test_a_read_with_motion_still_busy_after_30_s_reports_the_refusal() -> None:
+    module, printer, mcu = make_rfid({"ace2k_rfid_read": {"lane": 0, "accepted": 0, "reason": 1}})
+    start = printer.reactor.now
+    with pytest.raises(Exception, match="refused: busy"):
+        printer.lookup_object("gcode").commands["ACEK_RFID_READ"](
+            FakeGcmd({"LANE": "1", "MOVE": "1", "WAIT": "0"})
+        )
+    assert read_sends(mcu) == 121  # at 0 s, then every 0.25 s up to 30 s
+    assert printer.reactor.now == start + 30.0
+    assert not rfid_of(module).feed.motion[0].tag_search
+
+
+def test_a_read_without_motion_or_with_another_refusal_is_not_sent_again() -> None:
+    for move, reason in (("0", 1), ("1", 2)):
+        module, printer, mcu = make_rfid(
+            {"ace2k_rfid_read": {"lane": 0, "accepted": 0, "reason": reason}}
+        )
+        with pytest.raises(Exception, match="refused"):
+            printer.lookup_object("gcode").commands["ACEK_RFID_READ"](
+                FakeGcmd({"LANE": "1", "MOVE": move, "WAIT": "0"})
+            )
+        assert read_sends(mcu) == 1
 
 
 def test_a_read_with_motion_shows_as_a_search_in_the_lanes_last_move() -> None:
@@ -1208,11 +1253,12 @@ def read_anycubic(mcu: FakeMcu, lane: int = 1, session: int = 7) -> None:
 
 
 def restarted(
-    before: Ace2k, states: list[int], uid: bytes = b""
+    before: Ace2k, states: list[int], uid: bytes = b"", mask: int | None = None
 ) -> tuple[Ace2k, FakePrinter, FakeMcu]:
     """A new host after a restart: the lanes file of `before` is in its config directory, and the
     unit answers each lane's state from `states`, a read lane with `uid`. A pending lane is a full
-    bay of a unit that the restart reset."""
+    bay of a unit that the restart reset. `mask`, when given, is the unit's mask of the lanes set
+    by hand, reported before the seeding."""
     answers = [{"lane": i, "state": s, "uid": uid if s == 4 else b""} for i, s in enumerate(states)]
     module, printer, mcu = make_rfid({"ace2k_rfid_lane_query": answers})
     rfid = rfid_of(module)
@@ -1221,6 +1267,8 @@ def restarted(
     rfid.kept = KeptReads(rfid.kept.path, 4, "ace2k", printer.reactor.monotonic)
     for lane in module.lanes:
         lane["insert"] = True
+    if mask is not None:
+        by_hand_state(mcu, mask)
     fire_ready(printer)
     return module, printer, mcu
 
@@ -1321,12 +1369,61 @@ def test_a_forget_or_a_read_with_motion_drops_the_kept_read(params: dict[str, st
     assert rfid_of(module).lane_status(1)["record"] is None
 
 
+def test_a_restored_read_sets_the_lane_by_hand_on_the_unit() -> None:
+    """Bench 2026-11-12: the unit must hold a restored lane defined, or a tag on its neighbour's
+    spool stays ambiguous between the two. The restore sends set by hand, and again at each of the
+    unit's announcements that lacks it."""
+    before, _printer, mcu = make_rfid()
+    read_anycubic(mcu)
+    module, printer, mcu = restarted(before, [0, 1, 0, 0])
+    assert sent_named(mcu, "ace2k_rfid_by_hand lane") == [[1]]
+    assert rfid_of(module).attrib.wanted.keys() == {1}
+    by_hand_state(mcu, 0)
+    assert sent_named(mcu, "ace2k_rfid_by_hand lane") == [[1], [1]]
+
+
+def test_a_lane_the_unit_holds_read_after_a_restart_is_not_set_by_hand() -> None:
+    before, _printer, mcu = make_rfid()
+    read_anycubic(mcu)
+    module, printer, mcu = restarted(before, [0, 4, 0, 0], uid=UID7)
+    assert rfid_of(module).lane_status(1)["source"] == "restored"
+    assert sent_named(mcu, "ace2k_rfid_by_hand lane") == []
+
+
 def test_a_read_lane_after_a_restart_takes_the_cache_not_the_kept_read() -> None:
     before, _printer, mcu = make_rfid()
     read_anycubic(mcu)
     module, printer, mcu = restarted(before, [0, 4, 0, 0], uid=UID4)
     # a UID the cache does not know is forgotten, and so is the kept read
     assert rfid_of(module).lane_status(1)["record"] is None and rfid_of(module).kept.reads == {}
+
+
+def forgets_sent(mcu: FakeMcu) -> list[list[Any]]:
+    return [d for f, d in mcu.commands if f.startswith("ace2k_rfid_forget")]
+
+
+def test_a_read_lane_with_no_record_is_forgotten_unless_the_unit_holds_it_set_by_hand() -> None:
+    """A Klipper restart that kept the unit running: lane 2 is held read with an unknown UID. When
+    the unit holds it set by hand, the user's mark stands and no forget goes out; when not, the
+    lane is forgotten so that its next move reads the tag again."""
+    before, _printer, mcu = make_rfid()
+    read_anycubic(mcu)
+    module, printer, mcu = restarted(before, [0, 4, 0, 0], uid=UID4, mask=0b0010)
+    assert forgets_sent(mcu) == []
+    module, printer, mcu = restarted(before, [0, 4, 0, 0], uid=UID4, mask=0)
+    assert forgets_sent(mcu) == [[1]]
+
+
+def test_the_seeding_forget_waits_for_the_units_mask_when_it_comes_late() -> None:
+    before, _printer, mcu = make_rfid()
+    read_anycubic(mcu)
+    module, printer, mcu = restarted(before, [0, 4, 4, 0], uid=UID4)  # no mask yet
+    assert forgets_sent(mcu) == []
+    assert rfid_of(module).lane_status(1)["record"] is None
+    by_hand_state(mcu, 0b0010)  # lane 2 held set by hand, lane 3 not
+    assert forgets_sent(mcu) == [[2]]
+    by_hand_state(mcu, 0)  # a later report runs nothing again
+    assert forgets_sent(mcu) == [[2]]
 
 
 def test_a_bad_lanes_file_or_entry_keeps_nothing_of_it(caplog: pytest.LogCaptureFixture) -> None:
@@ -1440,3 +1537,436 @@ def test_the_seeding_writes_the_lanes_file_once(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(ace2k_rfid_kept.os, "replace", count)
     fire_ready(printer)
     assert calls == [rfid.kept.path] and set(rfid.kept.reads) == {0, 1}
+
+
+# --- tag attribution: the in-use mask, the set-by-hand bit, the confirmation numbers -------------
+
+NO_ATTRIBUTION = {
+    name: f"Unknown command: {name}"
+    for name in (
+        "ace2k_rfid_in_use",
+        "ace2k_rfid_by_hand",
+        "ace2k_rfid_by_hand_state",
+        "ace2k_rfid_confirm_set",
+        "ace2k_rfid_confirm_set_refused",
+    )
+}
+
+
+def sent_named(mcu: FakeMcu, name: str) -> list[list[Any]]:
+    return [data for fmt, data in mcu.commands if fmt.startswith(name)]
+
+
+def refresh_timer(printer: FakePrinter) -> list[Any]:
+    return next(t for t in printer.reactor.timers if t[0].__name__ == "_refresh")
+
+
+def test_nothing_is_sent_before_the_first_in_use_mask() -> None:
+    module, printer, mcu = make_rfid()
+    assert sent_named(mcu, "ace2k_rfid_in_use") == []
+    assert refresh_timer(printer)[1] == printer.reactor.NEVER
+
+
+def test_the_in_use_mask_goes_out_at_once_and_every_second_and_the_last_one_wins() -> None:
+    module, printer, mcu = make_rfid()
+    rfid = rfid_of(module)
+    rfid.set_in_use(0b0101)
+    assert sent_named(mcu, "ace2k_rfid_in_use") == [[5]]
+    timer = refresh_timer(printer)
+    assert timer[1] == printer.reactor.now + 1.0
+    assert timer[0](timer[1]) == timer[1] + 1.0
+    rfid.set_in_use(0b0010)
+    timer[0](timer[1])
+    assert sent_named(mcu, "ace2k_rfid_in_use") == [[5], [5], [2], [2]]
+    with pytest.raises(ValueError, match="4-bit"):
+        rfid.set_in_use(16)
+
+
+def by_hand_state(mcu: FakeMcu, mask: int) -> None:
+    """The unit's report of the lanes it holds a mark on (bit n = lane n+1)."""
+    mcu.subscriptions["ace2k_rfid_by_hand_state"]({"mask": mask})
+
+
+def by_hand_sends(mcu: FakeMcu) -> int:
+    return len(sent_named(mcu, "ace2k_rfid_by_hand lane"))
+
+
+def test_a_wanted_mark_is_sent_again_at_each_announcement_that_lacks_it() -> None:
+    """ACEK_SPOOL as the strand goes in: the unit has not latched the insert and refuses the first
+    send. Each announcement (every second) that lacks the mark sends it again; once it shows the
+    mark, nothing more is sent. No timer is armed for it."""
+    module, printer, mcu = make_rfid()
+    rfid = rfid_of(module)
+    rfid.set_by_hand(2)
+    assert sent_named(mcu, "ace2k_rfid_by_hand lane") == [[2]]
+    assert refresh_timer(printer)[1] == printer.reactor.NEVER
+    by_hand_state(mcu, 0)  # refused
+    assert by_hand_sends(mcu) == 2
+    by_hand_state(mcu, 0b0100)  # taken
+    by_hand_state(mcu, 0b0100)
+    assert by_hand_sends(mcu) == 2 and rfid.attrib.wanted.keys() == {2}
+    with pytest.raises(ValueError, match="lane"):
+        rfid.set_by_hand(4)
+
+
+def test_a_mark_given_just_before_the_insert_registers_reaches_the_unit() -> None:
+    """ACEK_SPOOL while the strand goes in: the bay still reads empty, and 0.5 s later the insert
+    registers. The mark is sent at once, kept wanted, and sent again until the unit holds it."""
+    module, printer, mcu = make_rfid()
+    rfid = rfid_of(module)
+    module.lanes[1]["insert"] = False
+    rfid.set_by_hand(1)
+    assert sent_named(mcu, "ace2k_rfid_by_hand lane") == [[1]]
+    printer.reactor.now += 0.5
+    module.lanes[1]["insert"] = True
+    by_hand_state(mcu, 0)  # the unit had not taken it yet
+    assert sent_named(mcu, "ace2k_rfid_by_hand lane") == [[1], [1]]
+    by_hand_state(mcu, 0b0010)
+    assert rfid.attrib.wanted.keys() == {1}
+
+
+def test_a_mark_on_an_empty_bay_that_stays_empty_is_dropped_after_5_s() -> None:
+    """A mark asked for a lane whose bay stays empty is dropped once it has been wanted more than
+    5 s: the next strand put in is a new spool, never set by hand by it."""
+    module, printer, mcu = make_rfid()
+    rfid = rfid_of(module)
+    module.lanes[1]["insert"] = False
+    rfid.set_by_hand(1)
+    for _ in range(5):  # one announcement a second, up to 5 s: still wanted, sent again
+        printer.reactor.now += 1.0
+        by_hand_state(mcu, 0)
+    assert rfid.attrib.wanted.keys() == {1} and by_hand_sends(mcu) == 6
+    printer.reactor.now += 1.0
+    by_hand_state(mcu, 0)
+    assert rfid.attrib.wanted == {} and by_hand_sends(mcu) == 6
+    module.lanes[1]["insert"] = True  # a new strand
+    printer.reactor.now += 1.0
+    by_hand_state(mcu, 0)
+    assert by_hand_sends(mcu) == 6
+
+
+def test_a_wanted_mark_whose_bit_clears_is_no_longer_wanted() -> None:
+    """The unit clears a mark when its strand leaves, also when the spool is swapped between two
+    of the host's looks: the host stops wanting it, and never gives it to the new spool, not even
+    after a connect."""
+    module, printer, mcu = make_rfid()
+    rfid = rfid_of(module)
+    rfid.set_by_hand(1)
+    rfid.set_by_hand(2)
+    by_hand_state(mcu, 0b0110)
+    by_hand_state(mcu, 0b0100)  # lane 2's strand left
+    assert rfid.attrib.wanted.keys() == {2}
+    by_hand_state(mcu, 0)
+    assert rfid.attrib.wanted == {}
+    sends = by_hand_sends(mcu)
+    by_hand_state(mcu, 0)
+    mcu.config_callback()  # a connect
+    by_hand_state(mcu, 0)
+    assert by_hand_sends(mcu) == sends
+
+
+def test_a_mark_the_unit_holds_and_the_host_did_not_ask_for_is_left_alone() -> None:
+    """Klipper started again and forgot its wants; the unit kept two marks, whose strands never
+    left. Nothing is sent and nothing cleared: the unit keeps them."""
+    module, printer, mcu = make_rfid()
+    rfid = rfid_of(module)
+    by_hand_state(mcu, 0b1001)
+    assert rfid.attrib.wanted == {} and rfid.attrib.held == 0b1001
+    assert by_hand_sends(mcu) == 0 and forgets_sent(mcu) == []
+
+
+def test_forget_ends_the_want_and_a_late_announcement_does_not_bring_it_back() -> None:
+    """ACEK_RFID_FORGET (the U1's Read tag) clears the unit's mark too, and the host stops wanting
+    it: an announcement sent before the forget arrived, with the old bit set, changes nothing."""
+    module, printer, mcu = make_rfid()
+    rfid = rfid_of(module)
+    rfid.set_by_hand(1)
+    by_hand_state(mcu, 0b0010)
+    printer.lookup_object("gcode").commands["ACEK_RFID_FORGET"](FakeGcmd({"LANE": "2"}))
+    by_hand_state(mcu, 0b0010)  # sent before the forget arrived
+    by_hand_state(mcu, 0)  # the forget's effect
+    assert rfid.attrib.wanted == {} and by_hand_sends(mcu) == 1
+
+
+def test_at_a_connect_a_mark_the_unit_lacks_is_sent_again_and_one_it_holds_is_not() -> None:
+    """A connect after a reset of the unit: the first announcement lacks the mark, which is sent
+    again. A RESTART that kept the unit: the announcement shows it, and nothing is sent. A mark
+    set before the connect waits for the first announcement."""
+    module, printer, mcu = make_rfid()
+    rfid = rfid_of(module)
+    rfid.set_by_hand(0)
+    by_hand_state(mcu, 0b0001)
+    mcu.config_callback()
+    by_hand_state(mcu, 0b0001)
+    assert sent_named(mcu, "ace2k_rfid_by_hand lane") == [[0]]
+    mcu.config_callback()  # the unit reset: it holds no mark
+    by_hand_state(mcu, 0)
+    assert sent_named(mcu, "ace2k_rfid_by_hand lane") == [[0], [0]]
+
+    module, printer, mcu = make(
+        dict(RESPONSES, ace2k_rfid_read={"lane": 0, "accepted": 1, "reason": 0})
+    )
+    rfid = rfid_of(module)
+    rfid.set_in_use(3)
+    rfid.set_by_hand(3)
+    assert refresh_timer(printer)[1] == printer.reactor.NEVER
+    mcu.config_callback()
+    assert not [c for c, _ in mcu.config_cmds if "by_hand" in c]
+    assert refresh_timer(printer)[1] == printer.reactor.now + 1.0  # the mask's resend
+    by_hand_state(mcu, 0)
+    assert sent_named(mcu, "ace2k_rfid_by_hand lane") == [[3]]
+
+
+def confirm_trace(
+    mcu: FakeMcu, lane: int, what: int, travel_um: int, reverse: int, lost: int = 0
+) -> None:
+    mcu.subscriptions["ace2k_rfid_confirm_trace"](
+        {"lane": lane, "what": what, "travel_um": travel_um, "reverse": reverse, "lost": lost}
+    )
+
+
+def test_a_confirmation_trace_is_logged_for_a_counted_and_a_rejected_change(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    module, printer, mcu = make_rfid()
+    with caplog.at_level("INFO"):
+        confirm_trace(mcu, 0, 1, 123456, 1)
+        confirm_trace(mcu, 0, 2, -2000, 0)
+        confirm_trace(mcu, 1, 3, 98000, 0)
+        confirm_trace(mcu, 1, 9, 0, 0)
+    lines = log_lines(caplog)
+    assert "ace2k: lane 1 confirm flip at 123.5 mm (reverse)" in lines
+    assert "ace2k: lane 1 confirm wrong_way at -2.0 mm (forward)" in lines
+    assert "ace2k: lane 2 confirm outside at 98.0 mm (forward)" in lines
+    assert "ace2k: lane 2 confirm 9 at 0.0 mm (forward)" in lines
+    assert not [line for line in lines if "lost" in line]
+
+
+def test_the_confirm_traces_the_unit_lost_are_logged_before_the_next_one(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    module, printer, mcu = make_rfid()
+    with caplog.at_level("INFO"):
+        confirm_trace(mcu, 0, 5, 1000, 0, lost=3)
+    lines = log_lines(caplog)
+    assert lines.index("ace2k: 3 confirm traces lost") < lines.index(
+        "ace2k: lane 1 confirm taken at 1.0 mm (forward)"
+    )
+
+
+def state_report(mcu: FakeMcu, states: tuple[int, int, int, int] = (1, 1, 1, 1)) -> None:
+    """One state report of the unit: a byte per lane (0 unknown, 1 pending)."""
+    mcu.subscriptions["ace2k_rfid_state"]({"state": bytes(states), "field": 0})
+
+
+def test_the_confirmation_numbers_go_out_as_an_init_command_with_the_defaults() -> None:
+    module, printer, mcu = make_rfid()
+    init = [c for c, is_init in mcu.config_cmds if is_init]
+    assert (
+        "ace2k_rfid_confirm_set leg_max_um=150000 speed_um_s=9000"
+        " passive_min_um=300000 follows=1 window_um=30000 passive_max_um=950000" in init
+    )
+    module, printer, mcu = make_rfid(
+        options={
+            "rfid_confirm_leg_mm": 80,
+            "rfid_confirm_speed": 12,
+            "rfid_passive_min_mm": 250.5,
+            "rfid_confirm_follows": 2,
+            "rfid_confirm_window_mm": 20,
+            "rfid_passive_max_mm": 600,
+        }
+    )
+    init = [c for c, is_init in mcu.config_cmds if is_init]
+    assert (
+        "ace2k_rfid_confirm_set leg_max_um=80000 speed_um_s=12000"
+        " passive_min_um=250500 follows=2 window_um=20000 passive_max_um=600000" in init
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("rfid_confirm_leg_mm", 5),
+        ("rfid_confirm_leg_mm", 700),
+        ("rfid_confirm_speed", 5),
+        ("rfid_confirm_speed", 90),
+        ("rfid_passive_min_mm", 40),
+        ("rfid_passive_min_mm", 1100),
+        ("rfid_confirm_follows", 0),
+        ("rfid_confirm_follows", 4),
+        ("rfid_confirm_window_mm", 4),
+        ("rfid_confirm_window_mm", 101),
+        ("rfid_passive_max_mm", 300),
+        ("rfid_passive_max_mm", 2001),
+    ],
+)
+def test_a_confirmation_number_outside_its_range_is_a_config_error(key: str, value: float) -> None:
+    match = {
+        "rfid_confirm_leg_mm": "leg",
+        "rfid_confirm_speed": "speed",
+        "rfid_passive_min_mm": "passive minimum",
+        "rfid_confirm_follows": "follows",
+        "rfid_confirm_window_mm": "window",
+        "rfid_passive_max_mm": "passive.max",
+    }[key]
+    with pytest.raises(Exception, match=f"{match}|{key} out of range"):
+        make_rfid(options={key: value})
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "rfid_confirm_leg_mm",
+        "rfid_confirm_speed",
+        "rfid_passive_min_mm",
+        "rfid_confirm_window_mm",
+        "rfid_passive_max_mm",
+    ],
+)
+@pytest.mark.parametrize("value", ["inf", "nan"])
+def test_an_infinite_or_nan_confirmation_number_is_a_config_error(key: str, value: str) -> None:
+    # a config error naming the value, never a crash on the conversion to the wire
+    with pytest.raises(Exception, match="outside|out of range|finite"):
+        make_rfid(options={key: value})
+
+
+def test_the_tune_gcode_sends_the_new_numbers_and_reports_the_ones_in_force() -> None:
+    module, printer, mcu = make_rfid()
+    run = printer.lookup_object("gcode").commands["ACEK_RFID_TUNE"]
+    g = FakeGcmd({"LEG": "100", "FOLLOWS": "2"})
+    run(g)
+    assert sent_named(mcu, "ace2k_rfid_confirm_set") == [[100000, 9000, 300000, 2, 30000, 950000]]
+    assert g.lines == [
+        "ace2k: tag confirmation sent: leg 100 mm, speed 9 mm/s, passive minimum 300 mm,"
+        " follows 2, window 30 mm, passive maximum 950 mm"
+    ]
+    g = FakeGcmd({})  # no argument: the values in force, sent again
+    run(g)
+    assert "leg 100 mm" in g.lines[0]
+    run(FakeGcmd({"WINDOW": "45", "MAX": "700"}))
+    assert sent_named(mcu, "ace2k_rfid_confirm_set")[-1] == [100000, 9000, 300000, 2, 45000, 700000]
+    for bad in (
+        {"LEG": "5"},
+        {"SPEED": "100"},
+        {"MIN": "20"},
+        {"FOLLOWS": "9"},
+        {"WINDOW": "4"},
+        {"WINDOW": "101"},
+        {"MAX": "300"},
+        {"MAX": "2001"},
+        {"MIN": "700"},
+    ):
+        before = len(sent_named(mcu, "ace2k_rfid_confirm_set"))
+        with pytest.raises(Exception, match="ace2k:"):
+            run(FakeGcmd(bad))
+        assert len(sent_named(mcu, "ace2k_rfid_confirm_set")) == before
+
+
+def test_the_by_hand_gcode_sends_the_lane() -> None:
+    module, printer, mcu = make_rfid()
+    g = FakeGcmd({"LANE": "3"})
+    printer.lookup_object("gcode").commands["ACEK_RFID_BY_HAND"](g)
+    assert sent_named(mcu, "ace2k_rfid_by_hand lane") == [[2]]
+    assert g.lines == ["ace2k: lane 3 tag set by hand"]
+
+
+def test_a_refused_confirmation_set_logs_one_warning(caplog: pytest.LogCaptureFixture) -> None:
+    module, printer, mcu = make_rfid()
+    with caplog.at_level("WARNING"):
+        mcu.subscriptions["ace2k_rfid_confirm_set_refused"](
+            {
+                "leg_max_um": 150000,
+                "speed_um_s": 9000,
+                "passive_min_um": 300000,
+                "follows": 1,
+                "window_um": 30000,
+                "passive_max_um": 950000,
+            }
+        )
+    lines = [r for r in caplog.records if "refused the confirmation" in r.getMessage()]
+    assert len(lines) == 1
+
+
+def test_an_image_without_the_commands_makes_every_call_a_no_op(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("INFO"):
+        module, printer, mcu = make_rfid(lookup_errors=NO_ATTRIBUTION)
+    rfid = rfid_of(module)
+    assert len([r for r in caplog.records if "without tag attribution" in r.getMessage()]) == 1
+    rfid.set_in_use(3)
+    rfid.set_by_hand(1)
+    assert not any(
+        fmt.startswith(("ace2k_rfid_in_use", "ace2k_rfid_by_hand", "ace2k_rfid_confirm"))
+        for fmt, _ in mcu.commands
+    )
+    assert not any(c.startswith("ace2k_rfid_confirm_set") for c, _ in mcu.config_cmds)
+    assert "ace2k_rfid_confirm_set_refused" not in mcu.subscriptions
+    with pytest.raises(Exception, match="no tag"):
+        printer.lookup_object("gcode").commands["ACEK_RFID_TUNE"](FakeGcmd({}))
+
+
+def refused(
+    mcu: FakeMcu,
+    leg: int,
+    speed: int = 9000,
+    passive: int = 300000,
+    follows: int = 1,
+    window: int = 30000,
+    passive_max: int = 950000,
+) -> None:
+    mcu.subscriptions["ace2k_rfid_confirm_set_refused"](
+        {
+            "leg_max_um": leg,
+            "speed_um_s": speed,
+            "passive_min_um": passive,
+            "follows": follows,
+            "window_um": window,
+            "passive_max_um": passive_max,
+        }
+    )
+
+
+def test_a_refused_init_set_leaves_the_view_unknown_and_a_bare_tune_sends_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    module, printer, mcu = make_rfid()
+    with caplog.at_level("WARNING"):
+        refused(mcu, 150000)  # the connect-time set
+    assert "does not know" in caplog.text
+    g = FakeGcmd({})
+    printer.lookup_object("gcode").commands["ACEK_RFID_TUNE"](g)
+    assert "nothing sent" in g.lines[0]
+    assert sent_named(mcu, "ace2k_rfid_confirm_set") == []
+    with pytest.raises(Exception, match="give LEG"):
+        printer.lookup_object("gcode").commands["ACEK_RFID_TUNE"](FakeGcmd({"LEG": "100"}))
+    full = FakeGcmd(
+        {"LEG": "100", "SPEED": "9", "MIN": "300", "FOLLOWS": "1", "WINDOW": "30", "MAX": "950"}
+    )
+    printer.lookup_object("gcode").commands["ACEK_RFID_TUNE"](full)
+    assert sent_named(mcu, "ace2k_rfid_confirm_set") == [[100000, 9000, 300000, 1, 30000, 950000]]
+
+
+def test_a_refused_tune_is_reported_on_the_console_and_a_stale_refusal_changes_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    module, printer, mcu = make_rfid()
+    run = printer.lookup_object("gcode").commands["ACEK_RFID_TUNE"]
+    run(FakeGcmd({"LEG": "100"}))
+    run(FakeGcmd({"LEG": "120"}))
+    with caplog.at_level("WARNING"):
+        refused(mcu, 100000)  # answers the first TUNE, not the last one sent
+    assert "not the last sent" in caplog.text
+    assert rfid_of(module).attrib.view_known
+    refused(mcu, 120000)
+    assert not rfid_of(module).attrib.view_known
+    said = printer.lookup_object("gcode").output
+    assert sum("refused the confirmation numbers" in m for m in said) == 1
+
+
+def test_a_bool_is_not_a_mask_or_a_lane() -> None:
+    module, printer, mcu = make_rfid()
+    with pytest.raises(ValueError, match="mask"):
+        rfid_of(module).set_in_use(True)
+    with pytest.raises(ValueError, match="lane"):
+        rfid_of(module).set_by_hand(False)

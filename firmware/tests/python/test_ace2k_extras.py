@@ -952,6 +952,8 @@ def test_every_gcode_name_is_letters_and_underscores_only() -> None:
         "ACEK_LANE_ACTIVE",
         "ACEK_RFID_READ",
         "ACEK_RFID_FORGET",
+        "ACEK_RFID_BY_HAND",
+        "ACEK_RFID_TUNE",
         "ACEK_DRY",
         "ACEK_DRY_STOP",
         "ACEK_DRY_CLEAR",

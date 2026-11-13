@@ -540,7 +540,7 @@ def test_start_move_free_tip_sends_the_sixth_argument() -> None:
     assert mcu.queries[-1][1][5] == 0
     feed.start_move(0, "rollback", 10.0, 40.0, free_tip=True)  # read by the unit since 14
     assert mcu.queries[-1][1][5] == 1
-    assert feed.API_VERSION == 28
+    assert feed.API_VERSION == 29
 
 
 def test_a_refusal_is_a_gcode_error_naming_the_reason() -> None:
@@ -562,7 +562,8 @@ def test_a_soft_assist_names_a_refusal_instead_of_raising() -> None:
     # without SOFT the unit's refusal is the G-code error, as for every start
     with pytest.raises(Exception, match="lane 2 assist refused: busy"):
         feed.cmd_ACEK_ASSIST(FakeGcmd({"LANE": "2"}))
-    # with SOFT=1 the same refusal is a line naming the lane and the reason, and no error
+    # with SOFT=1 the same refusal is a line naming the lane and the reason, and no error; a print
+    # hook never waits, so a busy is not sent again
     sent = len(mcu.sent)
     gcmd = FakeGcmd({"LANE": "2", "SOFT": "1"})
     feed.cmd_ACEK_ASSIST(gcmd)
@@ -1591,7 +1592,7 @@ def test_feed_snag_keys_and_units_are_the_documented_ones() -> None:
         "snag_rest_ms": 500,
         "snag_free_mm": 50.0,
     }
-    assert ace2k_feed.API_VERSION == 28
+    assert ace2k_feed.API_VERSION == 29
 
 
 def test_a_snag_lag_at_or_above_the_tolerance_is_a_config_error() -> None:
@@ -2519,13 +2520,13 @@ def test_an_image_without_the_tail_refuses_only_the_follow_with_the_flash_line()
 
 
 def test_api_version() -> None:
-    assert ace2k_feed.API_VERSION == 28
+    assert ace2k_feed.API_VERSION == 29
 
 
 def test_the_feed_object_carries_the_api_version() -> None:
     # a caller holds printer.lookup_object("ace2k").feed, not the module
     module, printer, mcu = make_feed(dict(RESPONSES))
-    assert feed_of(module).API_VERSION == ace2k_feed.API_VERSION == 28
+    assert feed_of(module).API_VERSION == ace2k_feed.API_VERSION == 29
 
 
 def test_start_move_returns_a_move_completed_by_its_final_event() -> None:
@@ -4169,3 +4170,18 @@ def test_the_wait_of_an_unload_counts_the_clear_as_a_move_of_its_own(
     )
     mcu.config_callback()
     assert feed_of(module).move_wait_s(0, 950, 70, reverse=True) == pytest.approx(30.40, abs=0.005)
+
+
+def test_the_feed_task_sends_its_events_before_its_state_report() -> None:
+    # Bench 2026-11-12: a report due on the pass that ended a move went out before the move's final
+    # event, so the host saw the lane idle without it and counted the start over. The task sends
+    # the events first, and the report only once none is left behind it (feed_cmds.c).
+    src = pathlib.Path(__file__).parents[2] / "src" / "ace2k" / "feed" / "feed_cmds.c"
+    text = src.read_text()
+    body = text[
+        text.index("void ace2k_feed_task(void)") : text.index("DECL_TASK(ace2k_feed_task);")
+    ]
+    events = body.index("ace2k_feed_peek_event(")
+    report = body.index("ace2k_report_try(&ace2k_feed_report_due, report)")
+    assert events < report
+    assert "ace2k_feed_has_events(" in body[events:report]  # nothing left behind the report

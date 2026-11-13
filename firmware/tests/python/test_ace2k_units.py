@@ -1623,7 +1623,7 @@ def test_a_remap_drops_the_active_lane_only_when_it_left_its_changed_group() -> 
 
 
 def test_the_host_interface_version() -> None:
-    assert ace2k_feed.API_VERSION == 28
+    assert ace2k_feed.API_VERSION == 29
 
 
 # --- the commands the core prints for a lane ----------------------------------------------------

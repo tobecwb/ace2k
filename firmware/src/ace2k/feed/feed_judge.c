@@ -47,8 +47,9 @@ static bool take_up_waits(struct ace2k_feed_lane *l, uint32_t now_ms)
 
 /* The modes that push the filament toward the head.  The buffer full while their motor runs is a
  * jam ahead (the tick, below). */
-static bool pushes_toward_head(uint8_t mode, uint8_t sub)
+static bool pushes_toward_head(const struct ace2k_feed_lane *l)
 {
+    uint8_t mode = l->mode;
     if (mode == ACE2K_FEED_FEEDING) {
         return true;
     }
@@ -58,10 +59,12 @@ static bool pushes_toward_head(uint8_t mode, uint8_t sub)
      * The return moves away from it too.  After a reacquire that reversed below the return point,
      * the return moves forward to that point instead.  That is at most the length of the reacquire,
      * over filament that the pull already fed (feed_load.c, begin_return).  A pause and the settle
-     * move nothing. */
+     * move nothing.  A leg of a confirmation counts as the phase it interrupted; only its forward
+     * legs push toward the head, so the callers also check the lane's direction. */
     if (mode != ACE2K_FEED_LOADING) {
         return false;
     }
+    uint8_t sub = ace2k_feed_load_phase(l);
     if (sub == ACE2K_FEED_SUB_MOVING) {
         return true;
     }
@@ -218,7 +221,7 @@ bool ace2k_feed_block(struct ace2k_feed *self, uint8_t lane, uint32_t now_ms)
 {
     const struct ace2k_feed_lane *l = &self->l[lane];
     if (l->mode == ACE2K_FEED_LOADING) {
-        if (l->sub != ACE2K_FEED_SUB_MOVING) {
+        if (ace2k_feed_load_phase(l) != ACE2K_FEED_SUB_MOVING) {
             return false;
         }
     } else if (l->mode != ACE2K_FEED_FEEDING) {
@@ -261,7 +264,7 @@ void ace2k_feed_on_trip(struct ace2k_feed *self, uint8_t lane, enum ace2k_feed_t
             return; /* the obstacle of a feed or of a load's pull: blocked */
         }
         if (self->l[lane].mode == ACE2K_FEED_LOADING &&
-            self->l[lane].sub == ACE2K_FEED_SUB_SEARCH) {
+            ace2k_feed_load_phase(&self->l[lane]) == ACE2K_FEED_SUB_SEARCH) {
             /* The tag search: the obstacle return to the parking point, never an error. */
             ace2k_feed_load_search_return(self, lane, now_ms);
             return;
@@ -291,17 +294,16 @@ void ace2k_feed_on_trip(struct ace2k_feed *self, uint8_t lane, enum ace2k_feed_t
 bool ace2k_feed_full_ahead(const struct ace2k_feed *self, uint8_t lane,
                            const struct ace2k_feed_inputs *in)
 {
-    if (!pushes_toward_head(self->l[lane].mode, self->l[lane].sub) ||
-        !ace2k_feed_lane_full(in, lane)) {
+    if (!pushes_toward_head(&self->l[lane]) || !ace2k_feed_lane_full(in, lane)) {
         return false;
     }
-    return ace2k_lane_is_moving(self->lane, lane);
+    return (bool)(ace2k_lane_is_moving(self->lane, lane) &&
+                  !ace2k_lane_is_reverse(self->lane, lane));
 }
 
 bool ace2k_feed_pushing_ahead(const struct ace2k_feed *self, uint8_t lane)
 {
-    if (!pushes_toward_head(self->l[lane].mode, self->l[lane].sub) ||
-        !ace2k_lane_is_moving(self->lane, lane)) {
+    if (!pushes_toward_head(&self->l[lane]) || !ace2k_lane_is_moving(self->lane, lane)) {
         return false;
     }
     return (bool)!ace2k_lane_is_reverse(self->lane, lane);

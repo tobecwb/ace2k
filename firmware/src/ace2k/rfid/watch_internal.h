@@ -1,4 +1,4 @@
-/* What: the seam between watch.c, watch_session.c and watch_attrib.c.
+/* What: the seam between watch.c, watch_session.c, watch_attrib.c and watch_confirm.c.
  * How: plain functions on struct ace2k_rfid_watch.  None of them is part of the public interface.
  * Depends on: rfid/watch.h. */
 #ifndef ACE2K_RFID_WATCH_INTERNAL_H
@@ -31,11 +31,14 @@ static inline uint8_t ace2k_rfid_watch_unread_state(const struct ace2k_rfid_watc
     return l->loading_last ? (uint8_t)ACE2K_RFID_SEARCHING : (uint8_t)ACE2K_RFID_PENDING;
 }
 
-/* A lane whose tag an inventory may attribute.  The lane has filament in, the link is up, and the
- * lane is pending or searching. */
+/* A lane whose tag an inventory may attribute.  The lane has filament in, the link is up, the lane
+ * is pending or searching, and the host did not set it by hand. */
 static inline bool ace2k_rfid_watch_eligible(const struct ace2k_rfid_watch *self, uint8_t lane)
 {
     uint8_t s = self->l[lane].state;
+    if (self->l[lane].by_hand) {
+        return false;
+    }
     if (!self->in.link_ok || self->in.insert_unknown ||
         !ace2k_rfid_watch_bit(self->in.insert, lane)) {
         return false;
@@ -44,6 +47,23 @@ static inline bool ace2k_rfid_watch_eligible(const struct ace2k_rfid_watch *self
         return true;
     }
     return false;
+}
+
+/* The lane holds this UID: attributed to it in this insertion, and not forgotten. */
+static inline bool ace2k_rfid_watch_holds(const struct ace2k_rfid_watch_lane *l,
+                                          const struct ace2k_iso14443a_tag *t)
+{
+    return (bool)(l->has_tag && ace2k_iso14443a_same_uid(&l->tag, t));
+}
+
+/* The two lane positions are at least lo_um and at most hi_um apart, either way.  Written as
+ * d >= -hi on purpose. */
+static inline bool ace2k_rfid_watch_apart(int32_t a_um, int32_t b_um, int32_t lo_um, int32_t hi_um)
+{
+    int64_t d = (int64_t)a_um - (int64_t)b_um;
+    bool near = (bool)(d <= (int64_t)hi_um && d >= -(int64_t)hi_um);
+    bool far = (bool)(d >= (int64_t)lo_um || d <= -(int64_t)lo_um);
+    return (bool)(near && far);
 }
 
 /* watch.c: the event ring and the state of each lane */
@@ -66,8 +86,30 @@ void ace2k_rfid_watch_close_session(struct ace2k_rfid_watch *self, uint8_t reade
 void ace2k_rfid_watch_step_done(struct ace2k_rfid_watch *self, uint8_t reader, uint32_t now_ms,
                                 bool reset);
 
+/* watch_attrib.c: the UID is one of the n tags of the list */
+bool ace2k_rfid_watch_in_list(const struct ace2k_iso14443a_tag *list, uint8_t n,
+                              const struct ace2k_iso14443a_tag *t);
 /* watch_attrib.c: an inventory ended on the reader */
 void ace2k_rfid_watch_inventory_done(struct ace2k_rfid_watch *self, uint8_t reader,
                                      uint32_t now_ms);
+/* watch_attrib.c: drops the reader's records of UIDs that left while the lane moved */
+void ace2k_rfid_watch_drop_gone(struct ace2k_rfid_watch_reader *rd, uint8_t lane);
+/* watch_attrib.c: the UID is the lane's.  Its session opens, or waits for the reader's. */
+void ace2k_rfid_watch_take(struct ace2k_rfid_watch *self, uint8_t lane,
+                           const struct ace2k_iso14443a_tag *t, uint32_t now_ms);
+
+/* watch_confirm.c: the UID is a candidate of the lane in its load.  A confirmation starts, or waits
+ * while one runs for the other lane.  It returns false when the candidate was refused or ignored:
+ * the lane may not confirm it, the reader is not free, a confirmation already runs on the lane, or
+ * the waiting slot is full. */
+bool ace2k_rfid_watch_confirm_offer(struct ace2k_rfid_watch *self, uint8_t lane,
+                                    const struct ace2k_iso14443a_tag *t);
+/* watch_confirm.c: an inventory ended on the reader, its tracked UIDs brought up to date.  The
+ * confirmation that runs follows the presence of its candidate, and may attribute it. */
+void ace2k_rfid_watch_confirm_inventory(struct ace2k_rfid_watch *self, uint8_t reader,
+                                        uint32_t now_ms);
+/* watch_confirm.c: once per task run, with the new inputs.  It ends a confirmation that can no
+ * longer run, and starts the one that waits when the reader is free. */
+void ace2k_rfid_watch_confirm_step(struct ace2k_rfid_watch *self, uint8_t reader);
 
 #endif

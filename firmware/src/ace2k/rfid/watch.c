@@ -3,7 +3,17 @@
 void ace2k_rfid_watch_init(struct ace2k_rfid_watch *self, struct ace2k_iso14443a *iso,
                            const struct ace2k_rfid_watch_ops *ops, void *ctx)
 {
-    *self = (struct ace2k_rfid_watch){ .iso = iso, .ops = ops, .ctx = ctx };
+    *self = (struct ace2k_rfid_watch){
+        .iso = iso,
+        .ops = ops,
+        .ctx = ctx,
+        .cfg = { .leg_max_um = ACE2K_RFID_CONFIRM_LEG_MAX_UM,
+                 .speed_um_s = ACE2K_RFID_CONFIRM_SPEED_UM_S,
+                 .passive_min_um = ACE2K_RFID_PASSIVE_MIN_UM,
+                 .follows = ACE2K_RFID_CONFIRM_FOLLOWS,
+                 .window_um = ACE2K_RFID_CONFIRM_WINDOW_UM,
+                 .passive_max_um = ACE2K_RFID_PASSIVE_MAX_UM, },
+    };
 }
 
 void ace2k_rfid_watch_push(struct ace2k_rfid_watch *self, const struct ace2k_rfid_event *e)
@@ -88,6 +98,9 @@ static void lane_load_edge(struct ace2k_rfid_watch *self, uint8_t lane,
 {
     struct ace2k_rfid_watch_lane *l = &self->l[lane];
     bool loading = ace2k_rfid_watch_bit(in->loading, lane);
+    if (loading && !l->loading_last) {
+        l->confirms = 0; /* a new load: its own cap of confirmations */
+    }
     if (loading && !l->loading_last &&
         (l->state == ACE2K_RFID_PENDING || l->state == ACE2K_RFID_NO_TAG)) {
         l->seen = false;
@@ -106,6 +119,12 @@ static void lane_load_edge(struct ace2k_rfid_watch *self, uint8_t lane,
 static void lane_update(struct ace2k_rfid_watch *self, uint8_t lane,
                         const struct ace2k_rfid_watch_inputs *in, uint32_t now_ms)
 {
+    if (ace2k_rfid_watch_bit(in->moving, lane)) {
+        /* The neighbour's leaves were measured with this lane still: passive watching needs it
+         * still from the leave to the return. */
+        ace2k_rfid_watch_drop_gone(&self->r[ace2k_rfid_reader_of(lane)],
+                                   ace2k_rfid_neighbour(lane));
+    }
     if (in->insert_unknown) {
         return; /* a frozen reading neither empties a lane nor makes one pending */
     }
@@ -114,6 +133,8 @@ static void lane_update(struct ace2k_rfid_watch *self, uint8_t lane,
             lane_emptied(self, lane, now_ms);
         }
         self->l[lane].loading_last = false;
+        self->l[lane].by_hand = false;
+        ace2k_rfid_watch_drop_gone(&self->r[ace2k_rfid_reader_of(lane)], lane);
         return;
     }
     if (self->l[lane].state == ACE2K_RFID_UNKNOWN) {
@@ -175,6 +196,7 @@ static void field_off(struct ace2k_rfid_watch *self, uint8_t reader)
     }
     self->ops->field_set(self->ctx, reader, false);
     rd->field = false;
+    rd->gone_count = 0; /* a UID's leave is measured within one spell of the field */
     rd->off_pending = self->ops->field_driven(self->ctx, reader);
     if (rd->off_pending) {
         rd->fault = true; /* rule 2: latched, reported through the health mask */
@@ -222,6 +244,7 @@ static void field_on(struct ace2k_rfid_watch *self, uint8_t reader, uint32_t now
     rd->t_last_inventory_ms = now_ms - ACE2K_RFID_POLL_MS + ACE2K_RFID_POWER_UP_MS;
     rd->baseline_polls = 0;
     rd->tracked_count = 0;
+    rd->gone_count = 0;
 }
 
 /* The time limit on the field (rule 2).  It is reached when the field stayed on with no lane of the
@@ -347,6 +370,9 @@ void ace2k_rfid_watch_step(struct ace2k_rfid_watch *self, uint32_t now_ms,
         }
     }
     if (!in->link_ok) {
+        self->in_use_set = false;
+        self->in_use = 0;
+        /* A lane set by hand keeps its mark: only its strand leaving clears it (lane_update). */
         for (uint8_t r = 0; r < ACE2K_RFID_READER_COUNT; r++) {
             if (self->r[r].session_open) {
                 ace2k_rfid_watch_close_session(
@@ -356,18 +382,19 @@ void ace2k_rfid_watch_step(struct ace2k_rfid_watch *self, uint32_t now_ms,
         }
     }
     for (uint8_t r = 0; r < ACE2K_RFID_READER_COUNT; r++) {
+        ace2k_rfid_watch_confirm_step(self, r);
         reader_step(self, r, now_ms, in);
     }
 }
 
 /* A read or no_tag lane goes back to pending.  Its state event answers a read on command that
  * waits.  A pending lane can keep the UID of a session that ended without a read, or wait with a
- * UID for the reader's session.  The forget drops both, so rule 1 stops guarding that UID for the
- * neighbour.  The pending lane stays pending, and no event goes out.  Its lost bit stays for the
- * feed's load, and a read on command that waits stays too: the next inventory answers it.  A
- * searching lane is left alone, so its search still never ends no_tag after it saw its tag.  A
- * forget after the search ends drops its UID.  A reading lane is left alone too, because the steps
- * of its session read the tag that opened it. */
+ * UID for the reader's session.  The forget drops both, so the neighbour's-UID rule stops guarding
+ * that UID for the neighbour.  The pending lane stays pending, and no event goes out.  Its lost
+ * bit stays for the feed's load, and a read on command that waits stays too: the next inventory
+ * answers it.  A searching lane is left alone, so its search still never ends no_tag after it saw
+ * its tag.  A forget after the search ends drops its UID.  A reading lane is left alone too,
+ * because the steps of its session read the tag that opened it. */
 void ace2k_rfid_watch_forget(struct ace2k_rfid_watch *self, uint8_t lane)
 {
     if (lane >= ACE2K_LANE_COUNT) {
@@ -381,6 +408,15 @@ void ace2k_rfid_watch_forget(struct ace2k_rfid_watch *self, uint8_t lane)
     } else if (s == ACE2K_RFID_PENDING) {
         drop_uid(l);
     }
+}
+
+void ace2k_rfid_watch_host_forget(struct ace2k_rfid_watch *self, uint8_t lane)
+{
+    if (lane >= ACE2K_LANE_COUNT) {
+        return;
+    }
+    ace2k_rfid_watch_forget(self, lane);
+    self->l[lane].by_hand = false;
 }
 
 bool ace2k_rfid_watch_lane_busy(const struct ace2k_rfid_watch *self, uint8_t lane)
@@ -405,8 +441,49 @@ enum ace2k_rfid_read_refusal ace2k_rfid_watch_read_with_motion(struct ace2k_rfid
     enum ace2k_rfid_read_refusal r = start(ctx, lane);
     if (r == ACE2K_RFID_READ_OK) {
         ace2k_rfid_watch_forget(self, lane);
+        if (lane < ACE2K_LANE_COUNT) {
+            self->l[lane].confirms = 0; /* the host's read: its own cap of confirmations */
+        }
     }
     return r;
+}
+
+void ace2k_rfid_watch_set_by_hand(struct ace2k_rfid_watch *self, uint8_t lane)
+{
+    /* Whatever the lane's state: right after an insertion the lane may not be pending yet, and
+     * the mark must already stand when its load starts. */
+    if (lane < ACE2K_LANE_COUNT && ace2k_rfid_watch_bit(self->in.insert, lane)) {
+        self->l[lane].by_hand = true;
+    }
+}
+
+uint8_t ace2k_rfid_watch_by_hand_bits(const struct ace2k_rfid_watch *self)
+{
+    uint8_t mask = 0;
+    for (uint8_t lane = 0; lane < ACE2K_LANE_COUNT; lane++) {
+        if (self->l[lane].by_hand) {
+            mask = (uint8_t)(mask | (1U << lane));
+        }
+    }
+    return mask;
+}
+
+void ace2k_rfid_watch_set_in_use(struct ace2k_rfid_watch *self, uint8_t mask)
+{
+    self->in_use = mask;
+    self->in_use_set = true;
+    self->t_in_use_ms = self->now_ms;
+}
+
+bool ace2k_rfid_watch_in_use(const struct ace2k_rfid_watch *self, uint8_t *mask)
+{
+    if (!self->in_use_set ||
+        ace2k_time_since(self->now_ms, self->t_in_use_ms) > ACE2K_RFID_IN_USE_STALE_MS) {
+        *mask = 0;
+        return false;
+    }
+    *mask = self->in_use;
+    return true;
 }
 
 uint8_t ace2k_rfid_watch_state(const struct ace2k_rfid_watch *self, uint8_t lane)

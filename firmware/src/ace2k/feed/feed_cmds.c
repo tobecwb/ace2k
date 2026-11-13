@@ -167,7 +167,10 @@ static void tick(void *ctx, uint32_t now_ms)
     in.insert_unknown = (bool)!ace2k_sensors_insert_known(ace2k_feed_sensors); // the scan stopped
     in.link_ok = ace2k_lane_binding_link_ok(); // the lane tick's sample, one per tick
 #if CONFIG_ACE2K_RFID_READ
-    ace2k_rfid_binding_feed_bits(&in.tag_hold, &in.tag_read, &in.tag_lost);
+    ace2k_rfid_binding_feed_bits(&in.tag_hold, &in.tag_read, &in.tag_lost, &in.tag_confirm,
+                                 &in.tag_confirm_rev, &in.tag_confirm_epoch);
+    in.in_use_valid = ace2k_rfid_binding_in_use(&in.in_use); // the mask 0 while not valid
+    in.tag_by_hand = ace2k_rfid_binding_by_hand();
 #endif
     ace2k_feed_tick(&ace2k_feed_instance, now_ms, &in);
 #if CONFIG_ACE2K_LED
@@ -251,17 +254,13 @@ void ace2k_feed_task(void)
     if (!sched_check_wake(&ace2k_feed_wake)) {
         return;
     }
-    // The due report goes first, so that a tick of events does not starve it.  Then the events go,
-    // oldest first.  Each is tried from the ring's tail, and dropped from it only once queued.  So
-    // an event that does not fit stays for the next tick, with everything behind it.  The task
-    // never wakes itself.  The tick brings it back while the ring holds anything or the report is
-    // pending.
-    if (ace2k_feed_report_due) {
-        (void)ace2k_report_try(&ace2k_feed_report_due, report);
-    }
-    if (ace2k_feed_ff_report_due) {
-        (void)ace2k_report_try(&ace2k_feed_ff_report_due, report_ff);
-    }
+    // The events go first, oldest first.  Each is tried from the ring's tail, and dropped from it
+    // only once queued.  So an event that does not fit stays for the next tick, with everything
+    // behind it.  The due reports go once the ring is empty: a report shows the modes after every
+    // event in the ring, so it must not reach the host before them (a lane reported idle before
+    // the final event of its move).  The ring drains at every pass that has room, so the report
+    // waits at most for the events of a tick.  The task never wakes itself.  The tick brings it
+    // back while the ring holds anything or a report is pending.
     struct ace2k_feed_event ev;
     while (ace2k_feed_peek_event(&ace2k_feed_instance, &ev)) {
         if (!ACE2K_SENDF(ACE2K_FEED_EVENT_FMT, ev.lane, ev.kind, ev.mode, ev.motor_um,
@@ -269,6 +268,15 @@ void ace2k_feed_task(void)
             break;
         }
         ace2k_feed_drop_event(&ace2k_feed_instance);
+    }
+    if (ace2k_feed_has_events(&ace2k_feed_instance)) {
+        return;
+    }
+    if (ace2k_feed_report_due) {
+        (void)ace2k_report_try(&ace2k_feed_report_due, report);
+    }
+    if (ace2k_feed_ff_report_due) {
+        (void)ace2k_report_try(&ace2k_feed_ff_report_due, report_ff);
     }
 }
 DECL_TASK(ace2k_feed_task);
@@ -691,16 +699,25 @@ void ace2k_feed_cmd_ff_query(uint32_t *args)
 }
 DECL_COMMAND(ace2k_feed_cmd_ff_query, "ace2k_feed_ff_query rest_ticks=%u");
 
-void ace2k_feed_binding_rfid_bits(uint8_t *loading, uint8_t *exhausted)
+void ace2k_feed_binding_rfid_bits(uint8_t *loading, uint8_t *exhausted, uint8_t *confirm_out,
+                                  uint8_t *confirm_out_epoch)
 {
     ensure_ready();
     *loading = 0;
     *exhausted = 0;
+    *confirm_out = 0;
+    *confirm_out_epoch = 0;
     for (uint8_t lane = 0; lane < ACE2K_LANE_COUNT; lane++) {
+        if (ace2k_feed_instance.l[lane].confirm_out) {
+            *confirm_out |= (uint8_t)(1U << lane);
+        }
+        if (ace2k_feed_instance.l[lane].confirm_epoch) {
+            *confirm_out_epoch |= (uint8_t)(1U << lane);
+        }
         if (ace2k_feed_mode(&ace2k_feed_instance, lane) == ACE2K_FEED_LOADING) {
             *loading |= (uint8_t)(1U << lane);
         }
-        if (ace2k_feed_search_end(&ace2k_feed_instance, lane) == ACE2K_FEED_SEARCH_LENGTH) {
+        if (ace2k_feed_search_exhausted(&ace2k_feed_instance, lane)) {
             *exhausted |= (uint8_t)(1U << lane);
         }
     }
@@ -716,6 +733,30 @@ enum ace2k_feed_refusal ace2k_feed_binding_search_start(uint8_t lane, uint8_t se
     return r;
 }
 
+enum ace2k_feed_refusal ace2k_feed_binding_tiebreak_start(uint8_t lane)
+{
+    ensure_ready();
+    irqstatus_t flag = irq_save();
+    enum ace2k_feed_refusal r =
+        ace2k_feed_tiebreak_start(&ace2k_feed_instance, lane, ace2k_tick_now_ms());
+    irq_restore(flag);
+    return r;
+}
+
+uint8_t ace2k_feed_binding_idle_bits(void)
+{
+    ensure_ready();
+    uint8_t idle = 0;
+    irqstatus_t flag = irq_save();
+    for (uint8_t lane = 0; lane < ACE2K_LANE_COUNT; lane++) {
+        if (ace2k_feed_mode(&ace2k_feed_instance, lane) == ACE2K_FEED_IDLE) {
+            idle |= (uint8_t)(1U << lane);
+        }
+    }
+    irq_restore(flag);
+    return idle;
+}
+
 bool ace2k_feed_binding_search_retry(uint8_t lane, uint8_t seq)
 {
     ensure_ready();
@@ -723,6 +764,14 @@ bool ace2k_feed_binding_search_retry(uint8_t lane, uint8_t seq)
     bool retry = ace2k_feed_search_retry(&ace2k_feed_instance, lane, seq, ace2k_tick_now_ms());
     irq_restore(flag);
     return retry;
+}
+
+void ace2k_feed_binding_confirm_cfg_set(uint32_t leg_max_um, uint32_t speed_um_s)
+{
+    ensure_ready();
+    irqstatus_t flag = irq_save();
+    ace2k_feed_confirm_cfg_set(&ace2k_feed_instance, leg_max_um, speed_um_s);
+    irq_restore(flag);
 }
 
 int ace2k_feed_binding_search_set(uint32_t search_um)

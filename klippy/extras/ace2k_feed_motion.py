@@ -165,14 +165,16 @@ WAIT_MARGIN_S = 5.0  # … plus this
 SEQ_MAX = 255  # the sequence wraps from here to 1; 0 is for motions that the unit starts itself
 COMMANDED_KEEP = 8  # how many start lengths are kept per lane until their event arrives
 # A G-code move on a lane in the follow stops the follow first. PAUSE_WAIT_S is how long to wait
-# for it to end. Meanwhile the lane refuses a start as busy, so the start is tried again every
-# PAUSE_POLL_S for up to PAUSE_BUSY_S.
+# for it to end.
 PAUSE_WAIT_S = 5.0
 # A start that the unit accepted may never get its final event (it was lost). It counts as over
 # when a state report shows the lane idle or in error, this many reports after the acceptance.
 GONE_REPORTS = 2
-PAUSE_BUSY_S = 5.0
-PAUSE_POLL_S = 0.25
+# A busy refusal from the unit's own work on a lane (its tie-break, which the refusal sends back,
+# its own load, or a lane winding down after a stop) is tried again every BUSY_POLL_S for up to
+# BUSY_S (retry_busy).
+BUSY_S = 30.0
+BUSY_POLL_S = 0.25
 # A start before the first state report of the session waits for it, for this many report periods
 # plus WAIT_MARGIN_S. It is two, so that the next report covers a first report that was lost on
 # the way (for example by a full transmit buffer or the half-duplex turnaround).
@@ -772,7 +774,10 @@ class FeedMotion(FeedBase):
         """Return the seq of the current motion of the lane, or None when nothing runs.
 
         This is the last accepted start whose final event has not come. Otherwise it is the motion
-        that the last report showed, if no final event has ended it since."""
+        that the last report showed, if no final event has ended it since. The report keeps the
+        seq of the lane's last host start through the unit's own modes, and a seq from before a
+        Klipper restart too, so a reported seq is not always a move of this host (see
+        retry_busy)."""
         return self.motion[index].open_seq(self.lanes[index]["mode"])
 
     def in_follow(self, index: int) -> bool:
@@ -813,22 +818,29 @@ class FeedMotion(FeedBase):
         """Return True if the current motion is a follow that has not ended or entered its tail."""
         return self.is_following(index) and not self.lanes[index]["tail"]
 
-    def retry_busy(self, send: Callable[[], T]) -> T:
+    def retry_busy(self, send: Callable[[], T], lane: int) -> T:
         """Call ``send()`` again while the unit refuses it as busy, and return its result.
 
-        A busy refusal is an error with ``reason`` "busy" (the text is not checked). The call is
-        repeated every PAUSE_POLL_S for up to PAUSE_BUSY_S, while a lane winds down after its
-        follow was stopped. Any other error, and the last busy refusal, are raised."""
-        give_up = self.reactor.monotonic() + PAUSE_BUSY_S
+        A busy refusal is an error with ``reason`` "busy" (the text is not checked). Unless a
+        start of this host on ``lane`` was accepted and its final event has not come, the busy is
+        the unit's own work: its tie-break, which the refusal sends back, its own load, or a lane
+        winding down after a stop. That holds whatever seq the report shows, which may be the one
+        of an ended host start or one from before a Klipper restart. The call is then repeated
+        every BUSY_POLL_S for up to BUSY_S. Any other error, a busy refusal with this host's
+        start open, and the last busy refusal are raised."""
+        give_up = self.reactor.monotonic() + BUSY_S
         while True:
             try:
                 return send()
             # Whatever send raises, only a busy refusal is tried again.
             except Exception as e:  # noqa: PERF203 — the retry needs the try inside the loop
                 now = self.reactor.monotonic()
-                if getattr(e, "reason", None) != "busy" or now + PAUSE_POLL_S > give_up:
+                m = self.motion[lane]
+                own = m.accepted_seq is not None and not m.accepted_ended
+                busy = getattr(e, "reason", None) == "busy" and not own
+                if not busy or now + BUSY_POLL_S > give_up:
                     raise
-                self.reactor.pause(now + PAUSE_POLL_S)
+                self.reactor.pause(now + BUSY_POLL_S)
 
     def move_wait_s(
         self, lane_index: int, length_mm: float, speed_mm_s: float, *, reverse: bool = False
@@ -1136,6 +1148,8 @@ class FeedMotion(FeedBase):
         lane: int,
         pause: FollowPause,
         send: Callable[[Before | None], T],
+        *,
+        retry: bool = True,
     ) -> T:
         """Call ``send(before)`` for a G-code move on the lane, and return its result.
 
@@ -1145,12 +1159,17 @@ class FeedMotion(FeedBase):
         ``send`` passes to ``before(seq)`` just before its query. ``before`` is None when there is
         nothing to register.
 
-        While the lane winds down, the send is tried again on busy (see retry_busy). If the send
+        A busy refusal from the unit's own work is tried again (see retry_busy), unless ``retry``
+        is False. If the send
         fails, the follow comes back (when "paused") or the pause ends (when "stopped"), and the
         error is raised unchanged."""
         state = self.pause_follow(gcmd, lane, pause.what, rearm=pause.rearm)
+
+        def sent(arg: Before | None) -> T:
+            return self.retry_busy(lambda: send(arg), lane) if retry else send(arg)
+
         if state is None:
-            return send(None)
+            return sent(None)
 
         def before(seq: int) -> None:
             # Only the end of the move with this seq ends the pause. If the follow was paused, the
@@ -1160,7 +1179,7 @@ class FeedMotion(FeedBase):
         if pause.seq is not None:
             before(pause.seq)
         try:
-            return self.retry_busy(lambda: send(before if pause.seq is None else None))
+            return sent(before if pause.seq is None else None)
         except (FeedRefused, RuntimeError):
             if state == "paused":
                 self.follow_auto.give_back(lane)
@@ -1168,8 +1187,12 @@ class FeedMotion(FeedBase):
                 self.follow_auto.end_pause(lane)
             raise
 
-    def _start(self, gcmd: GCodeCommand, index: int, start: Start, wait: int) -> Event | None:
+    def _start(
+        self, gcmd: GCodeCommand, index: int, start: Start, wait: int, *, retry: bool = True
+    ) -> Event | None:
         """Send the start (see _send_start) for a G-code. If ``wait`` is set, wait for its event.
+
+        ``retry`` False answers a busy refusal at once (see with_follow_paused).
 
         A refusal or a missing state report becomes a G-code error. When waiting, return the event
         with the sequence of the start. On a timeout, stop the lane and raise a G-code error.
@@ -1191,7 +1214,9 @@ class FeedMotion(FeedBase):
                 # After an unload the filament has left, and a one-way assist replaces the follow.
                 # So the follow does not re-arm.
                 rearm = mode not in ("unload", "assist", "assist_back")
-                self.with_follow_paused(gcmd, index, FollowPause(what, rearm=rearm), send)
+                self.with_follow_paused(
+                    gcmd, index, FollowPause(what, rearm=rearm), send, retry=retry
+                )
         except (FeedRefused, RuntimeError) as e:
             raise gcmd.error(str(e)) from e
         if completion is None:

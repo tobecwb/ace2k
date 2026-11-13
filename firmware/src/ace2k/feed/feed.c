@@ -89,6 +89,10 @@ static void reset_mode_state(struct ace2k_feed_lane *l)
     l->held_open = false;
     l->held_t0_ms = 0;
     l->held_enc0_um = 0;
+    l->confirm_rev = false;
+    l->confirm_out = false;
+    l->confirm_epoch = false;
+    l->free_held = false;
 }
 
 void ace2k_feed_enter(struct ace2k_feed *self, uint8_t lane, uint8_t mode, uint8_t seq,
@@ -98,7 +102,8 @@ void ace2k_feed_enter(struct ace2k_feed *self, uint8_t lane, uint8_t mode, uint8
     struct ace2k_feed_lane *l = &self->l[lane];
     l->mode = mode;
     l->seq = seq;
-    l->search_seq = 0; /* a read with motion sets its own key after its entry */
+    l->autonomous = false; /* the tie-break sets it after its entry */
+    l->search_seq = 0;     /* a read with motion sets its own key after its entry */
     l->search_on = false;
     l->fg_start_pulses = ace2k_lane_fg_raw(self->lane, lane);
     l->enc_um_start = ace2k_lane_encoder_um(self->lane, lane);
@@ -184,6 +189,10 @@ void ace2k_feed_init(struct ace2k_feed *self, struct ace2k_lane *lane)
         .pulse_um_s = ACE2K_FEED_FF_PULSE_UM_S,
     };
     self->unload_clear_um = ACE2K_FEED_UNLOAD_CLEAR_UM;
+    /* No leg until the reader's binding forwards its settings.  An image without the reader never
+     * asks for a confirmation. */
+    self->confirm_leg_um = 0;
+    self->confirm_speed_um_s = ACE2K_LANE_SPEED_MIN_UM_S;
     self->held = (struct ace2k_feed_held_cfg){
         .held_um = ACE2K_FEED_HELD_UM,
         .held_ms = ACE2K_FEED_HELD_MS,
@@ -527,11 +536,11 @@ static void tick_lane(struct ace2k_feed *self, uint8_t lane, const struct ace2k_
     /* An edge during a mode belongs to that mode.  A rollback that brings a piece back to the bay
      * entrance on the tick it ends must not load it again.  So the automatic load reads the mode as
      * it was before the result of this tick could end it. */
-    bool load_edge = false;
-    if (rose && l->mode == ACE2K_FEED_IDLE) {
-        load_edge = true;
-    }
+    bool load_edge = (bool)(rose && l->mode == ACE2K_FEED_IDLE);
     l->insert_last = insert;
+    if (rose) {
+        ace2k_feed_yield_neighbour_tiebreak(self, lane); /* a hand at the reader's other bay */
+    }
     if (fall_or_clear(self, lane, fell, in, now_ms)) {
         return;
     }
@@ -685,8 +694,10 @@ enum ace2k_feed_refusal ace2k_feed_set_speed(struct ace2k_feed *self, uint8_t la
      * because the follow was refused above.  The speed is kept for the next command move of the
      * mode all the same.  The bounds are checked above.  So the lane answers 0 when a motor move
      * took the speed, or -ACE2K_EREFUSED when no motor move runs at this instant.  That is an
-     * assist between two bursts, or a load in its settle. */
-    if (l->sub != ACE2K_FEED_SUB_REACQUIRE && l->snag != ACE2K_FEED_SNAG_BACK && !l->dose) {
+     * assist between two bursts, or a load in its settle.  A leg of a confirmation keeps the
+     * confirmation's speed too. */
+    if (l->sub != ACE2K_FEED_SUB_REACQUIRE && l->sub != ACE2K_FEED_SUB_CONFIRM &&
+        l->snag != ACE2K_FEED_SNAG_BACK && !l->dose) {
         (void)ace2k_lane_set_speed(self->lane, lane, speed_um_s, now_ms);
     }
     l->speed_um_s = speed_um_s;

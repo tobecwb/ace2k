@@ -360,6 +360,74 @@ def test_the_wrapper_survives_a_bad_move_object(caplog: pytest.LogCaptureFixture
     assert caplog.text.count("ace2k: feed-forward") == 1  # logged once, not per move
 
 
+def test_note_move_records_what_the_wrapper_records_for_the_same_move() -> None:
+    extruders = {"extruder": MoveExtruder(), "extruder1": MoveExtruder()}
+    feed, printer, mcu = make_ff(
+        {"lane1_extruder": "extruder", "lane2_extruder": "extruder1"}, extruders=extruders
+    )
+    extruders["extruder"].move(10.0, FakeMove(0.3, accel_t=0.02, cruise_t=0.06, decel_t=0.02))
+    extruders["extruder"].move(10.2, FakeMove(-0.5))
+    assert feed.ff.note_move("extruder1", 10.0, 0.1, 0.3) is True
+    assert feed.ff.note_move("extruder1", 10.2, 0.1, -0.5) is True
+    by_wrapper = list(feed.ff.moves["extruder"])
+    by_note = list(feed.ff.moves["extruder1"])
+    assert [move[:3] for move in by_note] == [move[:3] for move in by_wrapper]
+    assert by_note[0][3] is None and by_wrapper[0][3] is None
+    assert by_note[1][3].total == by_wrapper[1][3].total == pytest.approx(0.5)
+    assert by_note[1][4] is None and by_wrapper[1][4] is None  # the class is not frozen yet
+
+
+def test_the_wrapper_skips_the_record_of_a_move_with_no_e() -> None:
+    extruders = {"extruder": MoveExtruder()}
+    feed, printer, mcu = make_ff({"lane1_extruder": "extruder"}, extruders=extruders)
+    calls = []
+    feed.ff.note_move = lambda *args: calls.append(args) or True
+    extruders["extruder"].move(10.0, FakeMove(0.0))
+    assert calls == []  # the hot path: no sum, no call
+    extruders["extruder"].move(10.1, FakeMove(0.3, accel_t=0.02, cruise_t=0.06, decel_t=0.02))
+    assert calls == [("extruder", 10.1, pytest.approx(0.1), 0.3)]
+
+
+def test_note_move_of_no_distance_returns_true_and_records_nothing() -> None:
+    feed, printer, mcu = make_ff({"lane1_extruder": "extruder"})
+    assert feed.ff.note_move("extruder", 10.0, 0.1, 0.0) is True
+    assert list(feed.ff.moves["extruder"]) == []
+
+
+def test_note_move_of_an_unknown_extruder_returns_false_and_records_nothing() -> None:
+    feed, printer, mcu = make_ff({"lane1_extruder": "extruder"})
+    assert feed.ff.note_move("extruder9", 10.0, 0.1, -12.0) is False
+    assert "extruder9" not in feed.ff.moves
+    assert "extruder9" not in feed.ff.runs
+    assert list(feed.ff.moves["extruder"]) == []
+
+
+def test_a_long_retraction_through_note_move_makes_a_run_like_the_wrappers() -> None:
+    extruders = {"extruder": MoveExtruder(), "extruder1": MoveExtruder()}
+    feed, printer, mcu = make_ff(
+        {"lane1_extruder": "extruder", "lane2_extruder": "extruder1"}, extruders=extruders
+    )
+    for k in range(3):  # a retraction of 15 mm split by a wipe
+        extruders["extruder"].move(10.0 + 0.3 * k, FakeMove(-5.0, cruise_t=0.1))
+        feed.ff.note_move("extruder1", 10.0 + 0.3 * k, 0.1, -5.0)
+    run, run1 = feed.ff.runs["extruder"], feed.ff.runs["extruder1"]
+    assert run1 is not run
+    assert run1.total == pytest.approx(run.total) == pytest.approx(15.0)
+    assert run1.end_pt == pytest.approx(run.end_pt)
+    assert all(move[3] is run1 for move in feed.ff.moves["extruder1"])
+    feed.ff.note_move("extruder1", 11.0, 0.1, 5.0)  # an extrusion ends the run
+    assert "extruder1" not in feed.ff.runs
+
+
+def test_a_long_retraction_through_note_move_takes_it_back() -> None:
+    feed, printer, mcu, extruder = make_reverse()
+    assert feed.ff.note_move("extruder", 10.0, 0.24, -12.0)  # 50 mm/s
+    rates = run_rates(feed, 9.6, 11.0)
+    assert min(rate for _lane, rate, _clear in bases(mcu)) < 0
+    assert feed.ff.credit.get("extruder", 0.0) == 0.0
+    assert sum(r * 0.1 for r in rates) == pytest.approx(-12.0, abs=0.3)
+
+
 # --- the lane and the rate -----------------------------------------------------------------
 
 

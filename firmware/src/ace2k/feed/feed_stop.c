@@ -30,6 +30,9 @@ int ace2k_feed_stop_when(struct ace2k_feed *self, uint8_t lane, bool held, bool 
          !ace2k_within_u32(held_ms, ACE2K_FEED_HELD_MS_MIN, ACE2K_FEED_HELD_MS_MAX))) {
         return -ACE2K_EINVAL;
     }
+    if (ace2k_feed_tiebreak_on(&self->l[lane])) {
+        self->l[lane].yield = true; /* the tie-break goes back at the next tick, as at a start */
+    }
     if (self->l[lane].mode != ACE2K_FEED_IDLE) {
         return -ACE2K_EBUSY; /* a stop armed under a running move would never be the host's */
     }
