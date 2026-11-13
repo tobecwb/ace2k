@@ -75,6 +75,13 @@ For the Snapmaker U1, see the [`ace2k-u1`](https://github.com/tobecwb/ace2k-u1) 
     #feed_report_hz: 1             # 0.05–10 Hz; 1, 2, 5 and 10 are exact, the rest snap to the 100 ms grid
     #rfid_search_mm: 750          # the load's search for a spool's tag past the parking point,
     #                             # 100–1000 mm of filament (unset: the firmware's default)
+    #rfid_confirm_leg_mm: 150     # longest single leg when a tag is confirmed by following, 10–600 mm
+    #rfid_confirm_speed: 9        # speed of those legs, mm/s
+    #rfid_passive_min_mm: 300     # least lane travel between a tag's leave and return, 50–1000 mm
+    #rfid_confirm_follows: 1      # reversals the tag must follow, 1–3
+    #rfid_confirm_window_mm: 30   # most lane travel between the two changes of a reversal, 5–100 mm
+    #rfid_passive_max_mm: 950     # most lane travel between a tag's leave and return, above the
+    #                             # minimum, up to 2000 mm
     #rfid_mifare_order: bambu, snapmaker, creality
     #heater_watts: 360            # the dryer's heater power, for ACEK_DRYER_LOG's energy
 

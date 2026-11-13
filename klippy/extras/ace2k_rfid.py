@@ -24,16 +24,24 @@ has no file of its own.
 The last read of each lane is kept beside the cache, in ``<cache>.lanes.json``
 (``ace2k_rfid_kept.py``). A restart that resets the unit leaves a full bay ``pending``. Such a
 lane takes its kept read back, marked ``restored``, and its status shows it ``read`` until the
-next read replaces it. The unit has not seen that tag yet, so a load still searches for it. The
-kept read goes when the bay is seen empty, on a forget, on a read with motion, when a search
-ends with no tag, and when the unit reads another tag on the lane.
+next read replaces it. The lane is set by hand on the unit (``set_by_hand``): its strand never
+left, so the unit gives it no tag, and a new tag on the neighbour's spool is the neighbour's. A
+forget clears that mark, so the lane can be read again. The kept read goes when the bay is seen
+empty, on a forget, on a read with motion, when a search ends with no tag, and when the unit reads
+another tag on the lane.
 
 The field byte of the state report names the field of each reader, a field fault and a dead reader
 (``reader_flags()``, and ``rfid_readers`` in the status of ``[ace2k]``).
 
 The G-codes are ``ACEK_RFID_READ LANE=n [MOVE=1] [DUMP=1] [WAIT=0]`` and
 ``ACEK_RFID_FORGET LANE=n``. A read on command ends at the next state event of the lane. If
-nothing decided the state, the event carries the unchanged state.
+nothing decided the state, the event carries the unchanged state. The unit refuses a read with
+motion as busy while its own tie-break runs, and sends the tie-break back: the G-code sends the
+read again every 0.25 s for up to 30 s (as the feed's G-codes send a start), and then reports the
+refusal.
+
+``ACEK_RFID_BY_HAND`` and ``ACEK_RFID_TUNE``, with ``set_in_use`` and ``set_by_hand``, belong to
+the tag attribution (``ace2k_rfid_attrib.py``).
 
 The brands and their parameters come from the ``[ace2k_tag]`` sections
 (``config/ace2k_tags.cfg``). The module [ace2k] loads this one. If the firmware is built without
@@ -101,9 +109,11 @@ except ImportError:  # the host tests put klippy/extras on the path and import b
     )
 
 try:
+    from .ace2k_rfid_attrib import TagAttribution
     from .ace2k_rfid_kept import KeptReads
     from .ace2k_tags import base, registry
 except ImportError:  # the host tests put klippy/extras on the path and import by bare name
+    from ace2k_rfid_attrib import TagAttribution  # type: ignore[import-not-found, no-redef]
     from ace2k_rfid_kept import KeptReads  # type: ignore[import-not-found, no-redef]
     from ace2k_tags import base, registry  # type: ignore[import-not-found, no-redef]
 
@@ -139,6 +149,7 @@ if TYPE_CHECKING:
         def lanes(self) -> list[LaneStatus]: ...
         def head(self, part: str | None = None) -> str: ...
         def lane_text(self, lane: int) -> str: ...
+        def say(self, line: str) -> None: ...
         def add_key_cmd(self, text: str, has_key: bool) -> None: ...
         def register_command(
             self, name: str, func: Callable[[GCodeCommand], None], desc: str | None = None
@@ -323,11 +334,18 @@ class Ace2kRfid:
             self.reactor.monotonic,
         )
         self.timer = self.reactor.register_timer(self._session_timeout)
+        # The in-use mask, the lanes set by hand and the confirmation numbers (see its module).
+        self.attrib = TagAttribution(config, unit)
         self.mcu.register_config_callback(self._build_config)
         self.printer.register_event_handler("klippy:connect", self._on_connect)
         self.printer.register_event_handler("klippy:ready", self._on_ready)
         self.printer.register_event_handler("ace2k:feed_event", self._feed_event)
-        for name in ("ACEK_RFID_READ", "ACEK_RFID_FORGET"):
+        for name in (
+            "ACEK_RFID_READ",
+            "ACEK_RFID_FORGET",
+            "ACEK_RFID_BY_HAND",
+            "ACEK_RFID_TUNE",
+        ):
             unit.register_command(
                 name, getattr(self, "cmd_" + name), getattr(self, "cmd_" + name + "_help")
             )
@@ -359,6 +377,10 @@ class Ace2kRfid:
                     self.printer, self.section, fmt, (verdict, detail), self.read_fmt
                 )
         self.present = True
+        try:
+            self.attrib.build()
+        except ValueError as e:
+            raise self.printer.config_error(f"{self.section}: {e}") from None
         ticks = self.mcu.seconds_to_clock(REPORT_S)
         self.mcu.add_config_cmd(f"ace2k_rfid_query rest_ticks={ticks}", is_init=True)
         if self.mcu.try_lookup_command(SEARCH_FMT) is not None:
@@ -462,7 +484,9 @@ class Ace2kRfid:
 
         It takes the cached record of its UID, else its kept read of that UID (a tag read by its
         UID alone is in no cache). With neither, the lane is forgotten, so that its next move reads
-        the tag again.
+        the tag again, unless the unit holds it set by hand: that mark is the user's, and a forget
+        would clear it. When the unit's mask of those lanes has not come yet, the forget waits for
+        it.
         """
         cached = self.cache.get(uid)
         kept = self.kept.restorable(lane)
@@ -471,7 +495,7 @@ class Ace2kRfid:
         elif kept is not None and kept.get("uid") == uid:
             self._take_kept(lane, kept)
         else:
-            self.forget_cmd.send([lane])
+            self.attrib.forget_unless_held(lane, lambda: self.forget_cmd.send([lane]))
             self._set_record(lane, None, None, None, save=False)
 
     def _restore(self, lane: int) -> None:
@@ -480,7 +504,7 @@ class Ace2kRfid:
         A unit reset by the restart has forgotten its tags, so a full bay is pending. The spool is
         taken to be the one read before. The read is marked ``restored``, and the next read of
         the lane replaces it. A spool swapped while the printer was off keeps the old read until
-        then.
+        then. The lane is set by hand on the unit: its strand never left, so it is defined.
         """
         kept = self.kept.restorable(lane)
         status = self.lanes[lane]
@@ -489,6 +513,9 @@ class Ace2kRfid:
         if lane in self.sessions:
             return
         self._take_kept(lane, kept)
+        # The unit holds the lane defined, as for a spool set by hand, so a tag on the
+        # neighbour's spool is not taken for one that could be this lane's.
+        self.attrib.set_by_hand(lane)
 
     def _take_kept(self, lane: int, kept: Record) -> None:
         """Give the lane its kept read, marked ``restored``, and announce it."""
@@ -1068,5 +1095,36 @@ class Ace2kRfid:
         self._require(gcmd)
         lane = self._lane(gcmd)
         self.forget_cmd.send([lane])
+        self.attrib.forget_by_hand(lane)  # the unit clears its mark with the forget
         self._set_record(lane, None, None, None)
         gcmd.respond_info(f"ace2k: lane {lane + 1} tag forgotten")
+
+    def set_in_use(self, mask: int) -> None:
+        """Tell the unit which lanes a print uses (4-bit mask). It does nothing on an old image."""
+        self.attrib.set_in_use(mask)
+
+    def set_by_hand(self, lane_index: int) -> None:
+        """Tell the unit that the tag of a lane (0-3) was set by hand."""
+        self.attrib.set_by_hand(lane_index)
+
+    cmd_ACEK_RFID_BY_HAND_help = (
+        "Say that the tag of LANE=<1-4> was set by hand: the antenna never changes it"
+    )
+
+    def cmd_ACEK_RFID_BY_HAND(self, gcmd: GCodeCommand) -> None:
+        self._require(gcmd)
+        lane = self._lane(gcmd)
+        if not self.attrib.present:
+            raise gcmd.error("ace2k: the firmware has no tag attribution")
+        self.attrib.set_by_hand(lane)
+        gcmd.respond_info(f"ace2k: lane {lane + 1} tag set by hand")
+
+    cmd_ACEK_RFID_TUNE_help = (
+        "Set how a tag is confirmed: LEG=<mm> SPEED=<mm/s> MIN=<mm> FOLLOWS=<1-3> WINDOW=<mm>"
+        " MAX=<mm>;"
+        " reports the values in force"
+    )
+
+    def cmd_ACEK_RFID_TUNE(self, gcmd: GCodeCommand) -> None:
+        self._require(gcmd)
+        gcmd.respond_info(self.attrib.tune(gcmd))

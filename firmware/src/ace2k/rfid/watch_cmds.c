@@ -2,14 +2,17 @@
 // engine runs over the transceive, and the watch runs over both.  The 10 ms tick only wakes the
 // task and raises the report's due flag.  The task runs one watch step, and every SPI transfer of
 // the readers happens there.  Then the task publishes the bits for the feed and sends what is due.
-// The state report goes first, then the events, oldest first.  Each one is tried, and held for the
-// next tick when its frame does not fit (tx.h).  A malformed command, with a lane or an argument
-// out of range, is a bug in the host and takes the Klipper way out.  A stale session is ignored.
+// The state report goes first, then the mask of the lanes set by hand when it is due, then the
+// events, oldest first, then the traces of the confirmations, only once no event waits.  Each one
+// is tried, and held for the next tick when its frame does not fit (tx.h).  A malformed command,
+// with a lane or an argument out of range, is a bug in the host and takes the Klipper way out.  A
+// stale session is ignored.
 #include "rfid/watch_cmds.h"
 #include "rfid/iso14443a.h" // ACE2K_ISO_KEY_BYTES
 #include "rfid/reader_cmds.h"
 #include "rfid/transceive.h"
 #include "rfid/watch.h"
+#include "rfid/watch_tiebreak.h"
 #include "lane/lane_cmds.h"     // ace2k_lane_binding: which lanes move
 #include "lane/sensors_cmds.h"  // ace2k_sensors_binding: the insert sensors
 #include "ace2k_board/args.h"   // ACE2K_ARG_U8, ACE2K_ARG_U8_MAX, ACE2K_ARG_FLAG
@@ -36,22 +39,36 @@
 #define ACE2K_RFID_DEAD_BIT_A      0x10U
 #define ACE2K_RFID_DEAD_BIT_B      0x20U
 // The bits for the feed, in one word.  Each nibble holds one bit per lane, for the hold of the
-// session, the read tag and the lost tag.
-#define ACE2K_RFID_FEED_HOLD_SHIFT 0U
-#define ACE2K_RFID_FEED_READ_SHIFT 4U
-#define ACE2K_RFID_FEED_LOST_SHIFT 8U
-#define ACE2K_RFID_FEED_LANES_MASK 0x0FU
+// session, the read tag, the lost tag, the confirmation asked and its direction.  The next one
+// holds the host's mask of the lanes in use, 0 while that mask is not valid, and the bit above
+// it says whether it is valid.  The top nibble holds the epoch of each lane's confirmation.
+#define ACE2K_RFID_FEED_HOLD_SHIFT          0U
+#define ACE2K_RFID_FEED_READ_SHIFT          4U
+#define ACE2K_RFID_FEED_LOST_SHIFT          8U
+#define ACE2K_RFID_FEED_CONFIRM_SHIFT       12U
+#define ACE2K_RFID_FEED_CONFIRM_REV_SHIFT   16U
+#define ACE2K_RFID_FEED_IN_USE_SHIFT        20U
+#define ACE2K_RFID_FEED_IN_USE_VALID        0x01000000U // bit 24
+#define ACE2K_RFID_FEED_CONFIRM_EPOCH_SHIFT 28U
+#define ACE2K_RFID_FEED_LANES_MASK          0x0FU
 
 static struct ace2k_rfid_transceive ace2k_rfid_tx;
 static struct ace2k_iso14443a ace2k_rfid_iso;
 static struct ace2k_rfid_watch ace2k_rfid_watch_instance;
+#if CONFIG_ACE2K_FEED
+static struct ace2k_rfid_tiebreak ace2k_rfid_tb;
+#endif
 static struct task_wake ace2k_rfid_wake;
 static struct ace2k_report ace2k_rfid_report;
 static volatile bool ace2k_rfid_report_due;
-// The task writes the word whole, and the tick of the feed reads it once.  It is one aligned 16-bit
+// The task writes the word whole, and the tick of the feed reads it once.  It is one aligned 32-bit
 // store and one load.  So the tick never sees a hold of this run with a read of the last run, which
-// would be a torn triple.
-static volatile uint16_t ace2k_rfid_feed_bits;
+// would be a torn set.
+static volatile uint32_t ace2k_rfid_feed_bits;
+// The lanes set by hand, one bit per lane.  The word above has no nibble left, so they go in a
+// byte of their own.  The task writes it whole.  It changes only on a host command or a strand
+// leaving.
+static volatile uint8_t ace2k_rfid_by_hand_bits;
 static bool ace2k_rfid_ready;
 
 // The ops of the iso14443a engine: the transceive of the reader instance.
@@ -117,15 +134,19 @@ static void tick(void *ctx, uint32_t now_ms)
     sched_wake_task(&ace2k_rfid_wake); // one watch step per tick
 }
 
-// The inputs that come from the feed: which lanes are in a load, and which ones had their last
-// search run its whole length.  Without the feed, nothing loads.
+// The inputs that come from the feed: which lanes are in a load, which ones had their last search
+// run its whole length, which ones ran a confirmation leg out, and for which confirmation (its
+// epoch).  Without the feed, nothing loads.
 static void feed_inputs(struct ace2k_rfid_watch_inputs *in)
 {
 #if CONFIG_ACE2K_FEED
-    ace2k_feed_binding_rfid_bits(&in->loading, &in->exhausted);
+    ace2k_feed_binding_rfid_bits(&in->loading, &in->exhausted, &in->confirm_out,
+                                 &in->confirm_out_epoch);
 #else
     in->loading = 0;
     in->exhausted = 0;
+    in->confirm_out = 0;
+    in->confirm_out_epoch = 0;
 #endif
 }
 
@@ -144,6 +165,10 @@ static void gather(struct ace2k_rfid_watch_inputs *in)
         if (ace2k_lane_is_moving(lane, i)) {
             in->moving |= (uint8_t)(1U << i);
         }
+        if (ace2k_lane_is_reverse(lane, i)) {
+            in->reverse |= (uint8_t)(1U << i);
+        }
+        in->travel_um[i] = ace2k_lane_encoder_um(lane, i);
     }
     feed_inputs(in);
     irq_restore(flag);
@@ -158,7 +183,20 @@ static void publish(void)
          << ACE2K_RFID_FEED_READ_SHIFT;
     v |= ((uint32_t)ace2k_rfid_watch_lost_bits(w) & ACE2K_RFID_FEED_LANES_MASK)
          << ACE2K_RFID_FEED_LOST_SHIFT;
-    ace2k_rfid_feed_bits = (uint16_t)v;
+    v |= ((uint32_t)ace2k_rfid_watch_confirm_bits(w) & ACE2K_RFID_FEED_LANES_MASK)
+         << ACE2K_RFID_FEED_CONFIRM_SHIFT;
+    v |= ((uint32_t)ace2k_rfid_watch_confirm_reverse_bits(w) & ACE2K_RFID_FEED_LANES_MASK)
+         << ACE2K_RFID_FEED_CONFIRM_REV_SHIFT;
+    v |= ((uint32_t)ace2k_rfid_watch_confirm_epoch_bits(w) & ACE2K_RFID_FEED_LANES_MASK)
+         << ACE2K_RFID_FEED_CONFIRM_EPOCH_SHIFT;
+    uint8_t in_use = 0;
+    if (ace2k_rfid_watch_in_use(w, &in_use)) { // the mask 0 when not valid
+        v |= ACE2K_RFID_FEED_IN_USE_VALID;
+    }
+    v |= ((uint32_t)in_use & ACE2K_RFID_FEED_LANES_MASK) << ACE2K_RFID_FEED_IN_USE_SHIFT;
+    ace2k_rfid_feed_bits = v;
+    ace2k_rfid_by_hand_bits =
+        (uint8_t)(ace2k_rfid_watch_by_hand_bits(w) & ACE2K_RFID_FEED_LANES_MASK);
 }
 
 static uint8_t field_mask(void)
@@ -203,6 +241,36 @@ static bool send_event(const struct ace2k_rfid_event *e)
     }
 }
 
+static void tiebreak(const struct ace2k_rfid_watch_inputs *in, uint32_t now_ms);
+
+// The mask of the lanes set by hand last sent to the host.  0xff, no mask, sends it again: before
+// the first, and after every state report.
+static uint8_t ace2k_rfid_by_hand_told = 0xFFU;
+
+// The mask of the lanes set by hand, with every state report and on any change.  A frame that does
+// not fit is tried again on the next tick.
+static void tell_by_hand(void)
+{
+    uint8_t mask = ace2k_rfid_watch_by_hand_bits(&ace2k_rfid_watch_instance);
+    if (mask != ace2k_rfid_by_hand_told && ACE2K_SENDF("ace2k_rfid_by_hand_state mask=%c", mask)) {
+        ace2k_rfid_by_hand_told = mask;
+    }
+}
+
+// The traces of the confirmations, for the bench, oldest first.  A frame that does not fit is
+// tried again on the next tick.
+static void send_traces(void)
+{
+    struct ace2k_rfid_confirm_trace t;
+    while (ace2k_rfid_watch_peek_trace(&ace2k_rfid_watch_instance, &t)) {
+        if (!ACE2K_SENDF("ace2k_rfid_confirm_trace lane=%c what=%c travel_um=%i reverse=%c lost=%c",
+                         t.lane, t.what, t.travel_um, (uint8_t)t.reverse, t.lost)) {
+            break;
+        }
+        ace2k_rfid_watch_drop_trace(&ace2k_rfid_watch_instance);
+    }
+}
+
 // Klipper calls every DECL_TASK target by name from generated code, so it is not static.
 void ace2k_rfid_watch_task(void)
 {
@@ -211,18 +279,22 @@ void ace2k_rfid_watch_task(void)
     }
     struct ace2k_rfid_watch_inputs in;
     gather(&in);
-    ace2k_rfid_watch_step(&ace2k_rfid_watch_instance, ace2k_tick_now_ms(), &in);
+    uint32_t now_ms = ace2k_tick_now_ms();
+    ace2k_rfid_watch_step(&ace2k_rfid_watch_instance, now_ms, &in);
+    tiebreak(&in, now_ms);
     publish();
-    if (ace2k_rfid_report_due) {
-        (void)ace2k_report_try(&ace2k_rfid_report_due, report);
+    if (ace2k_rfid_report_due && ace2k_report_try(&ace2k_rfid_report_due, report)) {
+        ace2k_rfid_by_hand_told = 0xFFU;
     }
+    tell_by_hand();
     struct ace2k_rfid_event e;
     while (ace2k_rfid_watch_peek_event(&ace2k_rfid_watch_instance, &e)) {
         if (!send_event(&e)) {
-            break; // the tail of the ring waits for the next tick, which wakes the task
+            return; // the tail of the ring waits for the next tick, and the traces after it
         }
         ace2k_rfid_watch_drop_event(&ace2k_rfid_watch_instance);
     }
+    send_traces();
 }
 DECL_TASK(ace2k_rfid_watch_task);
 
@@ -242,6 +314,9 @@ static void ensure_ready(void)
     if (ace2k_feed_binding_search_set(ACE2K_FEED_SEARCH_DEFAULT_UM) != 0) {
         shutdown("ace2k_rfid_search_set: search_um out of bounds");
     }
+    // The feed runs the legs of a confirmation with the watch's own settings.
+    ace2k_feed_binding_confirm_cfg_set((uint32_t)ace2k_rfid_watch_instance.cfg.leg_max_um,
+                                       (uint32_t)ace2k_rfid_watch_instance.cfg.speed_um_s);
 #endif
     if (ace2k_tick_register(tick, NULL) != 0) {
         shutdown("ace2k: tick slots exhausted");
@@ -256,12 +331,29 @@ void ace2k_rfid_watch_binding_init(void)
 }
 DECL_INIT(ace2k_rfid_watch_binding_init);
 
-void ace2k_rfid_binding_feed_bits(uint8_t *hold, uint8_t *read, uint8_t *lost)
+void ace2k_rfid_binding_feed_bits(uint8_t *hold, uint8_t *read, uint8_t *lost, uint8_t *confirm,
+                                  uint8_t *confirm_rev, uint8_t *confirm_epoch)
 {
     uint32_t v = ace2k_rfid_feed_bits; // the one load
     *hold = (uint8_t)((v >> ACE2K_RFID_FEED_HOLD_SHIFT) & ACE2K_RFID_FEED_LANES_MASK);
     *read = (uint8_t)((v >> ACE2K_RFID_FEED_READ_SHIFT) & ACE2K_RFID_FEED_LANES_MASK);
     *lost = (uint8_t)((v >> ACE2K_RFID_FEED_LOST_SHIFT) & ACE2K_RFID_FEED_LANES_MASK);
+    *confirm = (uint8_t)((v >> ACE2K_RFID_FEED_CONFIRM_SHIFT) & ACE2K_RFID_FEED_LANES_MASK);
+    *confirm_rev = (uint8_t)((v >> ACE2K_RFID_FEED_CONFIRM_REV_SHIFT) & ACE2K_RFID_FEED_LANES_MASK);
+    *confirm_epoch =
+        (uint8_t)((v >> ACE2K_RFID_FEED_CONFIRM_EPOCH_SHIFT) & ACE2K_RFID_FEED_LANES_MASK);
+}
+
+bool ace2k_rfid_binding_in_use(uint8_t *mask)
+{
+    uint32_t v = ace2k_rfid_feed_bits; // the one load
+    *mask = (uint8_t)((v >> ACE2K_RFID_FEED_IN_USE_SHIFT) & ACE2K_RFID_FEED_LANES_MASK);
+    return (bool)((v & ACE2K_RFID_FEED_IN_USE_VALID) != 0U);
+}
+
+uint8_t ace2k_rfid_binding_by_hand(void)
+{
+    return ace2k_rfid_by_hand_bits; // the one load
 }
 
 bool ace2k_rfid_binding_reader_busy(uint8_t reader)
@@ -290,11 +382,10 @@ void ace2k_rfid_binding_clear_dead(void)
 }
 
 #if CONFIG_ACE2K_FEED
-// Starts the feed's search, and turns its answer into the answer of a read.  ctx points to the
-// read's seq, its retry key.
-static enum ace2k_rfid_read_refusal search_start(void *ctx, uint8_t lane)
+// The answer of a feed's start, as the answer of a read.
+static enum ace2k_rfid_read_refusal read_refusal(enum ace2k_feed_refusal r)
 {
-    switch (ace2k_feed_binding_search_start(lane, *(const uint8_t *)ctx)) {
+    switch (r) {
     case ACE2K_FEED_ACCEPTED:
         return ACE2K_RFID_READ_OK;
     case ACE2K_FEED_REFUSED_NO_FILAMENT:
@@ -310,7 +401,34 @@ static enum ace2k_rfid_read_refusal search_start(void *ctx, uint8_t lane)
         return ACE2K_RFID_READ_BUSY;
     }
 }
+
+// Starts the feed's search for a read with motion.  ctx points to the read's seq, its retry key.
+static enum ace2k_rfid_read_refusal search_start(void *ctx, uint8_t lane)
+{
+    return read_refusal(ace2k_feed_binding_search_start(lane, *(const uint8_t *)ctx));
+}
+
 #endif
+
+// The tie-break (rfid/watch_tiebreak.h), after each watch step.  A lane the feed has idle with its
+// motor stopped may be picked (the pick also rules out a session or a read on command on its
+// reader).  The lane is tried once the feed accepted the start: a refused start is asked again at a
+// later run.  Without the feed nothing moves on its own.
+static void tiebreak(const struct ace2k_rfid_watch_inputs *in, uint32_t now_ms)
+{
+#if CONFIG_ACE2K_FEED
+    const struct ace2k_rfid_watch *w = &ace2k_rfid_watch_instance;
+    ace2k_rfid_tiebreak_note(&ace2k_rfid_tb, w, in, now_ms);
+    uint8_t idle = (uint8_t)(ace2k_feed_binding_idle_bits() & (uint8_t)~in->moving);
+    int8_t lane = ace2k_rfid_tiebreak_pick(&ace2k_rfid_tb, w, idle, now_ms);
+    if (lane >= 0 && ace2k_feed_binding_tiebreak_start((uint8_t)lane) == ACE2K_FEED_ACCEPTED) {
+        ace2k_rfid_tiebreak_tried(&ace2k_rfid_tb, (uint8_t)lane);
+    }
+#else
+    (void)in;
+    (void)now_ms;
+#endif
+}
 
 // A read with motion runs the feed's search (ace2k_rfid_watch_read_with_motion).  Without the feed
 // it is unsupported.  When a search starts, the bits for the feed are published again at once.  So
@@ -326,6 +444,8 @@ static uint8_t read_with_motion(uint8_t lane, uint8_t seq)
     enum ace2k_rfid_read_refusal r =
         ace2k_rfid_watch_read_with_motion(&ace2k_rfid_watch_instance, lane, search_start, &seq);
     if (r == ACE2K_RFID_READ_OK) {
+        // The host's read is its request to start the lane's tie-break over.
+        ace2k_rfid_tiebreak_restart(&ace2k_rfid_tb, lane);
         publish();
     }
     return (uint8_t)r;
@@ -417,7 +537,7 @@ void ace2k_rfid_cmd_forget(uint32_t *args)
 {
     ensure_ready();
     uint8_t lane = ACE2K_ARG_LANE(args[0], "ace2k_rfid_forget: lane out of range");
-    ace2k_rfid_watch_forget(&ace2k_rfid_watch_instance, lane);
+    ace2k_rfid_watch_host_forget(&ace2k_rfid_watch_instance, lane);
 }
 DECL_COMMAND(ace2k_rfid_cmd_forget, "ace2k_rfid_forget lane=%c");
 
@@ -443,6 +563,61 @@ void ace2k_rfid_cmd_query(uint32_t *args)
                        ACE2K_RFID_REPORT_PHASE_MS);
 }
 DECL_COMMAND(ace2k_rfid_cmd_query, "ace2k_rfid_query rest_ticks=%u");
+
+// The host's mask of the lanes in use, a bit per lane: the lanes whose tip is in a head that
+// prints, is paused or is otherwise in use.  The host sends it on every change and every second.
+// It is published at once, so the feed's next tick sees a lane that just became in use.  A mask
+// above the four lanes is a bug in the host.
+// cppcheck-suppress constParameterPointer
+void ace2k_rfid_cmd_in_use(uint32_t *args)
+{
+    ensure_ready();
+    uint8_t mask = ACE2K_ARG_U8_MAX(args[0], ACE2K_RFID_FEED_LANES_MASK,
+                                    "ace2k_rfid_in_use: mask out of range");
+    ace2k_rfid_watch_set_in_use(&ace2k_rfid_watch_instance, mask);
+    publish();
+}
+DECL_COMMAND(ace2k_rfid_cmd_in_use, "ace2k_rfid_in_use mask=%c");
+
+// The user named the lane's material by hand: no tag is attributed to it until its strand leaves.
+// A lane with no filament ignores it.  ace2k_rfid_by_hand_state tells the host the marks.
+// cppcheck-suppress constParameterPointer
+void ace2k_rfid_cmd_by_hand(uint32_t *args)
+{
+    ensure_ready();
+    uint8_t lane = ACE2K_ARG_LANE(args[0], "ace2k_rfid_by_hand: lane out of range");
+    ace2k_rfid_watch_set_by_hand(&ace2k_rfid_watch_instance, lane);
+}
+DECL_COMMAND(ace2k_rfid_cmd_by_hand, "ace2k_rfid_by_hand lane=%c");
+
+// The settings of the confirmation, sent by the host at connect and when the bench tunes them, in
+// the order of enum ace2k_rfid_cfg_index.  A set with a value outside its bounds is ignored whole,
+// and the refusal frame carries it back.  The host matches it with the set it sent last and logs
+// it.  This one is not a shutdown: a tuning sent during a print must not stop it.  An accepted set
+// reaches the feed too, which runs the legs.
+static void confirm_set_refused(const uint32_t *v)
+{
+    sendf("ace2k_rfid_confirm_set_refused leg_max_um=%u speed_um_s=%u passive_min_um=%u"
+          " follows=%c window_um=%u passive_max_um=%u",
+          v[ACE2K_RFID_CFG_LEG], v[ACE2K_RFID_CFG_SPEED], v[ACE2K_RFID_CFG_PASSIVE_MIN],
+          v[ACE2K_RFID_CFG_FOLLOWS], v[ACE2K_RFID_CFG_WINDOW], v[ACE2K_RFID_CFG_PASSIVE_MAX]);
+}
+
+// cppcheck-suppress constParameterPointer
+void ace2k_rfid_cmd_confirm_set(uint32_t *args)
+{
+    ensure_ready();
+    if (ace2k_rfid_watch_confirm_set(&ace2k_rfid_watch_instance, args) != 0) {
+        confirm_set_refused(args);
+        return;
+    }
+#if CONFIG_ACE2K_FEED
+    ace2k_feed_binding_confirm_cfg_set(args[ACE2K_RFID_CFG_LEG], args[ACE2K_RFID_CFG_SPEED]);
+#endif
+}
+DECL_COMMAND(ace2k_rfid_cmd_confirm_set, "ace2k_rfid_confirm_set leg_max_um=%u speed_um_s=%u"
+                                         " passive_min_um=%u follows=%c window_um=%u"
+                                         " passive_max_um=%u");
 
 #if CONFIG_ACE2K_FEED
 // Klipper's DECL_CONSTANT encodes its value with signed literals inside the macro.  So the lint's

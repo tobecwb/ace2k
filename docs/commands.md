@@ -45,7 +45,10 @@ Commands that start a move (`ACEK_FEED`, `ACEK_ROLLBACK`, `ACEK_UNLOAD`, `ACEK_L
 - `ace2k: lane N MODE refused: REASON` when the unit refuses the start. `MODE` is `feed`,
   `rollback`, `unload`, `load`, `assist`, `assist_back` or `assist_both`. `REASON` is one of
   `busy` (the lane is already moving), `in_error` (clear it with `ACEK_CLEAR`), `no_filament`,
-  `no_link`, `bounds` or `other_lane`.
+  `no_link`, `bounds` or `other_lane`. A start refused `busy` while no move of this host runs on
+  the lane is the unit's own work, such as its tie-break, which the refusal sends back: the
+  command sends it again every 0.25 s for up to 30 s, and only then reports the refusal
+  (`ACEK_ASSIST SOFT=1` excepted: it names the refusal at once).
 - `ace2k: no feed state report within S s (the unit reports at feed_report_hz = H Hz; check the
   link)` when the first start of a session finds no state report from the unit.
 - `ace2k: lane N MODE: no answer from the unit; check the link (...); lane N stopped in case it
@@ -791,7 +794,10 @@ filament may sit in an extruder, where a filament that follows the motor proves 
 already read is read again. The command prints the outcome and the decoded spool
 record. With `MOVE=1`, another lane of the unit that only follows, with its motor at rest, does
 not refuse the read (since v0.13.0); if that follow moves during the search, the search gives way
-and comes back, and the lane stays `pending`. A waited command waits 5 s for the field report (`MOVE=0`) or the move's budget (`MOVE=1`).
+and comes back, and the lane stays `pending`. While the unit's own tie-break runs, the unit sends
+it back and refuses `MOVE=1` as `busy`: the command sends the read again every 0.25 s for up to
+30 s, and only then reports the refusal. A waited command waits 5 s for the field report
+(`MOVE=0`) or the move's budget (`MOVE=1`).
 
 | Parameter | Default | Range | Meaning |
 |---|---|---|---|
@@ -828,6 +834,47 @@ Refused: `ace2k: firmware built without CONFIG_ACE2K_RFID_READ`.
 
 ```
 ACEK_RFID_FORGET LANE=1
+```
+
+### `ACEK_RFID_BY_HAND`
+
+Says that the material of a lane was named by hand. From then on the antenna never gives that lane
+a tag, until its strand leaves the insert sensor. A lane with no filament ignores it. The host
+sends it again at each announcement of the unit that lacks it, and stops once the strand leaves.
+The U1 adapter sends it for `ACEK_SPOOL`; other hosts may use it.
+
+| Parameter | Default | Range | Meaning |
+|---|---|---|---|
+| `LANE` | required | 1–4 | the lane |
+
+Refused: `ace2k: the firmware has no tag attribution`.
+
+```
+ACEK_RFID_BY_HAND LANE=3
+```
+
+### `ACEK_RFID_TUNE`
+
+Sets how a tag is confirmed by following, with no reflash, and prints the values sent. The unit
+starts from the `rfid_confirm_*`, `rfid_passive_min_mm` and `rfid_passive_max_mm` keys of
+`[ace2k]` (or the defaults) at every connect. A value left out keeps the last one. If the unit
+refused the last numbers, give all six. Values outside the ranges are refused here and by the
+unit.
+
+| Parameter | Default | Range | Meaning |
+|---|---|---|---|
+| `LEG` | `rfid_confirm_leg_mm` (150) | 10–600 mm | the longest single leg of a confirmation |
+| `SPEED` | `rfid_confirm_speed` (9) | within the lane's speed bounds | the speed of every leg, mm/s |
+| `MIN` | `rfid_passive_min_mm` (300) | 50–1000 mm | the least lane travel between a tag's leave and return in passive watching |
+| `FOLLOWS` | `rfid_confirm_follows` (1) | 1–3 | the reversals a tag must follow |
+| `WINDOW` | `rfid_confirm_window_mm` (30) | 5–100 mm | the most lane travel between the two changes of one reversal followed: a tag on the lane's own spool changes at the same place both ways |
+| `MAX` | `rfid_passive_max_mm` (950) | above `MIN`, up to 2000 mm | the most lane travel between a tag's leave and return in passive watching |
+
+Smaller values are better when they still tell the tags apart: use the smallest that works with
+the spools you have. The values set here last until the next connect.
+
+```
+ACEK_RFID_TUNE LEG=120 SPEED=9 MIN=300 FOLLOWS=1 WINDOW=30 MAX=950
 ```
 
 ### `ACEK_LOAD_SET`

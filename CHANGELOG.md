@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.15.0 — 2026-11-13
+
+Two lanes share each tag reader. A tag now goes to a lane only when the tag follows that lane's
+motion. The host interface is at version 29.
+
+### Breaking
+
+- **A lane that is not in use may move on its own when the host sends the lanes in use.** The
+  unit now sorts out a lane whose tag is not known by moving that lane a little (the tie-break). It
+  does this only while the host sends a recent list of the lanes in use. A host that sends no list
+  gets no tie-break, so nothing moves on its own for an older host. A host that sends the list
+  must name every lane that feeds a head, or the unit may move it
+  ([`protocol.md`](docs/protocol.md#the-tie-break), "The tie-break").
+
+### Changed
+
+- **A tag goes to the lane it follows.** Before, a tag that entered the reader's field while a
+  lane moved went to that lane. A spool hung on an empty bay could then have its tag taken by the
+  neighbour lane that ran, and the two spools ended swapped. Now, when the unit drives the lane
+  (a load, or the tie-break), it moves the lane back and forth, and the tag counts only when its
+  reading changes with the lane, at the same place both ways. When the lane moves for another
+  reason (a feed, a roll back, an assist), the tag counts only when it leaves the field and comes
+  back after 300 to 950 mm of that lane's travel, with the neighbour still
+  ([`protocol.md`](docs/protocol.md), "Watching and attribution").
+- **Lanes in use.** The host tells the unit which lanes feed a head that prints. The unit never
+  moves such a lane on its own, and runs no confirmation on it.
+- **Lanes set by hand.** `ACEK_RFID_BY_HAND LANE=n` says that you named the lane's material by
+  hand. The reader then never gives that lane a tag, until its filament leaves the bay.
+  `ACEK_RFID_FORGET` clears the mark, so the lane can be read again. A lane whose tag the host
+  restored after a restart is set by hand too. A load on a lane set by hand runs no tag search
+  ([`commands.md`](docs/commands.md#acek_rfid_by_hand)).
+- **`ACEK_RFID_TUNE`** changes how a tag is confirmed, with no reflash. The same values are the
+  new `[ace2k]` keys `rfid_confirm_leg_mm`, `rfid_confirm_speed`, `rfid_passive_min_mm`,
+  `rfid_confirm_follows`, `rfid_confirm_window_mm` and `rfid_passive_max_mm`
+  ([`commands.md`](docs/commands.md#acek_rfid_tune)).
+- **A start refused `busy` by the unit's own work is sent again.** The G-code starts and
+  `ACEK_RFID_READ MOVE=1` try again every 0.25 s for up to 30 s, for example while the unit runs
+  its tie-break. `ACEK_ASSIST SOFT=1` still answers at once.
+- **The feed's state report comes after the events of the same moment.** Before, a report could
+  show a lane idle just before the end of its feed, and the host logged a warning.
+- **The host interface is version 29.** It adds `set_in_use(mask)` and `set_by_hand(lane_index)`
+  on the `ace2k_rfid` object, `feed.ff.note_move(...)` for a move of a parked head, the two
+  G-codes and the six keys above
+  ([`protocol.md`](docs/protocol.md#host-interface), "Host interface").
+
 ## v0.14.0 — 2026-11-08
 
 The unit's top speed is now 80 mm/s, the same as the factory firmware. The host interface is

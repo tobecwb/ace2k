@@ -31,7 +31,7 @@ brand.
 
 Nothing is ever written to a tag.
 
-**Status: `v0.14.0`.** The long-run print tests have run many prints since the release
+**Status: `v0.15.0`.** The long-run print tests have run many prints since the release
 candidate, the longest over 40 hours, with all four lanes of one unit in use.
 
 **How this was built.** AI tools were used in developing this firmware. Every feature and every

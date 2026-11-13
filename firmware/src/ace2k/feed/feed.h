@@ -387,6 +387,9 @@ enum ace2k_feed_sub {
     ACE2K_FEED_SUB_SEARCH = 5,    /* load: past the parking point, looking for the tag */
     ACE2K_FEED_SUB_RETURN = 6,    /* load: back to the parking point (or the read's start) */
     ACE2K_FEED_SUB_REACQUIRE = 7, /* load: backwards at the floor speed for a lost tag */
+    /* Load: the reader's watch asks the lane to move back and forth until a candidate tag follows
+     * it.  One bounded leg at a time, in the direction asked, at the confirmation's speed. */
+    ACE2K_FEED_SUB_CONFIRM = 8,
 };
 
 /* How the search of the last load ended (ace2k_feed_search_end).  The binding of the reader turns a
@@ -470,6 +473,26 @@ struct ace2k_feed_inputs {
     uint8_t tag_hold;
     uint8_t tag_read;
     uint8_t tag_lost;
+    /* From the reader's binding too: the watch asks the lane's load to confirm a candidate tag, and
+     * in which direction (a bit set: toward the spool). */
+    uint8_t tag_confirm;
+    uint8_t tag_confirm_rev;
+    /* The epoch of each lane's confirmation, a bit that turns over at each new one.  A new epoch
+     * starts a fresh leg, even in the direction of the last one. */
+    uint8_t tag_confirm_epoch;
+    /* From the reader's binding too: the host's mask of the lanes in use, one bit per lane.  It is
+     * 0 when the mask is not valid (none since the link came up, or too old), so every rule that
+     * reads it then works as it did without one.  A lane in use neither keeps another lane's tag
+     * search from starting nor makes it yield, and the unit's own read with motion (the tie-break)
+     * on a lane that becomes in use goes back at once. */
+    uint8_t in_use;
+    /* The host's mask is valid: set since the link came up, and fresh.  Without it nothing moves
+     * on its own, so the unit's own read with motion goes back on the tick it turns false.  A
+     * read the host started does not depend on it. */
+    bool in_use_valid;
+    /* From the reader's binding too: the lanes the unit holds set by hand, one bit per lane.
+     * Such a lane is never given a tag, so its load runs no search past its pull. */
+    uint8_t tag_by_hand;
 };
 
 /* The comparator's thresholds.  ace2k_feed_thresholds_check has their rules. */
@@ -577,6 +600,24 @@ struct ace2k_feed_lane {
     bool yield;
     bool reacquired;
     bool gripped; /* the automatic load a grip or the park took: no tag search past its pull */
+    /* The lane's last load is the unit's own read with motion, the tie-break
+     * (ace2k_feed_tiebreak_start).  Cleared at the next entry only, so after its end its search
+     * running its reach is still not taken for a no-tag (ace2k_feed_search_exhausted). */
+    bool autonomous;
+    /* The confirmation (ACE2K_FEED_SUB_CONFIRM).  confirm_rev is the direction of the running or
+     * last leg, true toward the spool.  confirm_out says that the last leg ran its length, or had
+     * no room, and the lane holds still until the watch lets it go.  The reader's binding reads
+     * it back. */
+    bool confirm_rev;
+    bool confirm_out;
+    /* A reverse leg of a confirmation set the free phase of the push aside (feed_snag.c).  The next
+     * forward move of the load takes it up again, with a fresh window, unless the plunger is back
+     * at rest by then. */
+    bool free_held;
+    /* The epoch of the confirmation that the legs serve (tag_confirm_epoch).  The reader's binding
+     * reads it back with confirm_out, so an out of the confirmation before is never taken for the
+     * out of a new one. */
+    bool confirm_epoch;
     /* A load from the bay: the comparator skips its first ACE2K_FEED_LOAD_GRACE_UM of motor.  A
      * read with motion never has it, because its filament is gripped from its first millimetre.  It
      * is cleared at every entry and end (reset_mode_state), and set by ace2k_feed_begin_load after
@@ -656,6 +697,8 @@ struct ace2k_feed {
     struct ace2k_feed_held_cfg held;
     uint32_t unload_clear_um; /* the clear of an unload past the insert's fall; 0: none */
     uint32_t search_um;       /* reach of the search as travel since the load began; 0: no search */
+    uint32_t confirm_leg_um;  /* the longest leg of a confirmation; 0: no leg, out at once */
+    uint32_t confirm_speed_um_s; /* the speed of every leg */
     /* per lane, the grip that the next automatic load takes and clears; 0: none.  RAM only */
     uint32_t grip_um[ACE2K_LANE_COUNT];
     /* The last tick's inputs, whole.  The refusals of ace2k_feed_start() read the link and the
@@ -717,6 +760,9 @@ enum ace2k_feed_refusal ace2k_feed_start(struct ace2k_feed *self, uint8_t lane,
  * own on the lane, running or ending, neither closes nor opens the window again.  The same seq with
  * another command, length, speed, or, for a feed or a rollback, free_tip, is a new command.  It
  * takes the normal path: busy, or a new move.
+ *
+ * A start on a lane where the unit's own tie-break runs (ace2k_feed_tiebreak_start) sends it back
+ * and is refused busy, as a host's read with motion is: the host sends the start again.
  *
  * ace2k_feed_start() is this call with free_tip false. */
 enum ace2k_feed_refusal ace2k_feed_start_tip(struct ace2k_feed *self, uint8_t lane,
@@ -829,7 +875,8 @@ int ace2k_feed_ff_set(struct ace2k_feed *self, const struct ace2k_feed_ff_cfg *c
  * with the link down clears an arming that no start took.  Both false disarms.
  * It returns 0.  It returns -ACE2K_EINVAL, with nothing armed, for a lane out of range, or for a
  * held_ms other than 0 outside ACE2K_FEED_HELD_MS_MIN.._MAX, whatever the lane's mode.  It returns
- * -ACE2K_EBUSY, with nothing armed, for a lane that is not idle, in a mode or in error.
+ * -ACE2K_EBUSY, with nothing armed, for a lane that is not idle, in a mode or in error.  On a lane
+ * where the unit's own tie-break runs, it also sends the tie-break back, as a start does.
  * The caller masks interrupts. */
 int ace2k_feed_stop_when(struct ace2k_feed *self, uint8_t lane, bool held, bool at_rest,
                          uint32_t held_ms);
@@ -863,6 +910,12 @@ int ace2k_feed_base_set(struct ace2k_feed *self, uint8_t lane, int32_t rate_um_s
  * interrupts. */
 int ace2k_feed_search_set(struct ace2k_feed *self, uint32_t search_um);
 
+/* Sets the legs of the confirmation of a tag (ACE2K_FEED_SUB_CONFIRM): the longest leg, and the
+ * speed of every leg.  The reader's binding forwards its own settings.  A leg longer than one move
+ * is cut to ACE2K_LANE_MOVE_MAX_UM, and a speed outside the lane's bounds is brought within them.
+ * In effect from the next leg.  The caller masks interrupts. */
+void ace2k_feed_confirm_cfg_set(struct ace2k_feed *self, uint32_t leg_max_um, uint32_t speed_um_s);
+
 /* Sets the lane's grip.  Its next automatic load pulls grip_um alone, at the load's speed, with no
  * tag search, and ends loaded.  That load clears the grip.  So does any start that the host gives
  * the lane and that is accepted: ace2k_feed_start, its retry included, and ace2k_feed_search_start.
@@ -889,11 +942,24 @@ int ace2k_feed_wait_set(struct ace2k_feed *self, uint8_t lane);
  * the refusals of a start: no_link, in_error, busy, no_filament.  Then it returns
  * ACE2K_FEED_REFUSED_OTHER_LANE while another lane is busy (the tag search's rule 4).  A lane in
  * the follow with its motor at rest does not count, and the search yields when its motor starts.
- * Then it returns ACE2K_FEED_REFUSED_BOUNDS with no search configured.  An accepted read records
- * seq as the lane's retry key (ace2k_feed_search_retry); 0 records none.  The mode's events still
- * carry seq 0, the unit's own load.  Interrupts masked. */
+ * Then it returns ACE2K_FEED_REFUSED_BOUNDS with no search configured.  While a tie-break of the
+ * unit runs on any lane (ace2k_feed_tiebreak_start), it returns ACE2K_FEED_REFUSED_BUSY before
+ * any of those, and sends every tie-break back: the host tries the read again.  An accepted read
+ * records seq as the lane's retry key (ace2k_feed_search_retry); 0 records none.  The mode's
+ * events still carry seq 0, the unit's own load.  Interrupts masked. */
 enum ace2k_feed_refusal ace2k_feed_search_start(struct ace2k_feed *self, uint8_t lane, uint8_t seq,
                                                 uint32_t now_ms);
+
+/* Starts the unit's own read with motion on the lane, the tie-break: ace2k_feed_search_start with
+ * seq 0 and its refusals, the grip left as it was.  It goes forward at most confirm_leg_um, at
+ * confirm_speed_um_s (no leg set: ACE2K_FEED_REFUSED_BOUNDS), with no free tip, and comes back
+ * exactly what it pushed.  It goes back at once, whatever its phase and without waiting for a
+ * read session, on: a host start on its lane (refused busy) or on the other lane of its reader, a
+ * host's read with motion on any lane (refused busy), a strand going in beside it, its lane
+ * becoming in use, or the host's mask no longer valid.  A stop, the link and a shutdown end it
+ * where it is.  Interrupts masked. */
+enum ace2k_feed_refusal ace2k_feed_tiebreak_start(struct ace2k_feed *self, uint8_t lane,
+                                                  uint32_t now_ms);
 
 /* Tells whether a read with motion on the lane with this seq is the transport's retry of the last
  * one the unit accepted.  It is when seq is not 0, is that read's, and the search that read started
@@ -905,6 +971,11 @@ bool ace2k_feed_search_retry(const struct ace2k_feed *self, uint8_t lane, uint8_
 /* Returns how the last load search of the lane ended (enum ace2k_feed_search_end).  It is kept
  * until the next load.  It returns ACE2K_FEED_SEARCH_NONE for a lane out of range. */
 uint8_t ace2k_feed_search_end(const struct ace2k_feed *self, uint8_t lane);
+
+/* Returns true when the last load search of the lane ran its whole reach, and was not a
+ * tie-break: a tie-break goes forward one confirmation leg, too short to tell a no-tag.  False for
+ * a lane out of range. */
+bool ace2k_feed_search_exhausted(const struct ace2k_feed *self, uint8_t lane);
 
 /* Copies the oldest event and leaves it in the ring.  The binding tries to send it, and pops it
  * only once the frame is queued.  So a frame that does not fit waits at the ring's tail for the

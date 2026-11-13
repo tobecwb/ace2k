@@ -19,7 +19,7 @@ src-$(CONFIG_ACE2K_MOTOR) += ace2k_board/motor.c
 src-$(CONFIG_ACE2K_FEED) += ace2k/feed/feed.c ace2k/feed/feed_events.c ace2k/feed/feed_start.c
 src-$(CONFIG_ACE2K_FEED) += ace2k/feed/feed_compare.c ace2k/feed/feed_judge.c
 src-$(CONFIG_ACE2K_FEED) += ace2k/feed/feed_assist.c ace2k/feed/feed_follow.c ace2k/feed/feed_load.c
-src-$(CONFIG_ACE2K_FEED) += ace2k/feed/feed_snag.c ace2k/feed/feed_stop.c
+src-$(CONFIG_ACE2K_FEED) += ace2k/feed/feed_load_set.c ace2k/feed/feed_snag.c ace2k/feed/feed_stop.c
 src-$(CONFIG_ACE2K_FEED) += ace2k/feed/feed_cmds.c
 src-$(CONFIG_ACE2K_MAINS) += ace2k_board/zerocross.c ace2k/heat/mains.c ace2k/heat/mains_cmds.c
 src-$(CONFIG_ACE2K_HEAT) += ace2k_board/airflow_io.c ace2k/heat/airflow.c ace2k/heat/airflow_cmds.c
@@ -32,6 +32,7 @@ src-$(CONFIG_ACE2K_RFID) += ace2k/rfid/reader.c ace2k/rfid/reader_cmds.c
 src-$(CONFIG_ACE2K_RFID_READ) += ace2k/rfid/transceive.c ace2k/rfid/iso14443a.c ace2k/rfid/watch.c
 src-$(CONFIG_ACE2K_RFID_READ) += ace2k/rfid/iso14443a_anticoll.c
 src-$(CONFIG_ACE2K_RFID_READ) += ace2k/rfid/watch_session.c ace2k/rfid/watch_attrib.c
+src-$(CONFIG_ACE2K_RFID_READ) += ace2k/rfid/watch_confirm.c ace2k/rfid/watch_tiebreak.c
 src-$(CONFIG_ACE2K_RFID_READ) += ace2k/rfid/watch_cmds.c
 src-$(CONFIG_ACE2K_HEALTH) += ace2k_board/sysinfo.c ace2k/core/health.c ace2k/core/health_cmds.c
 

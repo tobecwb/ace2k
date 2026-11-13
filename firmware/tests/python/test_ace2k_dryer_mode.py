@@ -544,7 +544,7 @@ def test_stop_bound_on_an_image_without_it_is_the_plain_stop() -> None:
 
 
 def test_the_interface_version_is_27() -> None:
-    assert ace2k_feed_proto.API_VERSION == 28
+    assert ace2k_feed_proto.API_VERSION == 29
 
 
 MODE_KEYS = [

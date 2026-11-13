@@ -661,6 +661,33 @@ def test_the_busy_of_the_lane_winding_down_is_retried() -> None:
     assert replies == [] and printer.reactor.now == pytest.approx(before + 0.5)
 
 
+def test_a_start_refused_busy_by_the_units_own_work_is_sent_again() -> None:
+    """A start on a lane in the unit's tie-break is refused busy, and the tie-break goes back: the
+    G-code sends the start again every 0.25 s until the unit takes it."""
+    feed, printer, mcu, responses = rig()
+    replies = [1, 1, 0]
+
+    def respond() -> dict[str, int]:
+        reason = replies.pop(0)
+        return {"lane": 0, "accepted": int(reason == 0), "reason": reason}
+
+    responses["ace2k_feed_start"] = respond
+    before = printer.reactor.now
+    feed.cmd_ACEK_LOAD(FakeGcmd({"LANE": "1", "WAIT": "0"}))
+    assert replies == [] and printer.reactor.now == pytest.approx(before + 0.5)
+
+
+def test_a_soft_assist_refused_busy_answers_at_once() -> None:
+    """A print hook's ACEK_ASSIST SOFT=1 never waits on a busy lane: one send, a line, no wait."""
+    feed, printer, mcu, responses = rig()
+    responses["ace2k_feed_start"] = {"lane": 0, "accepted": 0, "reason": 1}
+    before = printer.reactor.now
+    gcmd = FakeGcmd({"LANE": "1", "SOFT": "1"})
+    feed.cmd_ACEK_ASSIST(gcmd)
+    assert len(start_queries(mcu)) == 1 and printer.reactor.now == before
+    assert any("not armed" in line for line in gcmd_lines(gcmd))
+
+
 def test_a_refused_move_gives_the_follow_back() -> None:
     feed, printer, mcu, responses = following_rig()
     responses["ace2k_feed_start"] = {"lane": 0, "accepted": 0, "reason": 5}  # bounds
@@ -957,13 +984,65 @@ def test_retry_busy_retries_by_the_reason_only() -> None:
             raise ace2k_feed.FeedRefused(0, "feed", "busy")
         return "sent"
 
-    assert feed.retry_busy(send) == "sent" and len(tries) == 3
+    assert feed.retry_busy(send, 0) == "sent" and len(tries) == 3
 
     def busy_text() -> NoReturn:
         raise RuntimeError("refused: busy")  # the text, no reason: not retried
 
     with pytest.raises(RuntimeError):
-        feed.retry_busy(busy_text)
+        feed.retry_busy(busy_text, 0)
+
+    # a busy with this host's own move open on the lane is that move's: raised at once
+    tries.clear()
+    feed.motion[0].accepted_seq, feed.motion[0].accepted_ended = 5, False
+    with pytest.raises(ace2k_feed.FeedRefused):
+        feed.retry_busy(send, 0)
+    assert len(tries) == 1
+
+    # a busy while the open motion is the unit's own (seq 0: its tie-break or its load) is tried
+    # again
+    tries.clear()
+    feed.motion[0].accepted_seq, feed.motion[0].accepted_ended = None, True
+    feed.motion[0].report_seq, feed.motion[0].ended_since_report = 0, False
+    feed.lanes[0]["mode"] = "loading"
+    assert feed.open_seq(0) == 0
+    assert feed.retry_busy(send, 0) == "sent" and len(tries) == 3
+
+
+def test_a_feed_refused_by_the_units_tie_break_after_a_host_move_is_retried() -> None:
+    # The state report keeps the seq of the lane's last host start through the unit's own
+    # modes. So after the host's move has ended, a tie-break on the lane reports that old seq.
+    feed, printer, mcu, responses = rig(inserts=(False,) * 4)
+    seq = feed.start_move(2, "feed", 10.0, 30.0).seq
+    deliver(mcu, 2, 0, FEEDING, seq=seq)  # the host's move is done
+    mcu.subscriptions["ace2k_feed_state"](
+        state_frame(
+            [IDLE, IDLE, LOADING, IDLE], [0] * 4, [0] * 4, [0] * 4, [0] * 4, seqs=[0, 0, seq, 0]
+        )
+    )  # the unit's tie-break
+    responses["ace2k_feed_start"] = [
+        {"lane": 2, "accepted": 0, "reason": 1},  # busy: the refusal sends the tie-break back
+        {"lane": 2, "accepted": 1, "reason": 0},
+    ]
+    feed.cmd_ACEK_FEED(FakeGcmd({"LANE": "3", "LENGTH": "20", "WAIT": "0"}))
+    assert len(start_queries(mcu)) == 3
+
+
+def test_a_units_motion_with_a_seq_from_before_a_restart_is_the_units_own() -> None:
+    # After a Klipper restart the host has started nothing yet, so a reported motion with an old
+    # seq is the unit's own: its busy refusal is retried. The seq stays for a stop to name.
+    feed, printer, mcu, responses = rig(inserts=(False,) * 4)
+    mcu.subscriptions["ace2k_feed_state"](
+        state_frame(
+            [IDLE, IDLE, LOADING, IDLE], [0] * 4, [0] * 4, [0] * 4, [0] * 4, seqs=[0, 0, 7, 0]
+        )
+    )
+    responses["ace2k_feed_start"] = [
+        {"lane": 2, "accepted": 0, "reason": 1},  # busy
+        {"lane": 2, "accepted": 1, "reason": 0},
+    ]
+    feed.cmd_ACEK_FEED(FakeGcmd({"LANE": "3", "LENGTH": "20", "WAIT": "0"}))
+    assert len(start_queries(mcu)) == 2
 
 
 def shared_following(responses_stop: bool = True) -> Rig:

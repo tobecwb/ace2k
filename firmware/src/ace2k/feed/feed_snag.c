@@ -55,7 +55,9 @@ static void begin(struct ace2k_feed *self, uint8_t lane)
 
 static bool in_search(const struct ace2k_feed_lane *l)
 {
-    return (bool)(l->mode == ACE2K_FEED_LOADING && l->sub == ACE2K_FEED_SUB_SEARCH);
+    /* a leg of a confirmation in the search belongs to the search */
+    return (bool)(l->mode == ACE2K_FEED_LOADING &&
+                  ace2k_feed_load_phase(l) == ACE2K_FEED_SUB_SEARCH);
 }
 
 /* The watch or the free phase ends in the tag search of a load.  The load returns to the parking
@@ -237,6 +239,12 @@ static void free_begin(struct ace2k_feed *self, uint8_t lane)
     self->l[lane].snag = ACE2K_FEED_SNAG_FREE_TIP;
 }
 
+void ace2k_feed_snag_free_resume(struct ace2k_feed *self, uint8_t lane)
+{
+    free_base(self, lane);
+    self->l[lane].snag = ACE2K_FEED_SNAG_FREE_TIP;
+}
+
 /* The free phase, every tick.
  * - The push no longer running forward ends it.
  * - The plunger back at rest ends it, with the notice.  In the search, a tag read meanwhile turns
@@ -325,6 +333,9 @@ bool ace2k_feed_snag_step(struct ace2k_feed *self, uint8_t lane, const struct ac
  * search, this is a verdict of the tolerance.  Elsewhere it belongs to the mode, as before. */
 static bool search_move_fault(const struct ace2k_feed_lane *l, const struct ace2k_lane_result *r)
 {
+    if (l->sub == ACE2K_FEED_SUB_CONFIRM && l->confirm_rev) {
+        return false; /* a reverse leg of a confirmation is judged as any reverse move */
+    }
     return (bool)(in_search(l) &&
                   (r->outcome == ACE2K_LANE_STALLED || r->outcome == ACE2K_LANE_TIMEOUT));
 }

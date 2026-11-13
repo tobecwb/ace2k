@@ -463,7 +463,7 @@ class FeedForward:
             return
         if self.clock is None:
             self.clock = self.printer.lookup_object("mcu")
-        moves = self.moves[name] = collections.deque(maxlen=MOVES_MAX)
+        self.moves[name] = collections.deque(maxlen=MOVES_MAX)
         original = getattr(obj, attr)
 
         # This wraps the hook of Klipper. Its arguments and its result are passed on unchanged.
@@ -475,23 +475,9 @@ class FeedForward:
             result = original(print_time, move, *args, **kwargs)
             try:
                 e_distance = move.axes_d[3]
-                if e_distance:
+                if e_distance:  # most moves have no E: they skip the sum and the call
                     duration = move.accel_t + move.cruise_t + move.decel_t
-                    run = None
-                    if e_distance < 0.0:
-                        run = self.runs.get(name)
-                        # A gap of more than one window (at least one period) without E ends the
-                        # run. A retraction of the print, long after the retraction of an unload,
-                        # is not part of it.
-                        if run is None or print_time > run.end_pt + self._window_s():
-                            run = self.runs[name] = Retraction()
-                        run.total -= e_distance
-                        run.end_pt = print_time + duration
-                    else:
-                        self.runs.pop(name, None)  # an extrusion ends the retraction
-                    # The last slot is the class (long or not). window_parts freezes it once a
-                    # span of either part reaches the move.
-                    moves.append([print_time, duration, e_distance, run, None])
+                    self.note_move(name, print_time, duration, e_distance)
             except Exception:
                 if not self.record_failed:
                     self.record_failed = True
@@ -505,6 +491,37 @@ class FeedForward:
         setattr(obj, attr, wrapper)
         if self.timer is None:
             self.timer = self.reactor.register_timer(self._tick, self.reactor.monotonic())
+
+    def note_move(self, name: str, print_time: float, duration: float, e_distance: float) -> bool:
+        """Record one move of the extruder ``name``, as the hook records a planned move.
+
+        This is for a module that moves an extruder's stepper outside the extruder's own move,
+        such as a parked head. The lane meters the move out as it does a planned move, and takes
+        a long retraction back. ``print_time`` is the start of the move, ``duration`` its length
+        in seconds and ``e_distance`` its E in mm (negative for a retraction).
+
+        Return False if the extruder is not hooked: nothing is recorded. Return True otherwise.
+        A move without E records nothing."""
+        moves = self.moves.get(name)
+        if moves is None:
+            return False
+        if not e_distance:
+            return True
+        run = None
+        if e_distance < 0.0:
+            run = self.runs.get(name)
+            # A gap of more than one window (at least one period) without E ends the run. A
+            # retraction of the print, long after the retraction of an unload, is not part of it.
+            if run is None or print_time > run.end_pt + self._window_s():
+                run = self.runs[name] = Retraction()
+            run.total -= e_distance
+            run.end_pt = print_time + duration
+        else:
+            self.runs.pop(name, None)  # an extrusion ends the retraction
+        # The last slot is the class (long or not). window_parts freezes it once a span of either
+        # part reaches the move.
+        moves.append([print_time, duration, e_distance, run, None])
+        return True
 
     # --- the rate ------------------------------------------------------------------------
 
