@@ -1600,7 +1600,7 @@ TEST(a_cool_down_does_not_end_on_one_rising_outlet)
     ASSERT_EQ(r.dryer.cool, ACE2K_DRYER_COOL_WAITING);
 }
 
-/* The retarget: a manual start over an automatic cycle replaces it in place. */
+/* The retarget: a manual start over a running cycle replaces it in place. */
 TEST(a_retarget_while_heating_moves_the_target_and_the_end)
 {
     rig_init(&r, 25000);

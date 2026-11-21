@@ -217,13 +217,50 @@ TEST(a_manual_start_over_an_own_cycle_makes_it_manual)
     ASSERT_EQ(t.s.failures, 0U); /* a manual cycle counts neither way */
 }
 
-TEST(a_manual_start_over_a_manual_cycle_is_busy)
+TEST(a_manual_start_over_a_manual_cycle_retargets_up_and_down)
 {
     struct auto_rig t;
     auto_init(&t, ACE2K_DRYER_AUTO_MANUAL);
     ASSERT_EQ(ace2k_dryer_auto_manual_start(&t.a, 50U, 30U, t.r.now_ms), ACE2K_DRYER_OK);
     ASSERT_TRUE(rig_run_until(&t.r, ACE2K_DRYER_HEATING, 5000U));
+    ASSERT_EQ(ace2k_dryer_auto_manual_start(&t.a, 60U, 45U, t.r.now_ms), ACE2K_DRYER_OK);
+    ASSERT_EQ(t.r.dryer.state, ACE2K_DRYER_HEATING);
+    ASSERT_EQ(t.r.dryer.target_c, 60U);
+    ASSERT_EQ(t.r.dryer.highest_target_c, 60U);
+    ASSERT_EQ(t.r.dryer.end_ms, t.r.now_ms + (45U * RIG_MIN_MS));
+    ASSERT_EQ(ace2k_dryer_auto_manual_start(&t.a, 45U, 15U, t.r.now_ms), ACE2K_DRYER_OK);
+    ASSERT_EQ(t.r.dryer.state, ACE2K_DRYER_HEATING);
+    ASSERT_EQ(t.r.dryer.target_c, 45U);
+    ASSERT_EQ(t.r.dryer.highest_target_c, 60U);
+    ASSERT_EQ(t.r.dryer.end_ms, t.r.now_ms + (15U * RIG_MIN_MS));
+    ASSERT_TRUE(!t.a.own && !t.a.bound);
+}
+
+TEST(a_manual_start_over_a_starting_manual_cycle_retargets_and_checks_range)
+{
+    struct auto_rig t;
+    auto_init(&t, ACE2K_DRYER_AUTO_MANUAL);
+    ASSERT_EQ(ace2k_dryer_auto_manual_start(&t.a, 50U, 30U, t.r.now_ms), ACE2K_DRYER_OK);
+    ASSERT_EQ(t.r.dryer.state, ACE2K_DRYER_STARTING);
+    ASSERT_EQ(ace2k_dryer_auto_manual_start(&t.a, 66U, 30U, t.r.now_ms), ACE2K_DRYER_RANGE);
+    ASSERT_EQ(ace2k_dryer_auto_manual_start(&t.a, 50U, 0U, t.r.now_ms), ACE2K_DRYER_RANGE);
+    ASSERT_EQ(t.r.dryer.target_c, 50U);
+    ASSERT_EQ(ace2k_dryer_auto_manual_start(&t.a, 55U, 20U, t.r.now_ms), ACE2K_DRYER_OK);
+    ASSERT_EQ(t.r.dryer.state, ACE2K_DRYER_STARTING);
+    ASSERT_EQ(t.r.dryer.target_c, 55U);
+    ASSERT_EQ(t.r.dryer.end_ms, t.r.now_ms + (20U * RIG_MIN_MS));
+}
+
+TEST(a_manual_start_during_cooldown_of_a_manual_cycle_is_busy)
+{
+    struct auto_rig t;
+    auto_init(&t, ACE2K_DRYER_AUTO_MANUAL);
+    ASSERT_EQ(ace2k_dryer_auto_manual_start(&t.a, 50U, 30U, t.r.now_ms), ACE2K_DRYER_OK);
+    ASSERT_TRUE(rig_run_until(&t.r, ACE2K_DRYER_HEATING, 5000U));
+    ASSERT_EQ(ace2k_dryer_auto_manual_stop(&t.a, t.r.now_ms), ACE2K_DRYER_OK);
+    ASSERT_EQ(t.r.dryer.state, ACE2K_DRYER_COOLDOWN);
     ASSERT_EQ(ace2k_dryer_auto_manual_start(&t.a, 60U, 30U, t.r.now_ms), ACE2K_DRYER_BUSY);
+    ASSERT_EQ(t.r.dryer.state, ACE2K_DRYER_COOLDOWN);
 }
 
 TEST(a_running_manual_cycle_blocks_the_humidity_mode)

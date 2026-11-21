@@ -146,8 +146,7 @@ FAULT_HINTS = {
     " The heater stopped; the fans cool it down (ACEK_DRY_CLEAR once it is cool)",
 }
 REFUSAL_TEXT = {
-    1: "busy — a cycle or its cool-down is running (ACEK_DRY_STOP first), or the fans are held by a"
-    " manual run (ACEK_FAN ON=0 first)",
+    1: "busy — a cool-down is running, or the fans are held by a manual run (ACEK_FAN ON=0 first)",
     2: "out of range — 15–65 °C, 1 min to 24 h",
     3: "the dryer is in a fault — ACEK_DRY_CLEAR once it is cool",
     4: "a temperature sensor is not valid",

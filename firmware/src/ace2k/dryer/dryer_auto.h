@@ -110,8 +110,8 @@ void ace2k_dryer_auto_timing(struct ace2k_dryer_auto *self, uint32_t hold_ms, ui
  * in milliseconds would not fit 32 bits (nothing changes). */
 int ace2k_dryer_auto_timing_s(struct ace2k_dryer_auto *self, uint32_t hold_s, uint32_t window_s,
                               uint32_t link_s);
-/* A start from the host, as ACEK_DRY sends it. Over an own or bound cycle in STARTING or
- * HEATING it retargets that cycle, which becomes manual; otherwise it is ace2k_dryer_start().
+/* A start from the host, as ACEK_DRY sends it. Over any cycle in STARTING or HEATING it
+ * retargets that cycle in place, which becomes manual; otherwise it is ace2k_dryer_start().
  * Once accepted, it drops a pending outcome: that counts neither way. */
 enum ace2k_dryer_refusal ace2k_dryer_auto_manual_start(struct ace2k_dryer_auto *self,
                                                        uint8_t target_c, uint16_t minutes,
