@@ -1776,13 +1776,13 @@ Since v0.13.0 the unit runs three modes beside the dryer: `manual` (0), `humidit
 (2). The modes decide like a user. They start and stop the dryer, and they read its state. Their
 tick runs every 10 ms, right after the dryer's.
 
-**The host's start and stop go through them.** `ace2k_dryer_start` over any cycle still in
-`starting` or `heating` — manual, humidity-mode or bound — does not refuse or start a second
-cycle. It changes the running cycle's target and time in place, and the cycle is or becomes manual:
-it counts for nothing. Otherwise it is a plain start. Either way, an accepted start drops an
-outcome still waiting for a cold box. `ace2k_dryer_stop` of a humidity-mode cycle sets the mode to
-manual,
-and event 12 `auto_off` follows. That stop is never counted as a completed cycle. The stop of a
+**The host's start and stop go through them.** `ace2k_dryer_start` over a cycle still in
+`starting` or `heating` does not start a second cycle. It changes the running cycle's target and
+time in place. The cycle is then manual: it counts for nothing. This holds for a manual cycle since
+v0.15.1; before, that start was refused as `busy`. It holds for a humidity-mode or a bound cycle
+since v0.13.0. Otherwise it is a plain start. Either way, an accepted start drops an outcome still
+waiting for a cold box. `ace2k_dryer_stop` of a humidity-mode cycle sets the mode to manual, and
+event 12 `auto_off` follows. That stop is never counted as a completed cycle. The stop of a
 bound cycle leaves the mode as it was.
 
 **The cold box.** The chamber is sampled once a minute over a 30 min window. The box reads cold
@@ -2273,16 +2273,18 @@ a caller that holds only the object reads `printer.lookup_object("ace2k").feed.A
 - The dryer (since `API_VERSION` 13), on the unit's dryer object
   (`printer.lookup_object("ace2k_dryer")`, or `ace2k_dryer <name>`; the coordinator's unit carries
   it as `dryer`): `dryer.start(target_c, minutes)` starts a cycle at `target_c` (whole degrees,
-  15–65) for `minutes` (whole, 1–1 440), as `ACEK_DRY` does; `dryer.stop()` stops it, as
-  `ACEK_DRY_STOP` does; `dryer.clear()` leaves a fault, as `ACEK_DRY_CLEAR` does. Each returns once
-  the unit took it, and waits for the unit's answer only. Each raises `DryerRefused`
-  (`ace2k_dryer.DryerRefused`) when the unit refuses: `.what` is `start`, `stop` or `clear`,
-  `.code` the unit's number, and `.reason` the refusal's name ("The dryer", refusals: `busy`, `range`, `faulted`, `sensors`,
-  `no_mains`, `cutout`, `not_cool`, `shutdown`, `measuring`). `measuring` is transient: ask again
-  in a few seconds. Each raises `ValueError` for an argument out of range (nothing sent),
-  `NoAnswerError` (a `RuntimeError`) when the unit did not answer, and `RuntimeError` on an image
-  without the dryer. The state stays in `printer["ace2k_dryer <name>"]`, and the changes come as
-  the `ace2k:dryer` event.
+  15–65) for `minutes` (whole, 1–1 440), as `ACEK_DRY` does. Over a cycle still in `starting` or
+  `heating` it changes that cycle's target and time instead ("The host's start and stop go through
+  them"); over a manual cycle this holds since v0.15.1, and before it raised `busy`; `dryer.stop()`
+  stops it, as `ACEK_DRY_STOP` does; `dryer.clear()` leaves a fault, as `ACEK_DRY_CLEAR` does. Each
+  returns once the unit took it, and waits for the unit's answer only. Each raises `DryerRefused`
+  (`ace2k_dryer.DryerRefused`) when the unit refuses: `.what` is `start`, `stop` or `clear`, `.code`
+  the unit's number, and `.reason` the refusal's name ("The dryer", refusals: `busy`, `range`,
+  `faulted`, `sensors`, `no_mains`, `cutout`, `not_cool`, `shutdown`, `measuring`). `measuring` is
+  transient: ask again in a few seconds. Each raises `ValueError` for an argument out of range
+  (nothing sent), `NoAnswerError` (a `RuntimeError`) when the unit did not answer, and
+  `RuntimeError` on an image without the dryer. The state stays in `printer["ace2k_dryer <name>"]`,
+  and the changes come as the `ace2k:dryer` event.
 - The dryer's mode (since `API_VERSION` 27), on the unit's mode object
   (`printer.lookup_object("ace2k_dryer_mode")`, or `ace2k_dryer_mode <name>`; the unit carries it
   as `dryer_mode`):

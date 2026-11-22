@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.15.1 — 2026-11-22
+
+A running dryer cycle takes a new target. The host interface stays at version 29.
+
+### Changed
+
+- **`ACEK_DRY` changes a running cycle in place** (PR #14, by Simon-CR). Before, `ACEK_DRY` over a
+  manual cycle that was heating was refused as busy. To go from 45 °C to 55 °C you had to stop,
+  wait for the whole cool-down, and start again. Now the new target and the new time apply to the
+  running cycle. The heater does not stop. A cycle of the humidity or print mode already worked
+  this way. During a cool-down `ACEK_DRY` is still refused as busy. A target or a time out of
+  range is still refused, and the cycle goes on as it was.
+
+### For host modules
+
+- **`dryer.start()` over a running manual cycle now changes that cycle.** Before, the call raised
+  `DryerRefused` with `reason` `busy`. Now it returns, and the cycle takes the new target and time.
+  The rules in [`protocol.md`](docs/protocol.md#what-a-caller-can-rely-on) count a changed refusal
+  as a breaking change. This release is a patch all the same, and `API_VERSION` stays 29. The
+  change only lets through a start that was refused, and no known caller relies on that refusal.
+  A module that needs the old check reads the dryer's status and does not start over a running
+  cycle.
+
 ## v0.15.0 — 2026-11-13
 
 Two lanes share each tag reader. A tag now goes to a lane only when the tag follows that lane's
