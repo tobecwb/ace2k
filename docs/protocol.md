@@ -1672,7 +1672,7 @@ the inputs:
 
 | Refusal | Name | Meaning |
 |---|---|---|
-| 1 | `busy` | start: the dryer not `idle` (a cycle or a cool-down running), or the fans held by a manual run (`ACEK_FAN ON=0` first) |
+| 1 | `busy` | start: the dryer in cool-down or the fans held by a manual run (`ACEK_FAN ON=0` first) |
 | 2 | `range` | start: `target_c` outside 15–65, `minutes` outside 1–1 440 |
 | 3 | `faulted` | start: the dryer in `fault`, or the gate latched; stop: the dryer in `fault`; clear: the gate's latch would not clear for a reason none of the refusals below names |
 | 4 | `sensors` | start: an outlet NTC invalid, or no plausible chamber reading within 5 s; clear of a `ntc` or `chamber_stale` fault: that sensor still not valid; clear of any fault the gate latched: an outlet NTC invalid |
@@ -1776,11 +1776,12 @@ Since v0.13.0 the unit runs three modes beside the dryer: `manual` (0), `humidit
 (2). The modes decide like a user. They start and stop the dryer, and they read its state. Their
 tick runs every 10 ms, right after the dryer's.
 
-**The host's start and stop go through them.** `ace2k_dryer_start` over a humidity-mode cycle or a
-bound cycle that is still in `starting` or `heating` does not start a second cycle. It changes the
-running cycle's target and time in place, and the cycle becomes manual: it counts for nothing.
-Otherwise it is a plain start. Either way, an accepted start drops an outcome still waiting for a
-cold box. `ace2k_dryer_stop` of a humidity-mode cycle sets the mode to manual,
+**The host's start and stop go through them.** `ace2k_dryer_start` over any cycle still in
+`starting` or `heating` — manual, humidity-mode or bound — does not refuse or start a second
+cycle. It changes the running cycle's target and time in place, and the cycle is or becomes manual:
+it counts for nothing. Otherwise it is a plain start. Either way, an accepted start drops an
+outcome still waiting for a cold box. `ace2k_dryer_stop` of a humidity-mode cycle sets the mode to
+manual,
 and event 12 `auto_off` follows. That stop is never counted as a completed cycle. The stop of a
 bound cycle leaves the mode as it was.
 

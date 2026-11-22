@@ -319,8 +319,8 @@ void ace2k_dryer_binding_respond(enum ace2k_dryer_cmd_op op, enum ace2k_dryer_re
 // Klipper's generated dispatch declares every handler as void (*)(uint32_t *). The checks run
 // on the raw arguments. A target or a duration past its field is out of range, and it is never
 // narrowed into the field.
-// The host's start goes through the automatic modes: over an automatic cycle it retargets that
-// cycle (dryer_auto.h).
+// The host's start goes through the automatic modes: over any cycle in STARTING or HEATING it
+// retargets that cycle in place (dryer_auto.h).
 // cppcheck-suppress constParameterPointer
 void ace2k_dryer_cmd_start(uint32_t *args)
 {

@@ -927,7 +927,8 @@ Every refusal below comes from the unit, not from the host.
 
 ### `ACEK_DRY`
 
-Starts a drying cycle at a chamber target, for a duration.
+Starts a drying cycle at a chamber target, for a duration. Over a cycle still in `starting` or
+`heating`, it updates the target and remaining time in place and makes the cycle manual.
 
 | Parameter | Default | Range | Meaning |
 |---|---|---|---|
@@ -950,7 +951,7 @@ table prints `reason N`.
 
 | Code | Text |
 |---|---|
-| 1 | busy — a cycle or its cool-down is running (ACEK_DRY_STOP first), or the fans are held by a manual run (ACEK_FAN ON=0 first) |
+| 1 | busy — a cool-down is running, or the fans are held by a manual run (ACEK_FAN ON=0 first) |
 | 2 | out of range — 15–65 °C, 1 min to 24 h |
 | 3 | the dryer is in a fault — ACEK_DRY_CLEAR once it is cool |
 | 4 | a temperature sensor is not valid |

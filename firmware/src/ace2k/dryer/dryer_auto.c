@@ -174,7 +174,7 @@ enum ace2k_dryer_refusal ace2k_dryer_auto_manual_start(struct ace2k_dryer_auto *
                                                        uint32_t now_ms)
 {
     enum ace2k_dryer_refusal r;
-    if ((self->own || self->bound) && ace2k_dryer_running_state(self->dryer->state)) {
+    if (ace2k_dryer_running_state(self->dryer->state)) {
         r = ace2k_dryer_retarget(self->dryer, target_c, minutes, now_ms);
         if (r == ACE2K_DRYER_OK) {
             self->own = false;
