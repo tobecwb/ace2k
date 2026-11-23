@@ -279,6 +279,12 @@ class LaneMotion:
     # from final_seq, which motions that the unit starts itself (seq 0) overwrite later.
     accepted_ended: bool = True
     final_seq: int | None = None  # the seq of the last final event
+    # The kind of that event, as a number. A second final event with the same seq and kind (one
+    # recovered from the unit, then the real one late after all) is dropped.
+    final_kind: int | None = None
+    # True while the host asks the unit for the last final event of the lane (FeedMotion._ask_last).
+    # The start that it asks for is not counted over meanwhile.
+    asking: bool = False
     report_seq: int | None = None  # the seq that the last state report showed
     # True when a final event came after the last state report. The motion that the report
     # showed is then over.
@@ -407,7 +413,9 @@ class FeedMotion(FeedBase):
         """Update the motion records from a state report, on the reactor.
 
         A start that the unit accepted without a final event counts as over when a report,
-        GONE_REPORTS reports after the acceptance, shows the lane idle or in error."""
+        GONE_REPORTS reports after the acceptance, shows the lane idle or in error. A firmware
+        with the query of a lane's last final event is asked first (``_ask_last``): its final
+        event may only have been lost on the link."""
         self.reports += 1
         for i in range(LANES):
             m = self.motion[i]
@@ -421,22 +429,122 @@ class FeedMotion(FeedBase):
                 and not m.accepted_ended
                 and modes[i] in ("idle", "error")
                 and self.reports >= m.accepted_report + GONE_REPORTS
+                and not m.asking
             ):
+                if self.last_query is None:
+                    self._count_over(i, acc, modes[i])
+                else:
+                    # The query blocks, so it runs in a callback of its own, after this report.
+                    m.asking = True
+                    self.reactor.register_callback(self._asker(i, acc, modes[i]))
+
+    def _asker(self, index: int, seq: int, mode: object) -> Callable[[float], None]:
+        """Return the reactor callback that runs ``_ask_last`` for the lane's start ``seq``."""
+
+        def run(_eventtime: float) -> None:
+            self._ask_last(index, seq, mode)
+
+        return run
+
+    def _count_over(self, index: int, seq: int, mode: object) -> None:
+        """Count the accepted start ``seq`` of the lane as over: its final event never came.
+
+        Its final event may still come up to the next report (the lost window, ``lost_seq``)."""
+        m = self.motion[index]
+        logging.warning(
+            "%s lane %s: start %d reported %s without its final event; counted over",
+            self.unit.head("feed"),
+            self.unit.lane_text(index),
+            seq,
+            mode,
+        )
+        m.final_seq = seq
+        m.final_kind = None  # the late final event of that start is not a second one
+        m.accepted_ended = True
+        m.lost_seq = seq
+        m.lost_stop_by = None
+        m.lost_report = self.reports
+        if m.stop_by is not None and m.stop_by[0] == seq:
+            m.lost_stop_by, m.stop_by = m.stop_by, None
+        self.follow_auto.on_lost(index, seq)
+
+    def _ask_last(self, index: int, seq: int, mode: object) -> None:
+        """Ask the unit for the last final event of the lane, for the start ``seq`` reported idle.
+
+        This runs in a reactor callback of its own, as the query blocks. When the unit answers with
+        that seq, its answer is the final event that was lost on the link, and it is handled as if
+        it had arrived. When the query fails, or the unit answers for another lane (a late answer:
+        Klipper matches an answer by its name only) or with another seq, the start is counted
+        over. Only a start that is still open is ended: when its real final event came meanwhile,
+        or a newer start was accepted, the answer is dropped, with a debug line (none when the
+        real final event came and the answer misses)."""
+        m = self.motion[index]
+        assert self.last_query is not None  # asked only on an image with the query
+        try:
+            missed = None  # why the answer is not the start's final event
+            try:
+                params = ask(self.printer, self.mcu, self.last_query, [index], "last final event")
+            except NoAnswerError as e:
+                missed = str(e)
+            else:
+                if params["lane"] != index:
+                    missed = f"the unit answered for lane {params['lane'] + 1}"
+                elif params["seq"] == 0:
+                    missed = "the unit holds no final event of a host start"
+                elif params["seq"] != seq:
+                    missed = f"the unit's last final event is start {params['seq']}'s"
+            if not (m.accepted_seq == seq and not m.accepted_ended):
+                if m.final_seq != seq:
+                    # A newer start was accepted before this one's final event came.
+                    logging.debug(
+                        "%s lane %s: the unit's answer for start %d came after a newer start;"
+                        " dropped",
+                        self.unit.head("feed"),
+                        self.unit.lane_text(index),
+                        seq,
+                    )
+                elif missed is None:  # its real final event came while the unit was asked
+                    self._drop_twice(index, seq, self._event_from(params)["kind"])
+                return
+            if missed is not None:
                 logging.warning(
-                    "%s lane %s: start %d reported %s without its final event; counted over",
+                    "%s lane %s: start %d: the unit was asked for its final event; %s",
                     self.unit.head("feed"),
-                    self.unit.lane_text(i),
-                    acc,
-                    modes[i],
+                    self.unit.lane_text(index),
+                    seq,
+                    missed,
                 )
-                m.final_seq = acc
-                m.accepted_ended = True
-                m.lost_seq = acc
-                m.lost_stop_by = None
-                m.lost_report = self.reports
-                if m.stop_by is not None and m.stop_by[0] == acc:
-                    m.lost_stop_by, m.stop_by = m.stop_by, None
-                self.follow_auto.on_lost(i, acc)
+                self._count_over(index, seq, mode)
+                return
+            event = self._event_from(params)
+            logging.info(
+                "%s lane %s: start %d's final event was lost on the link; recovered from the unit"
+                " — %s (%s), motor %.1f mm, filament %.1f mm",
+                self.unit.head("feed"),
+                self.unit.lane_text(index),
+                seq,
+                event["kind"],
+                event["mode"],
+                event["motor_mm"],
+                event["filament_mm"],
+            )
+            self.lanes[index]["last_event"] = event
+            self._dispatch(index, event, params["kind"])
+        finally:
+            m.asking = False
+
+    def _drop_twice(self, index: int, seq: int, kind: object) -> None:
+        """Log a final event of the lane that came a second time, and keep the first as the last."""
+        logging.debug(
+            "%s lane %s: start %d's final event %s came twice; the second is dropped",
+            self.unit.head("feed"),
+            self.unit.lane_text(index),
+            seq,
+            kind,
+        )
+        m = self.motion[index]
+        if m.final_event is not None:
+            self.lanes[index]["last_event"] = m.final_event  # the first stays the last
 
     def _forget_lost(self, index: int) -> None:
         """Forget the start of the lane that was counted over: its final event no longer ends it."""
@@ -455,19 +563,25 @@ class FeedMotion(FeedBase):
             self.state_reported = True
             self.first_report.complete(True)
 
-    def _handle_event(self, params: Params) -> None:
-        index = params["lane"]
+    @staticmethod
+    def _event_from(params: Params) -> Event:
+        """Return the event of an event frame, or of the unit's answer with a lane's last one."""
         kind = params["kind"]
-        seq = params["seq"]
-        event: Event = dict(
+        return dict(
             kind=KIND_NAMES.get(kind, kind),
             mode=MODE_NAMES.get(params["mode"], params["mode"]),
             motor_mm=to_mm(params["motor_um"]),
             filament_mm=to_mm(params["filament_um"]),
-            seq=seq,
+            seq=params["seq"],
             stop_by=None,
             tag_search=False,
         )
+
+    def _handle_event(self, params: Params) -> None:
+        index = params["lane"]
+        kind = params["kind"]
+        seq = params["seq"]
+        event = self._event_from(params)
         lane = self.lanes[index]
         lane["last_event"] = event
         if kind == KIND_TAIL:
@@ -511,7 +625,13 @@ class FeedMotion(FeedBase):
             # The motion record is updated here and not on the serial thread, to stay in order
             # with the stops.
             m = self.motion[index]
+            if seq != 0 and seq == m.final_seq and kind == m.final_kind:
+                # One recovered from the unit and the real one, late after all. A runout after an
+                # error has another kind and goes on.
+                self._drop_twice(index, seq, event["kind"])
+                return
             m.final_seq = seq
+            m.final_kind = kind
             m.ended_since_report = True
             if seq == m.accepted_seq:
                 m.accepted_ended = True

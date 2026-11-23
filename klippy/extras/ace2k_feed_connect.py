@@ -36,6 +36,8 @@ try:
         FF_STATE_FMT_FORWARD,
         GRIP_FMT,
         HELD_SET_FMT,
+        LAST_FMT,
+        LAST_RESP,
         LOAD_SET_FMT,
         NO_CLEAR,
         NO_FF,
@@ -101,6 +103,8 @@ except ImportError:  # the host tests import by bare name, with klippy/extras on
         FF_STATE_FMT_FORWARD,
         GRIP_FMT,
         HELD_SET_FMT,
+        LAST_FMT,
+        LAST_RESP,
         LOAD_SET_FMT,
         NO_CLEAR,
         NO_FF,
@@ -404,6 +408,13 @@ class FeedConnect(FeedBase):
         self.tail_mm = self.mcu.get_constant_float("ACE2K_FEED_UNLOAD_TAIL_UM") / 1000.0
         # A firmware with the reader binding searches for the tag past the parking point.
         self.has_search = self.mcu.try_lookup_command(SEARCH_FMT) is not None
+        # A firmware that keeps each lane's last final event answers for a start whose final
+        # event was lost on the link. Without it, such a start is counted over.
+        self.last_query = (
+            self.mcu.lookup_query_command(LAST_FMT, LAST_RESP)
+            if self.mcu.try_lookup_command(LAST_FMT) is not None
+            else None
+        )
         if self.search_mm is None:
             self.search_mm = firmware_search_mm(self.mcu)
         self._default_unload_speed()

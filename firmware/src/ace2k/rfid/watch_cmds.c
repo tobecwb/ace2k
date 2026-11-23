@@ -565,7 +565,8 @@ void ace2k_rfid_cmd_query(uint32_t *args)
 DECL_COMMAND(ace2k_rfid_cmd_query, "ace2k_rfid_query rest_ticks=%u");
 
 // The host's mask of the lanes in use, a bit per lane: the lanes whose tip is in a head that
-// prints, is paused or is otherwise in use.  The host sends it on every change and every second.
+// prints, is paused or is otherwise in use.  The host sends it on every change; the unit holds it
+// until the link drops or the host connects again, which ACE2K_RFID_IN_USE_HOLD tells the host.
 // It is published at once, so the feed's next tick sees a lane that just became in use.  A mask
 // above the four lanes is a bug in the host.
 // cppcheck-suppress constParameterPointer
@@ -578,6 +579,24 @@ void ace2k_rfid_cmd_in_use(uint32_t *args)
     publish();
 }
 DECL_COMMAND(ace2k_rfid_cmd_in_use, "ace2k_rfid_in_use mask=%c");
+
+// The host's connect (ace2k_version) drops the mask: none is set since the link came up, also
+// across a quick host restart that never let the link count as lost.  Before the init no mask can
+// exist, and this runs in a handler that works in a shutdown, so it does not start the init.
+void ace2k_rfid_binding_drop_in_use(void)
+{
+    if (!ace2k_rfid_ready) {
+        return;
+    }
+    ace2k_rfid_watch_drop_in_use(&ace2k_rfid_watch_instance);
+    publish();
+}
+
+// A host that finds this constant need not send the mask again every second.  Klipper's
+// DECL_CONSTANT encodes its value with signed literals inside the macro, so the lint's
+// signed-bitwise check is off for this declaration only.
+// NOLINTNEXTLINE(bugprone-signed-bitwise)
+DECL_CONSTANT("ACE2K_RFID_IN_USE_HOLD", 1);
 
 // The user named the lane's material by hand: no tag is attributed to it until its strand leaves.
 // A lane with no filament ignores it.  ace2k_rfid_by_hand_state tells the host the marks.

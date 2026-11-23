@@ -419,6 +419,23 @@ void ace2k_feed_cmd_stop(uint32_t *args)
 }
 DECL_COMMAND(ace2k_feed_cmd_stop, "ace2k_feed_stop lane=%c");
 
+// The last final event of the lane's host start, as the host asks for it when a final event was
+// lost on the link.  Same fields as the event, all zero before any host start has ended.  The copy
+// is read under the mask, because the tick writes it.
+// cppcheck-suppress constParameterPointer
+void ace2k_feed_cmd_last_query(uint32_t *args)
+{
+    ensure_ready();
+    uint8_t lane = ACE2K_ARG_LANE(args[0], "ace2k_feed_last_query: lane out of range");
+    struct ace2k_feed_event ev;
+    irqstatus_t flag = irq_save();
+    (void)ace2k_feed_last_final(&ace2k_feed_instance, lane, &ev);
+    irq_restore(flag);
+    sendf("ace2k_feed_last lane=%c kind=%c mode=%c motor_um=%u filament_um=%i seq=%c", lane,
+          ev.kind, ev.mode, ev.motor_um, ev.filament_um, ev.seq);
+}
+DECL_COMMAND(ace2k_feed_cmd_last_query, "ace2k_feed_last_query lane=%c");
+
 // cppcheck-suppress constParameterPointer
 void ace2k_feed_cmd_clear(uint32_t *args)
 {

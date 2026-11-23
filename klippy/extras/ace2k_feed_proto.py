@@ -99,6 +99,11 @@ SPEED_FMT = "ace2k_feed_speed_set lane=%c speed_um_s=%u"
 SPEED_RESP = "ace2k_feed_speed_set_response lane=%c accepted=%c reason=%c"
 STATE_FMT = "ace2k_feed_state mode=%*s error=%*s speed_um_s=%*s duty_pct=%*s bursts=%*s seq=%*s"
 EVENT_FMT = "ace2k_feed_event lane=%c kind=%c mode=%c motor_um=%u filament_um=%i seq=%c"
+# The last final event of a host start on a lane, as the unit keeps it (seq 0: none yet). The
+# host asks for it before it counts a start over whose final event was lost on the link. An
+# image without the query leaves that start counted over.
+LAST_FMT = "ace2k_feed_last_query lane=%c"
+LAST_RESP = "ace2k_feed_last lane=%c kind=%c mode=%c motor_um=%u filament_um=%i seq=%c"
 SCALE_FMT = "ace2k_lane_scale_set lane=%c um_per_count_x10=%u"
 SEARCH_FMT = "ace2k_rfid_search_set search_um=%u"
 DEFAULT_SEARCH_MM = 750.0  # used only when the firmware image declares no default

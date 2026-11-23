@@ -176,6 +176,8 @@ try:
         GRIP_FMT,
         HELD_SET_FMT,
         KIND_NAMES,
+        LAST_FMT,
+        LAST_RESP,
         LOAD_SET_FMT,
         MODE_NAMES,
         NO_CLEAR,
@@ -281,6 +283,8 @@ except ImportError:  # the host tests import by bare name, with klippy/extras on
         GRIP_FMT,
         HELD_SET_FMT,
         KIND_NAMES,
+        LAST_FMT,
+        LAST_RESP,
         LOAD_SET_FMT,
         MODE_NAMES,
         NO_CLEAR,
@@ -463,7 +467,7 @@ class Ace2kFeed(FeedConnect, FeedMotion):
         self.tail_mm = None  # the motor travel of an unload or rollback past the bay entrance
         self.unload_clear_mm = 0.0  # an unload's travel past the bay's sensor (0: none)
         # The commands and queries that the connect builds. They are None until then.
-        self.start_query = self.speed_query = self.stop_when_query = None
+        self.start_query = self.speed_query = self.stop_when_query = self.last_query = None
         self.stop_cmd = self.clear_cmd = self.scale_cmd = self.load_set_cmd = None
         self.ff_base_cmd = self.ff_query_cmd = self.grip_cmd = self.park_cmd = None
         self.wait_cmd = None

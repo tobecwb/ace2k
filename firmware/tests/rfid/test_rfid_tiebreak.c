@@ -391,9 +391,10 @@ TEST(no_tiebreak_without_a_valid_mask)
     tb_steps(&tw, NULL, 0, 2);
     ASSERT_EQ(tw.starts[2], 1); /* quiet long enough: it starts at once */
     tb_steps(&tw, NULL, 0, 300);
-    /* The host stops refreshing.  1.5 s later a new strand goes in: its quiet time would end at
-     * 3.5 s, after the mask went stale at 3 s. */
+    /* The host connects again (its ace2k_version): the mask is dropped.  A new strand goes in 1.5 s
+     * later and no tie-break runs for it, as with no mask. */
     tw.mask_on = false;
+    ace2k_rfid_watch_drop_in_use(&tw.w);
     tb_steps(&tw, NULL, 0, 150);
     tw.in.insert = 0;
     tb_steps(&tw, NULL, 0, 1);
@@ -402,7 +403,7 @@ TEST(no_tiebreak_without_a_valid_mask)
     ASSERT_EQ(tw.attempts[2], 1);
     uint8_t m = 0xFF;
     ASSERT_TRUE(!ace2k_rfid_watch_in_use(&tw.w, &m));
-    /* The host refreshes again, then the link drops and comes back: the mask is gone until the
+    /* The host sends a mask again, then the link drops and comes back: the mask is gone until the
      * host sends one again. */
     tb_mask(&tw, 0);
     tw.in.link_ok = false;

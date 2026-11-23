@@ -370,8 +370,7 @@ void ace2k_rfid_watch_step(struct ace2k_rfid_watch *self, uint32_t now_ms,
         }
     }
     if (!in->link_ok) {
-        self->in_use_set = false;
-        self->in_use = 0;
+        ace2k_rfid_watch_drop_in_use(self);
         /* A lane set by hand keeps its mark: only its strand leaving clears it (lane_update). */
         for (uint8_t r = 0; r < ACE2K_RFID_READER_COUNT; r++) {
             if (self->r[r].session_open) {
@@ -472,13 +471,17 @@ void ace2k_rfid_watch_set_in_use(struct ace2k_rfid_watch *self, uint8_t mask)
 {
     self->in_use = mask;
     self->in_use_set = true;
-    self->t_in_use_ms = self->now_ms;
+}
+
+void ace2k_rfid_watch_drop_in_use(struct ace2k_rfid_watch *self)
+{
+    self->in_use_set = false;
+    self->in_use = 0;
 }
 
 bool ace2k_rfid_watch_in_use(const struct ace2k_rfid_watch *self, uint8_t *mask)
 {
-    if (!self->in_use_set ||
-        ace2k_time_since(self->now_ms, self->t_in_use_ms) > ACE2K_RFID_IN_USE_STALE_MS) {
+    if (!self->in_use_set) {
         *mask = 0;
         return false;
     }

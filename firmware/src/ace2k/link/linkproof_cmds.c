@@ -13,6 +13,9 @@
 #include "board/irq.h" // irq_save, irq_restore
 #include "command.h"   // DECL_COMMAND_FLAGS, sendf, shutdown
 #include "sched.h"     // DECL_INIT, DECL_TASK, sched_wake_task, sched_check_wake
+#if CONFIG_ACE2K_RFID_READ
+#include "rfid/watch_cmds.h" // ace2k_rfid_binding_drop_in_use
+#endif
 #if CONFIG_ACE2K_LED
 #include "lane/led_cmds.h"
 #endif
@@ -160,6 +163,9 @@ DECL_TASK(ace2k_linkproof_binding_task);
 void ace2k_linkproof_cmd_version(uint32_t *args)
 {
     (void)args;
+#if CONFIG_ACE2K_RFID_READ
+    ace2k_rfid_binding_drop_in_use(); // the host connects: no mask since the link came up
+#endif
     ensure_ready();
     sendf("ace2k_version_response version=%s", running_version);
     if (ace2k_linkproof_proven(&ace2k_linkproof_instance) == 0) {

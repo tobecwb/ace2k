@@ -626,6 +626,183 @@ TEST(the_event_ring_drops_and_counts_beyond_sixteen)
     ASSERT_TRUE(!ace2k_feed_has_events(&w.feed));
 }
 
+TEST(last_final_is_none_before_any_start)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e = { .kind = 9, .seq = 9 };
+    for (uint8_t lane = 0; lane < ACE2K_LANE_COUNT; lane++) {
+        ASSERT_TRUE(!ace2k_feed_last_final(&w.feed, lane, &e));
+        ASSERT_EQ(e.kind, 0);
+        ASSERT_EQ(e.mode, 0);
+        ASSERT_EQ(e.seq, 0);
+        ASSERT_EQ(e.motor_um, 0);
+        ASSERT_EQ(e.filament_um, 0);
+        e.kind = 9;
+        e.seq = 9;
+    }
+}
+
+TEST(last_final_copies_each_final_kind_of_a_host_start)
+{
+    struct world w;
+    world_init(&w);
+    const uint8_t kinds[] = {
+        ACE2K_FEED_DONE,    ACE2K_FEED_STOPPED,           ACE2K_FEED_RUNOUT,
+        ACE2K_FEED_STUCK,   ACE2K_FEED_TANGLED,           ACE2K_FEED_MOTOR_STALLED,
+        ACE2K_FEED_TIMEOUT, ACE2K_FEED_UNLOAD_INCOMPLETE,
+    };
+    for (unsigned i = 0; i < sizeof kinds; i++) {
+        struct ace2k_feed_event ring_e;
+        struct ace2k_feed_event last;
+        w.feed.l[1].seq = (uint8_t)(40 + i);
+        ace2k_feed_push_event(&w.feed, 1, kinds[i], ACE2K_FEED_FEEDING, 1000U + i,
+                              -(int32_t)(500 + i));
+        ASSERT_TRUE(pop(&w, &ring_e));
+        ASSERT_TRUE(ace2k_feed_last_final(&w.feed, 1, &last));
+        ASSERT_EQ(last.lane, ring_e.lane);
+        ASSERT_EQ(last.kind, ring_e.kind);
+        ASSERT_EQ(last.mode, ring_e.mode);
+        ASSERT_EQ(last.seq, ring_e.seq);
+        ASSERT_EQ(last.motor_um, ring_e.motor_um);
+        ASSERT_EQ(last.filament_um, ring_e.filament_um);
+        ASSERT_EQ(last.seq, 40 + i);
+    }
+    /* a real start, ended by a stop */
+    struct ace2k_feed_event e;
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 500000, 30000, 77, w.now),
+              ACE2K_FEED_ACCEPTED);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    ASSERT_TRUE(pop(&w, &e));
+    struct ace2k_feed_event last;
+    ASSERT_TRUE(ace2k_feed_last_final(&w.feed, 0, &last));
+    ASSERT_EQ(last.kind, ACE2K_FEED_STOPPED);
+    ASSERT_EQ(last.seq, 77);
+    ASSERT_EQ(last.motor_um, e.motor_um);
+    ASSERT_EQ(last.filament_um, e.filament_um);
+    /* the lane out of range answers none */
+    ASSERT_TRUE(!ace2k_feed_last_final(&w.feed, ACE2K_LANE_COUNT, &last));
+}
+
+TEST(the_notice_kinds_are_behind_snag_and_tail_only)
+{
+    for (unsigned kind = 0; kind <= ACE2K_FEED_STOPPED_SENSORS; kind++) {
+        bool notice =
+            (bool)(kind == ACE2K_FEED_BEHIND || kind == ACE2K_FEED_SNAG || kind == ACE2K_FEED_TAIL);
+        ASSERT_EQ(ace2k_feed_kind_is_notice((uint8_t)kind), notice);
+    }
+}
+
+TEST(last_final_ignores_notices_and_unit_modes)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event last;
+    w.feed.l[2].seq = 55;
+    ace2k_feed_push_event(&w.feed, 2, ACE2K_FEED_DONE, ACE2K_FEED_FEEDING, 111, 222);
+    const uint8_t notices[] = { ACE2K_FEED_BEHIND, ACE2K_FEED_SNAG, ACE2K_FEED_TAIL };
+    for (unsigned i = 0; i < sizeof notices; i++) {
+        ace2k_feed_push_event(&w.feed, 2, notices[i], ACE2K_FEED_FOLLOWING, 9, 9);
+    }
+    ASSERT_TRUE(ace2k_feed_last_final(&w.feed, 2, &last));
+    ASSERT_EQ(last.kind, ACE2K_FEED_DONE);
+    ASSERT_EQ(last.motor_um, 111);
+    ASSERT_EQ(last.filament_um, 222);
+    /* the unit's own mode: seq 0, final kind, no change */
+    w.feed.l[2].seq = 0;
+    ace2k_feed_push_event(&w.feed, 2, ACE2K_FEED_LOADED, ACE2K_FEED_LOADING, 7, 8);
+    ASSERT_TRUE(ace2k_feed_last_final(&w.feed, 2, &last));
+    ASSERT_EQ(last.kind, ACE2K_FEED_DONE);
+    ASSERT_EQ(last.seq, 55);
+}
+
+TEST(last_final_is_kept_when_the_event_ring_is_full)
+{
+    struct world w;
+    world_init(&w);
+    w.feed.l[0].seq = 5;
+    for (int i = 0; i < 15; i++) {
+        ace2k_feed_push_event(&w.feed, 0, ACE2K_FEED_DONE, ACE2K_FEED_FEEDING, 1, 1);
+    }
+    ASSERT_EQ(w.feed.dropped, 0);
+    w.feed.l[0].seq = 6;
+    ace2k_feed_push_event(&w.feed, 0, ACE2K_FEED_STOPPED, ACE2K_FEED_FEEDING, 600, -60);
+    ASSERT_EQ(w.feed.dropped, 1);
+    struct ace2k_feed_event last;
+    ASSERT_TRUE(ace2k_feed_last_final(&w.feed, 0, &last));
+    ASSERT_EQ(last.kind, ACE2K_FEED_STOPPED);
+    ASSERT_EQ(last.seq, 6);
+    ASSERT_EQ(last.motor_um, 600);
+    ASSERT_EQ(last.filament_um, -60);
+}
+
+TEST(last_final_holds_the_runout_after_an_error)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event last;
+    w.feed.l[3].seq = 12;
+    ace2k_feed_push_event(&w.feed, 3, ACE2K_FEED_TANGLED, ACE2K_FEED_FEEDING, 300, 100);
+    ASSERT_TRUE(ace2k_feed_last_final(&w.feed, 3, &last));
+    ASSERT_EQ(last.kind, ACE2K_FEED_TANGLED);
+    ace2k_feed_push_event(&w.feed, 3, ACE2K_FEED_RUNOUT, ACE2K_FEED_FEEDING, 350, 120);
+    ASSERT_TRUE(ace2k_feed_last_final(&w.feed, 3, &last));
+    ASSERT_EQ(last.kind, ACE2K_FEED_RUNOUT);
+    ASSERT_EQ(last.seq, 12);
+    ASSERT_EQ(last.motor_um, 350);
+    ASSERT_EQ(last.filament_um, 120);
+}
+
+TEST(last_final_holds_a_done_from_a_real_start)
+{
+    struct world w;
+    world_init(&w);
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 100000, 30000, 21, w.now),
+              ACE2K_FEED_ACCEPTED);
+    paced(&w, 324, 4, 4, 1);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    struct ace2k_feed_event e;
+    struct ace2k_feed_event last;
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_TRUE(ace2k_feed_last_final(&w.feed, 0, &last));
+    ASSERT_EQ(last.kind, ACE2K_FEED_DONE);
+    ASSERT_EQ(last.mode, ACE2K_FEED_FEEDING);
+    ASSERT_EQ(last.seq, 21);
+    ASSERT_EQ(last.motor_um, e.motor_um);
+    ASSERT_EQ(last.filament_um, e.filament_um);
+    ASSERT_EQ(last.motor_um, ace2k_lane_fg_to_um(1296));
+}
+
+TEST(last_final_holds_the_runout_after_a_real_error)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    struct ace2k_feed_event last;
+    /* the timeout of a feed, as in the error tests above */
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 100000, ACE2K_LANE_SPEED_MAX_UM_S,
+                               51, w.now),
+              ACE2K_FEED_ACCEPTED);
+    paced(&w, 435, 1, 12, 1);
+    steps(&w, 1, 1, 0);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_ERROR);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_TRUE(ace2k_feed_last_final(&w.feed, 0, &last));
+    ASSERT_EQ(last.kind, ACE2K_FEED_TIMEOUT);
+    ASSERT_EQ(last.seq, 51);
+    /* the filament leaves the lane in error: the runout of the failed start replaces the copy */
+    w.in.insert = 0x00;
+    step(&w, 4, 3);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_EQ(e.kind, ACE2K_FEED_RUNOUT);
+    ASSERT_TRUE(ace2k_feed_last_final(&w.feed, 0, &last));
+    ASSERT_EQ(last.kind, ACE2K_FEED_RUNOUT);
+    ASSERT_EQ(last.seq, 51);
+    ASSERT_EQ(last.motor_um, e.motor_um);
+    ASSERT_EQ(last.filament_um, e.filament_um);
+}
+
 TEST(a_start_repeating_the_last_seq_is_the_transports_retry_and_starts_nothing)
 {
     /* Klipper re-sends a query whose response it did not get: the second start must not read
