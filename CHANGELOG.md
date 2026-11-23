@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.16.0 — 2026-11-23
+
+A frame lost on the link no longer pauses or ends a print. The host interface stays at version 29.
+
+The link between the host and a unit is half-duplex: when both start to send at the same time,
+both frames are corrupted. The host sends its own frame again. A frame of the unit is gone. Two
+such losses were seen in one print: a swap paused, and later Klipper lost the unit.
+
+### Fixed
+
+- **A move whose final event was lost now ends as it should.** Before, the host saw the lane stop
+  but never got the end of the move, so a swap's roll back waited for its time limit and the print
+  paused. Now the unit keeps the last final event of each lane, and the host asks for it before it
+  gives up on the move. The move then ends with its real result.
+- **Klipper no longer loses a unit over its clock replies.** Before, the host sent the in-use mask
+  again every second. That frame could leave right after Klipper's clock request, one second after
+  another, and collide with the unit's reply until Klipper gave the unit up. Now the unit keeps the
+  mask until the link drops or the host connects again. The host sends it when it changes, at
+  connect, and after a lane stopped on a lost link.
+
+### Changed
+
+- **A new image and a new host go together best, but either works alone.** An older image keeps
+  working with this host: the host then sends the mask every second, as before, and a lost final
+  event is handled as before. An older host keeps working with this image.
+
+### For host modules
+
+- **Nothing changes in the host interface.** `Move`, the events and the status fields are as in
+  v0.15.1.
+- **The firmware dictionary grows.** `ace2k_feed_last_query lane=%c` answers with
+  `ace2k_feed_last` (the same fields as `ace2k_feed_event`), and the constant
+  `ACE2K_RFID_IN_USE_HOLD` says the unit keeps the mask
+  ([`protocol.md`](docs/protocol.md)). A module that talks to the firmware directly can keep
+  sending the mask every second: the unit takes it as before.
+
 ## v0.15.1 — 2026-11-22
 
 A running dryer cycle takes a new target. The host interface stays at version 29.

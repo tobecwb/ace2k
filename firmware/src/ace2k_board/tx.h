@@ -9,11 +9,13 @@
  * No interrupt in this image sends: the bindings send from tasks, and Klipper sends its shutdown
  * report from its main loop. So the try needs no re-entrancy guard of its own.
  * The reserve: the responses to host commands go out through plain sendf, and are dropped against
- * a full buffer. The frames of the bindings could fill the buffer to the brim on their tick. 24 B
+ * a full buffer. The frames of the bindings could fill the buffer to the brim on their tick. 27 B
  * keeps room for the largest steady-state response with its acknowledgement, each one alone:
  * - the clock response (12 B framed) and the ack (5 B);
  * - a health response (14 B typical, 23 at most) and the ack;
  * - a feed start response (10 B) and the ack;
+ * - a feed last response (22 B at most: msgid 2, lane, kind and mode 1 each, motor_um and
+ *   filament_um 5 each, seq 2, framing 5) and the ack, which is the largest, 27 B;
  * - Klipper's stats (up to 22 B).
  * The connect-time responses are not covered: the version (25 B), the thresholds (30 B), the
  * identify chunks. They rely on the transport's query retry, as a lost start response does.
@@ -30,7 +32,7 @@
 #include "command.h" /* struct command_encoder, _DECL_ENCODER */
 
 /* The room that the frame of a binding leaves behind it, for a command response and its ack. */
-#define ACE2K_TX_RESPONSE_RESERVE_B 24U
+#define ACE2K_TX_RESPONSE_RESERVE_B 27U
 
 /* Klipper's sendf as a try: true when the frame was queued with the reserve still free. */
 bool ace2k_tx_try_sendf(const struct command_encoder *ce, ...);

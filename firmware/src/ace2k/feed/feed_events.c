@@ -8,6 +8,18 @@
 void ace2k_feed_push_event(struct ace2k_feed *self, uint8_t lane, uint8_t kind, uint8_t mode,
                            uint32_t motor_um, int32_t filament_um)
 {
+    uint8_t seq = self->l[lane].seq;
+    /* The last final event of a host start is kept before the ring-full check, so a dropped event
+     * still lands in it.  The notices and the unit's own modes (seq 0) leave it as it was. */
+    if (!ace2k_feed_kind_is_notice(kind) && seq != 0) {
+        struct ace2k_feed_event *f = &self->l[lane].last_final;
+        f->lane = lane;
+        f->kind = kind;
+        f->mode = mode;
+        f->seq = seq;
+        f->motor_um = motor_um;
+        f->filament_um = filament_um;
+    }
     uint8_t next = (uint8_t)((self->head + 1U) % ACE2K_FEED_EVENT_RING);
     if (next == self->tail) {
         self->dropped++;
@@ -17,7 +29,7 @@ void ace2k_feed_push_event(struct ace2k_feed *self, uint8_t lane, uint8_t kind, 
     e->lane = lane;
     e->kind = kind;
     e->mode = mode;
-    e->seq = self->l[lane].seq;
+    e->seq = seq;
     e->motor_um = motor_um;
     e->filament_um = filament_um;
     ACE2K_COMPILER_BARRIER(); /* payload before index */
@@ -152,4 +164,15 @@ struct ace2k_feed_ff_counts ace2k_feed_ff_counts(const struct ace2k_feed *self, 
 uint8_t ace2k_feed_seq(const struct ace2k_feed *self, uint8_t lane)
 {
     return lane < ACE2K_LANE_COUNT ? self->l[lane].last_seq : 0;
+}
+
+bool ace2k_feed_last_final(const struct ace2k_feed *self, uint8_t lane,
+                           struct ace2k_feed_event *out)
+{
+    if (lane >= ACE2K_LANE_COUNT) {
+        *out = (struct ace2k_feed_event){ 0 };
+        return false;
+    }
+    *out = self->l[lane].last_final;
+    return out->seq != 0;
 }

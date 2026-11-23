@@ -357,6 +357,12 @@ enum ace2k_feed_kind {
     ACE2K_FEED_STOPPED_SENSORS = 21,
 };
 
+/* A notice: the lane goes on, and the event ends no mode. */
+static inline bool ace2k_feed_kind_is_notice(uint8_t kind)
+{
+    return (bool)(kind == ACE2K_FEED_BEHIND || kind == ACE2K_FEED_SNAG || kind == ACE2K_FEED_TAIL);
+}
+
 /* The answer to ace2k_feed_start() and ace2k_feed_set_speed().  0 means accepted.  Any other value
  * says why not. */
 enum ace2k_feed_refusal {
@@ -523,6 +529,12 @@ struct ace2k_feed_event {
 };
 
 struct ace2k_feed_lane {
+    /* The last final event of a host start, as it entered the ring.  A notice never changes it,
+     * and neither does an event of seq 0 (the unit's own modes).  It is written even when the ring
+     * was full and dropped the event, so the host can ask for a final event that the link lost
+     * (ace2k_feed_last_final).  A later final event of the same seq, a runout after an error,
+     * replaces it.  All zero until the first host start ends. */
+    struct ace2k_feed_event last_final;
     uint8_t mode;        /* enum ace2k_feed_mode */
     uint8_t error_kind;  /* the kind that put the lane in error */
     uint8_t failed_mode; /* in error: the mode it happened in; the runout that ends it names it */
@@ -1022,5 +1034,13 @@ struct ace2k_feed_ff_counts ace2k_feed_ff_counts(const struct ace2k_feed *self, 
  * start.  A mode of the unit itself leaves it as the seq of the last accepted host start.  It
  * returns 0 for a lane out of range. */
 uint8_t ace2k_feed_seq(const struct ace2k_feed *self, uint8_t lane);
+
+/* Copies the lane's last final event of a host start into out and returns true.  It returns false,
+ * with out zeroed, when none has happened yet or the lane is out of range.  The copy is what
+ * entered the ring, so it holds the event even when the ring dropped it.  Task context, under the
+ * caller's mask: the producers write it from the tick.  A new start does not clear the copy, so
+ * the host compares its seq with the seq of its own start. */
+bool ace2k_feed_last_final(const struct ace2k_feed *self, uint8_t lane,
+                           struct ace2k_feed_event *out);
 
 #endif

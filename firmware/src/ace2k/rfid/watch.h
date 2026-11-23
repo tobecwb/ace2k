@@ -106,8 +106,6 @@
  * least, and about one revolution of the largest spool.  A return later than that is not one turn
  * of the lane's spool. */
 #define ACE2K_RFID_PASSIVE_MAX_UM 950000
-/* A mask of the lanes in use, older than this, is no mask.  The host sends it every second. */
-#define ACE2K_RFID_IN_USE_STALE_MS 3000U
 /* The lanes of a reader that are not in use must have been still this long before a tie-break
  * starts. */
 #define ACE2K_RFID_TIEBREAK_QUIET_MS 2000U
@@ -322,8 +320,7 @@ struct ace2k_rfid_watch {
     uint32_t now_ms;                   /* the clock of the last step: "now" for host commands */
     struct ace2k_rfid_watch_inputs in; /* those of the last step */
     uint8_t in_use;                    /* the host's mask of the lanes in use */
-    bool in_use_set;                   /* a mask was set, and the link has not dropped since */
-    uint32_t t_in_use_ms;              /* the clock when the mask was set */
+    bool in_use_set; /* a mask was set, and the link has not dropped nor the host connected since */
     struct ace2k_rfid_confirm_cfg cfg;
     struct ace2k_rfid_watch_lane l[ACE2K_LANE_COUNT];
     struct ace2k_rfid_watch_reader r[ACE2K_RFID_READER_COUNT];
@@ -421,12 +418,16 @@ void ace2k_rfid_watch_set_by_hand(struct ace2k_rfid_watch *self, uint8_t lane);
 /* The lanes set by hand, one bit per lane. */
 uint8_t ace2k_rfid_watch_by_hand_bits(const struct ace2k_rfid_watch *self);
 
-/* The host sends the mask of the lanes in use (a bit per lane).  The watch keeps it with the clock
- * of the last step. */
+/* The host sends the mask of the lanes in use (a bit per lane).  The watch holds it until the link
+ * drops, the host connects again, or the host sends another. */
 void ace2k_rfid_watch_set_in_use(struct ace2k_rfid_watch *self, uint8_t mask);
 
+/* Drops the mask, as if none was set: the host's connect calls it, so a host that restarts quickly,
+ * and never lets the link count as lost, still starts with no mask. */
+void ace2k_rfid_watch_drop_in_use(struct ace2k_rfid_watch *self);
+
 /* Returns the mask of the lanes in use.  It returns false, with the mask 0, when none was set, the
- * link dropped since, or the mask is older than ACE2K_RFID_IN_USE_STALE_MS. */
+ * link dropped or the host connected since. */
 bool ace2k_rfid_watch_in_use(const struct ace2k_rfid_watch *self, uint8_t *mask);
 
 /* The host sets the confirmation, one value per enum ace2k_rfid_cfg_index: the longest leg, the

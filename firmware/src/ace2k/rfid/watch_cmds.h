@@ -34,9 +34,13 @@ void ace2k_rfid_binding_feed_bits(uint8_t *hold, uint8_t *read, uint8_t *lost, u
 
 /* Puts the host's mask of the lanes in use, one bit per lane, as the task last published it, and
  * returns true when that mask is valid.  It is not valid, and the mask is 0, with none set since
- * the link came up, or one older than ACE2K_RFID_IN_USE_STALE_MS.  It may be called from any
- * context: one load of the published word. */
+ * the link dropped or the host connected.  It may be called from any context: one load of the
+ * published word. */
 bool ace2k_rfid_binding_in_use(uint8_t *mask);
+
+/* Drops the host's mask of the lanes in use, and publishes it at once.  The host's connect
+ * (ace2k_version) calls it.  Call it from the task context, as the command handlers do. */
+void ace2k_rfid_binding_drop_in_use(void);
 
 /* Returns the lanes the unit holds set by hand, one bit per lane, as the task last published them.
  * It may be called from any context: one load of the published byte. */

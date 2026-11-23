@@ -161,6 +161,33 @@ TEST(a_search_reaching_under_two_millimetres_past_the_park_ends_the_load_at_the_
     one_event(&w, ACE2K_FEED_LOADED);
 }
 
+/* A load of the unit's own (seq 0) that ends after a host start leaves that start's copy. */
+TEST(a_unit_load_ending_after_a_host_start_leaves_that_starts_last_final)
+{
+    struct world w;
+    world_init(&w);
+    struct ace2k_feed_event e;
+    struct ace2k_feed_event last;
+    ASSERT_EQ(ace2k_feed_start(&w.feed, 0, ACE2K_FEED_CMD_FEED, 100000, 30000, 21, w.now),
+              ACE2K_FEED_ACCEPTED);
+    ace2k_feed_stop(&w.feed, 0, w.now);
+    ASSERT_TRUE(pop(&w, &e));
+    ASSERT_TRUE(ace2k_feed_last_final(&w.feed, 0, &last));
+    ASSERT_EQ(last.kind, ACE2K_FEED_STOPPED);
+    ASSERT_EQ(last.seq, 21);
+    ASSERT_EQ(ace2k_feed_search_set(&w.feed, PARK_UM + 1000U), 0);
+    load_pulling(&w, 0);
+    paced(&w, 972, 4, 4, 1);
+    ASSERT_EQ(ace2k_feed_mode(&w.feed, 0), ACE2K_FEED_IDLE);
+    one_event(&w, ACE2K_FEED_LOADED);
+    struct ace2k_feed_event after;
+    ASSERT_TRUE(ace2k_feed_last_final(&w.feed, 0, &after));
+    ASSERT_EQ(after.kind, last.kind);
+    ASSERT_EQ(after.seq, last.seq);
+    ASSERT_EQ(after.motor_um, last.motor_um);
+    ASSERT_EQ(after.filament_um, last.filament_um);
+}
+
 /* A lane the unit holds set by hand never gets a tag: its load ends after the pull with no search.
  * The same load on a lane not set by hand goes on to the search. */
 TEST(a_load_on_a_lane_set_by_hand_ends_after_its_pull_with_no_search)

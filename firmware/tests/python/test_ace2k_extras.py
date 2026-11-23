@@ -41,6 +41,10 @@ if TYPE_CHECKING:
     PrinterObject = Any
 
 
+class EchoLane(dict):
+    """A canned answer that carries the lane its query asked for (data[0]), as the unit's does."""
+
+
 class FakeQuery:
     """The MCU's canned response for the command, read when the query is sent (a query built
     at connect answers what the test set since): a response, or a list of responses handed out
@@ -76,6 +80,8 @@ class FakeQuery:
             response = response()
         if isinstance(response, BaseException):
             raise response
+        if isinstance(response, EchoLane):
+            response = dict(response, lane=data[0])
         return response
 
 
@@ -296,6 +302,7 @@ class FakeReactor:
         self.now = 100.0
         self.while_waiting = {}
         self.pause_disabled = False  # set while klippy:ready handlers run, as Klipper does
+        self.deferred = None  # a list: register_callback keeps its callbacks there, unrun
 
     def check_pause(self) -> None:
         """Klipper's reactor refuses a pause (a blocking query, a completion's wait) inside a
@@ -313,6 +320,14 @@ class FakeReactor:
         self, cb: Callable[[float], object], waketime: float | None = None
     ) -> None:
         cb(0.0)
+
+    def register_callback(self, cb: Callable[[float], object], waketime: float = 0.0) -> None:
+        """Klipper's callback on the reactor, in a greenlet of its own: run at once, or kept in
+        ``deferred`` while a test sets it to a list (the reactor has not picked it up yet)."""
+        if self.deferred is not None:
+            self.deferred.append(cb)
+        else:
+            cb(self.now)
 
     def register_timer(self, cb: Callable[[float], float], waketime: float = NEVER) -> Timer:
         timer = [cb, waketime]
@@ -779,6 +794,8 @@ RESPONSES = {
     "ace2k_lane_counters_reset": {"lane": 255, "accepted": 1},
     "ace2k_rfid_lane_query": {"lane": 0, "state": 0, "uid": b""},
     "ace2k_dryer_log_query": {"index": 0, "a": 0, "b": 0, "c": 0, "d": 0, "e": 0, "f": 0},
+    # a lane with no final event of a host start yet (seq 0): a start reported idle is counted over
+    "ace2k_feed_last_query": EchoLane(lane=0, kind=0, mode=0, motor_um=0, filament_um=0, seq=0),
 }
 RFID_WARNINGS = (
     "CONFIG_ACE2K_RFID_READ",

@@ -193,6 +193,7 @@ def test_only_stopped_carries_an_author_and_the_motions_final_event_takes_it() -
 # --- the follow on by default ------------------------------------------------------------------
 
 IDLE, LOADING, ERROR, FOLLOWING = 0, 4, 7, 8
+LAST_QUERY = "ace2k_feed_last_query"
 
 
 def started(mcu: FakeMcu) -> list[tuple[int, int, int]]:
@@ -204,10 +205,14 @@ def rig(
     options: dict[str, Any] | None = None,
     inserts: Sequence[bool] = (True, True, True, True),
     extruders: dict[int, str] | None = None,
+    last: bool = False,
 ) -> Rig:
     """A connected feed with the follow, klippy:ready fired, the inserts set; every start
-    accepted for its lane; extruders: lane -> the extruder a host module maps it to."""
-    feed, printer, mcu, responses = make_follow(options=options)
+    accepted for its lane; extruders: lane -> the extruder a host module maps it to. last: the
+    image answers the query of a lane's last final event (by default it lacks the command, as an
+    older image does)."""
+    absent = {} if last else {LAST_QUERY: f"Unknown command: {LAST_QUERY}"}
+    feed, printer, mcu, responses = make_follow(options=options, lookup_errors=absent)
 
     def respond() -> dict[str, int]:
         return {"lane": mcu.queries[-1][1][0], "accepted": 1, "reason": 0}
@@ -1529,3 +1534,297 @@ def test_a_stop_keeps_only_the_report_of_a_rearm_and_a_counted_over_move_as_it_w
     follow.note_stop(0)
     assert lane.rearm is None  # a stop's end has nothing left to say
     assert lane.lost_rearm == ("load", 6, None, False)
+
+
+# --- a final event lost on the link, asked of the unit -------------------------------------------
+
+RECOVERED = "start %d's final event was lost on the link; recovered from the unit"
+TWICE = "final event %s came twice; the second is dropped"
+NEWER = "the unit's answer for start %d came after a newer start; dropped"
+
+
+def asked_rig() -> tuple[Rig, ace2k_feed.Move, list[int]]:
+    """Lane 4 runs an accepted feed whose end is lost, on an image that answers the query of a
+    lane's last final event; the lanes that follow_auto.on_lost was called for."""
+    rig_ = rig(inserts=(False, False, False, True), last=True)
+    feed, _printer, mcu, responses = rig_
+    report(mcu)
+    responses["ace2k_feed_start"] = {"lane": 3, "accepted": 1, "reason": 0}
+    move = feed.start_move(3, "feed", 50.0, 30.0)
+    lost: list[int] = []
+    on_lost = feed.follow_auto.on_lost
+    feed.follow_auto.on_lost = lambda lane, seq: (lost.append(lane), on_lost(lane, seq))
+    return rig_, move, lost
+
+
+def last_answer(seq: int, kind: int = 0, mode: int = FEEDING) -> dict[str, int]:
+    return {
+        "lane": 3,
+        "kind": kind,
+        "mode": mode,
+        "motor_um": 50000,
+        "filament_um": 49500,
+        "seq": seq,
+    }
+
+
+def asked(mcu: FakeMcu) -> list[list[Any]]:
+    return [data for name, data in mcu.queries if name == LAST_QUERY]
+
+
+def feed_events(printer: FakePrinter, lane: int) -> list[Any]:
+    return [p for e, p in printer.events if e == "ace2k:feed_event" and p[0] == lane]
+
+
+def messages(caplog: pytest.LogCaptureFixture, text: str) -> list[str]:
+    return [r.getMessage() for r in caplog.records if text in r.getMessage()]
+
+
+def test_a_lost_final_event_is_recovered_from_the_unit(caplog: pytest.LogCaptureFixture) -> None:
+    (feed, printer, mcu, responses), move, lost = asked_rig()
+    responses[LAST_QUERY] = last_answer(move.seq)
+    with caplog.at_level("DEBUG"):
+        for _ in range(3):
+            report(mcu)
+    assert asked(mcu) == [[3]]
+    result = move.result()
+    assert result is not None
+    assert (result["kind"], result["mode"], result["seq"]) == ("done", "feeding", move.seq)
+    assert (result["motor_mm"], result["filament_mm"]) == (50.0, 49.5)
+    assert messages(caplog, RECOVERED % move.seq) == [
+        f"{feed.unit.head('feed')} lane {feed.unit.lane_text(3)}: "
+        + RECOVERED % move.seq
+        + " — done (feeding), motor 50.0 mm, filament 49.5 mm"
+    ]
+    assert [r.levelname for r in caplog.records if RECOVERED % move.seq in r.getMessage()] == [
+        "INFO"
+    ]
+    assert not messages(caplog, "without its final event")
+    assert lost == []
+    assert len(feed_events(printer, 3)) == 1
+    assert feed.open_seq(3) is None
+
+
+def test_the_real_event_arriving_while_the_unit_is_asked_wins(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    (feed, printer, mcu, responses), move, lost = asked_rig()
+
+    def answer() -> dict[str, int]:
+        deliver(mcu, 3, 0, FEEDING, seq=move.seq)  # the real done, while the query is in flight
+        return last_answer(move.seq)
+
+    responses[LAST_QUERY] = answer
+    with caplog.at_level("DEBUG"):
+        for _ in range(3):
+            report(mcu)
+    result = move.result()
+    assert result is not None and result["motor_mm"] == 1.0  # the real event's odometers
+    assert messages(caplog, TWICE % "done")
+    assert not messages(caplog, "recovered from the unit")
+    assert not messages(caplog, "without its final event")
+    assert lost == []
+    assert len(feed_events(printer, 3)) == 1
+
+
+def test_a_late_final_event_after_a_recovery_is_dropped(caplog: pytest.LogCaptureFixture) -> None:
+    (feed, printer, mcu, responses), move, _lost = asked_rig()
+    responses[LAST_QUERY] = last_answer(move.seq)
+    for _ in range(3):
+        report(mcu)
+    with caplog.at_level("DEBUG"):
+        deliver(mcu, 3, 0, FEEDING, seq=move.seq)  # the lost done, late after all
+    assert messages(caplog, TWICE % "done")
+    assert len(feed_events(printer, 3)) == 1
+    assert feed.lanes[3]["last_event"]["motor_mm"] == 50.0  # the recovered event stays the last
+
+
+def test_a_runout_after_an_error_with_the_same_seq_still_goes_through(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    (feed, printer, mcu, responses), move, _lost = asked_rig()
+    responses[LAST_QUERY] = last_answer(move.seq, kind=8, mode=ERROR)  # tangled
+    for _ in range(3):
+        report(mcu, modes=(IDLE, IDLE, IDLE, ERROR), errors=(0, 0, 0, 8))
+    assert move.result() is not None and move.result()["kind"] == "tangled"
+    with caplog.at_level("DEBUG"):
+        deliver(mcu, 3, 4, ERROR, seq=move.seq)  # runout, the same seq
+    assert not messages(caplog, "came twice")
+    assert [p[1]["kind"] for p in feed_events(printer, 3)] == ["tangled", "runout"]
+
+
+def test_a_recovery_answer_with_another_seq_counts_the_start_over(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    (feed, printer, mcu, responses), move, lost = asked_rig()
+    responses[LAST_QUERY] = last_answer((move.seq % 255) + 1)
+    with caplog.at_level("INFO"):
+        for _ in range(2):  # the second report after the start counts it over
+            report(mcu)
+    assert asked(mcu) == [[3]]
+    assert messages(caplog, f"the unit's last final event is start {(move.seq % 255) + 1}'s")
+    assert messages(caplog, "without its final event; counted over")
+    assert not messages(caplog, "recovered from the unit")
+    assert lost == [3]
+    assert feed.motion[3].lost_seq == move.seq  # the window of a late event is open
+    assert move.result() is None
+    assert feed.open_seq(3) is None
+
+
+def test_a_failed_recovery_query_counts_the_start_over(caplog: pytest.LogCaptureFixture) -> None:
+    (feed, printer, mcu, responses), move, lost = asked_rig()
+    responses[LAST_QUERY] = FakeCommandError("Timeout on wait for 'ace2k_feed_last' response")
+    with caplog.at_level("INFO"):
+        for _ in range(2):  # the second report after the start counts it over
+            report(mcu)
+    assert asked(mcu) == [[3]]
+    assert messages(caplog, "without its final event; counted over")
+    assert lost == [3]
+    assert feed.motion[3].lost_seq == move.seq
+    assert move.result() is None
+
+
+def test_old_firmware_without_the_query_counts_over_as_today(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    feed, printer, mcu, responses = rig(inserts=(False, False, False, True))
+    assert feed.last_query is None
+    report(mcu)
+    seq = running(feed, responses, 3, "feed")
+    with caplog.at_level("INFO"):
+        for _ in range(2):  # the second report after the start counts it over
+            report(mcu)
+    assert asked(mcu) == []
+    assert messages(caplog, "without its final event; counted over")
+    assert feed.motion[3].lost_seq == seq
+
+
+def test_a_lane_being_asked_is_not_counted_over_again(caplog: pytest.LogCaptureFixture) -> None:
+    (feed, printer, mcu, responses), move, lost = asked_rig()
+    responses[LAST_QUERY] = last_answer(move.seq)
+    feed.reactor.deferred = []  # the reactor has not picked up the query yet
+    with caplog.at_level("INFO"):
+        for _ in range(5):
+            report(mcu)
+    assert asked(mcu) == []  # the report handler sent nothing: it never blocks on the query
+    assert len(feed.reactor.deferred) == 1  # asked once, however many reports came meanwhile
+    assert not messages(caplog, "without its final event")
+    callback = feed.reactor.deferred.pop()
+    feed.reactor.deferred = None
+    callback(feed.reactor.monotonic())
+    assert asked(mcu) == [[3]]
+    assert move.result() is not None and move.result()["seq"] == move.seq
+    assert lost == []
+    report(mcu)
+    assert feed.reactor.deferred is None and asked(mcu) == [[3]]  # over: nothing asked again
+
+
+def test_a_recovery_answer_for_another_lane_counts_the_start_over(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Klipper matches an answer by its name only: a late answer for lane 3 is not lane 4's
+    (feed, printer, mcu, responses), move, lost = asked_rig()
+    responses[LAST_QUERY] = dict(last_answer(move.seq), lane=2)
+    with caplog.at_level("INFO"):
+        for _ in range(2):  # the second report after the start counts it over
+            report(mcu)
+    assert asked(mcu) == [[3]]
+    assert messages(caplog, "the unit answered for lane 3")
+    assert messages(caplog, "without its final event; counted over")
+    assert lost == [3]
+    assert move.result() is None
+    assert feed_events(printer, 3) == []
+
+
+def test_a_none_answer_says_the_unit_was_asked_and_counts_the_start_over(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    (feed, printer, mcu, responses), move, lost = asked_rig()
+    responses[LAST_QUERY] = last_answer(0)  # seq 0: no final event of a host start
+    with caplog.at_level("INFO"):
+        for _ in range(2):
+            report(mcu)
+    assert [r.levelname for r in caplog.records if "the unit was asked" in r.getMessage()] == [
+        "WARNING"
+    ]
+    assert messages(caplog, "the unit holds no final event of a host start")
+    assert lost == [3]
+
+
+def asked_later(feed: Ace2kFeed, mcu: FakeMcu) -> Callable[[float], object]:
+    """Report until the lane is asked, with the query's callback not yet picked up; return it."""
+    feed.reactor.deferred = []
+    for _ in range(3):
+        report(mcu)
+    callback = feed.reactor.deferred.pop()
+    assert feed.reactor.deferred == []
+    feed.reactor.deferred = None
+    return callback
+
+
+@pytest.mark.parametrize("answer", ["failed", "another seq"])
+def test_a_real_event_during_a_query_that_misses_is_not_counted_over(
+    caplog: pytest.LogCaptureFixture, answer: str
+) -> None:
+    (feed, printer, mcu, responses), move, lost = asked_rig()
+    callback = asked_later(feed, mcu)
+    deliver(mcu, 3, 0, FEEDING, seq=move.seq)  # the real done, before the query is sent
+    responses[LAST_QUERY] = (
+        FakeCommandError("timeout") if answer == "failed" else last_answer(move.seq % 255 + 1)
+    )
+    with caplog.at_level("DEBUG"):
+        callback(feed.reactor.monotonic())
+    assert asked(mcu) == [[3]]
+    assert not messages(caplog, "without its final event")
+    assert not messages(caplog, "the unit was asked")
+    assert not messages(caplog, "after a newer start")  # it ended with its own event
+    assert lost == []
+    assert feed.motion[3].lost_seq is None
+    result = move.result()
+    assert result is not None and result["motor_mm"] == 1.0
+    assert len(feed_events(printer, 3)) == 1
+
+
+def test_a_late_answer_after_a_newer_start_completes_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # the host refuses a second start only while one is in flight, and the unit accepts one on
+    # an idle lane: a newer start can be accepted before the query for the older one is sent
+    (feed, printer, mcu, responses), move, lost = asked_rig()
+    callback = asked_later(feed, mcu)
+    newer = feed.start_move(3, "feed", 20.0, 30.0)
+    responses[LAST_QUERY] = last_answer(move.seq)  # the older start's end, lost on the link
+    waiter = feed.reactor.completion()
+    feed.motion[3].final_waiters.append(waiter)
+    with caplog.at_level("DEBUG"):
+        callback(feed.reactor.monotonic())
+    assert messages(caplog, NEWER % move.seq) == [
+        f"{feed.unit.head('feed')} lane {feed.unit.lane_text(3)}: " + NEWER % move.seq
+    ]
+    assert not messages(caplog, "came twice")
+    assert not messages(caplog, "recovered from the unit")
+    assert not messages(caplog, "without its final event")
+    assert newer.result() is None and not waiter.test()
+    assert feed.open_seq(3) == newer.seq
+    assert feed_events(printer, 3) == []
+    assert lost == []
+    deliver(mcu, 3, 0, FEEDING, seq=newer.seq)
+    assert newer.result() is not None and waiter.test()
+
+
+@pytest.mark.parametrize("answer", ["failed", "another seq"])
+def test_a_query_that_misses_after_a_newer_start_ends_the_older_one_with_a_line(
+    caplog: pytest.LogCaptureFixture, answer: str
+) -> None:
+    (feed, printer, mcu, responses), move, lost = asked_rig()
+    callback = asked_later(feed, mcu)
+    newer = feed.start_move(3, "feed", 20.0, 30.0)
+    responses[LAST_QUERY] = (
+        FakeCommandError("timeout") if answer == "failed" else last_answer(move.seq % 255 + 1)
+    )
+    with caplog.at_level("DEBUG"):
+        callback(feed.reactor.monotonic())
+    assert len(messages(caplog, NEWER % move.seq)) == 1
+    assert not messages(caplog, "without its final event")
+    assert lost == []
+    assert feed.open_seq(3) == newer.seq

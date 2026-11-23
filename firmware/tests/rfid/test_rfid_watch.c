@@ -2601,7 +2601,8 @@ TEST(beside_a_still_lane_set_by_hand_a_new_uid_is_the_loading_lanes_at_once)
     ASSERT_TRUE(ww.w.l[1].by_hand);
 }
 
-TEST(the_in_use_mask_ages_out_and_dies_with_the_link)
+/* The mask is held: nothing ages it out while the link is up.  A link loss drops it. */
+TEST(the_in_use_mask_holds_past_three_seconds_and_dies_with_the_link)
 {
     struct wworld ww;
     ww_init(&ww);
@@ -2611,22 +2612,37 @@ TEST(the_in_use_mask_ages_out_and_dies_with_the_link)
     ASSERT_EQ(m, 0);
     uint32_t t = ww.now;
     ace2k_rfid_watch_set_in_use(&ww.w, 0x05);
-    ace2k_rfid_watch_step(&ww.w, t + 2999, &ww.in);
+    ace2k_rfid_watch_step(&ww.w, t + 3001, &ww.in);
     ASSERT_TRUE(ace2k_rfid_watch_in_use(&ww.w, &m));
     ASSERT_EQ(m, 0x05);
-    ace2k_rfid_watch_step(&ww.w, t + 3001, &ww.in);
-    ASSERT_TRUE(!ace2k_rfid_watch_in_use(&ww.w, &m));
-    ASSERT_EQ(m, 0);
-    ww.now = t + 3010;
+    ww.now = t + 10000;
     ace2k_rfid_watch_step(&ww.w, ww.now, &ww.in);
-    ace2k_rfid_watch_set_in_use(&ww.w, 0x02);
     ASSERT_TRUE(ace2k_rfid_watch_in_use(&ww.w, &m));
+    ASSERT_EQ(m, 0x05);
     ww.in.link_ok = false;
     ww_steps(&ww, 1);
     ww.in.link_ok = true;
     ww_steps(&ww, 1);
     ASSERT_TRUE(!ace2k_rfid_watch_in_use(&ww.w, &m));
     ASSERT_EQ(m, 0);
+}
+
+/* The host's connect (its ace2k_version) drops the mask, whether or not the link counted as lost
+ * in between; the next mask makes it valid again. */
+TEST(the_in_use_mask_is_dropped_by_the_connect_query)
+{
+    struct wworld ww;
+    ww_init(&ww);
+    uint8_t m = 0xFF;
+    ww_steps(&ww, 1);
+    ace2k_rfid_watch_set_in_use(&ww.w, 0x05);
+    ASSERT_TRUE(ace2k_rfid_watch_in_use(&ww.w, &m));
+    ace2k_rfid_watch_drop_in_use(&ww.w);
+    ASSERT_TRUE(!ace2k_rfid_watch_in_use(&ww.w, &m));
+    ASSERT_EQ(m, 0);
+    ace2k_rfid_watch_set_in_use(&ww.w, 0x02);
+    ASSERT_TRUE(ace2k_rfid_watch_in_use(&ww.w, &m));
+    ASSERT_EQ(m, 0x02);
 }
 
 /* The field report: lane 1 runs (a print's assist) with its own tag at rest in the field.  A spool

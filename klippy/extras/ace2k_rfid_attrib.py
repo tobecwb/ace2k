@@ -4,8 +4,14 @@ The unit decides alone which lane a tag belongs to when two lanes share one ante
 the motion of the lane. This part of the host gives it three things.
 
 1. The in-use mask: one bit per lane that a print uses. The unit leaves those lanes alone. The
-   caller sets it with ``set_in_use``. Nothing is sent before the first call. After it, the last
-   mask is sent again every second, because the unit treats a mask older than 3 s as absent.
+   caller sets it with ``set_in_use``. Nothing is sent before the first call. A unit that holds
+   the mask (it declares ``ACE2K_RFID_IN_USE_HOLD``) keeps it until the link drops or the host
+   reconnects, so the host sends it on every change (each swap in a print), at connect, and again
+   after a ``stopped_link`` feed event of this unit, and never on a timer. After a link loss that
+   the unit alone saw with its lanes idle (no ``stopped_link``), the mask stays off until the next
+   change or connect; that only holds back the auto-load and the tie-break: nothing moves. A unit
+   that does not hold it treats a mask older than 3 s as absent, so the host sends the last mask
+   again every second.
 2. The lanes set by hand (``set_by_hand``). The host keeps the lanes it wants set by hand. The unit
    announces the lanes it holds a mark on (``ace2k_rfid_by_hand_state``) every second and on any
    change. On each announcement the host sends the mark again for a wanted lane the unit does not
@@ -57,13 +63,15 @@ except ImportError:  # the host tests put klippy/extras on the path and import b
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
-    from .ace2k_klipper_types import MCU, Command, Config, GCodeCommand, Params
+    from .ace2k_klipper_types import MCU, Command, Config, FeedEvent, GCodeCommand, Params
 
     class Unit(Protocol):
         """What this part needs of the unit (``ace2k.Ace2k``)."""
 
         @property
         def mcu(self) -> MCU: ...
+        @property
+        def name(self) -> str | None: ...
         @property
         def lanes(self) -> Sequence[Mapping[str, object]]: ...
         def head(self, part: str | None = None) -> str: ...
@@ -94,7 +102,10 @@ TRACE_NAMES = {
     5: "taken",
     6: "ended",
 }
-REFRESH_S = 1.0  # the unit takes a mask older than 3 s as no mask
+# Without ACE2K_RFID_IN_USE_HOLD the unit takes a mask older than 3 s as no mask, so the host sends
+# it again every REFRESH_S. With the hold the unit keeps the mask and the host never resends it.
+REFRESH_S = 1.0
+HOLD_CONSTANT = "ACE2K_RFID_IN_USE_HOLD"
 # A wanted mark whose bay still reads empty this long after it was wanted is dropped: no strand
 # came for it.
 EMPTY_DROP_S = 5.0
@@ -131,7 +142,9 @@ class TagAttribution:
     def __init__(self, config: Config, unit: Unit) -> None:
         self.mcu = unit.mcu
         self.lanes = unit.lanes
-        self.reactor = config.get_printer().get_reactor()
+        self.unit_name = unit.name
+        printer = config.get_printer()
+        self.reactor = printer.get_reactor()
         self.head = unit.head
         self.lane_text = unit.lane_text
         self.add_key_cmd = unit.add_key_cmd
@@ -175,6 +188,7 @@ class TagAttribution:
         self.view_known = True
         self.present = False
         self.mask: int | None = None
+        self.hold = False  # the unit holds the mask: build() reads the constant
         # The lanes the host wants set by hand, each with the time it was wanted, the unit's last
         # announced mask since the connect (None before the first), and the start-up forgets that
         # wait for that first one.
@@ -185,6 +199,8 @@ class TagAttribution:
         self.by_hand_cmd: Command | None = None
         self.confirm_cmd: Command | None = None
         self.timer = self.reactor.register_timer(self._refresh)
+        self.stopped_lanes: set[int] = set()  # stopped on a lost link, waiting for the resend
+        printer.register_event_handler("ace2k:feed_event", self._feed_event)
 
     # --- configuration -------------------------------------------------------------------
 
@@ -251,8 +267,17 @@ class TagAttribution:
         self.sent, self.sent_by_tune, self.view_known = self.wire(), False, True
         self.held = None  # the unit may have reset: its next announcement says what it holds
         subscribe_response(self.mcu, self._handle_by_hand_state, BY_HAND_STATE_FMT)
+        self.hold = constant_or_none(self.mcu, HOLD_CONSTANT) not in (None, 0)
         if self.mask is not None:
-            self._arm()  # set before the connect: start the resend now
+            # Set before the connect: a unit that holds it gets it now, once (it dropped the one
+            # before); any other unit gets it again every second from now on.
+            if self.hold:
+                self._send_mask()
+            else:
+                self._arm()
+        if self.hold:
+            # No resend, though an earlier connect to a unit without the hold may have armed one.
+            self.reactor.update_timer(self.timer, self.reactor.NEVER)
         if probe_format(self.mcu, REFUSED_FMT)[0] == "ok":
             subscribe_response(self.mcu, self._handle_refused, REFUSED_FMT)
         if probe_format(self.mcu, TRACE_FMT)[0] == "ok":
@@ -311,13 +336,16 @@ class TagAttribution:
     # --- the API -------------------------------------------------------------------------
 
     def set_in_use(self, mask: int) -> None:
-        """Say which lanes a print uses (bit n = lane n+1). Sent now and every second."""
+        """Say which lanes a print uses (bit n = lane n+1). Sent now. A unit that holds the mask
+        (ACE2K_RFID_IN_USE_HOLD) keeps it; any other unit takes it as absent after 3 s, so it is
+        sent again every second."""
         if not isinstance(mask, int) or isinstance(mask, bool) or not 0 <= mask <= ALL_LANES_MASK:
             raise ValueError(f"in-use mask {mask!r} is not a 4-bit mask")
         self.mask = mask
         if self.present:
             self._send_mask()
-            self._arm()
+            if not self.hold:
+                self._arm()
 
     def set_by_hand(self, lane_index: int) -> None:
         """Say that the tag of a lane was set by hand. Sent now, and again at each announcement
@@ -389,6 +417,32 @@ class TagAttribution:
         if self.mask is not None:
             assert self.in_use_cmd is not None
             self.in_use_cmd.send([self.mask])
+
+    def _feed_event(self, lane: int, event: FeedEvent) -> None:
+        """A ``stopped_link`` of this unit: the unit took the link for lost and dropped the mask.
+
+        Every moving lane stops on one loss, so the lanes of one reactor pass share one resend."""
+        if event.get("unit") != self.unit_name or event["kind"] != "stopped_link":
+            return
+        first = not self.stopped_lanes
+        self.stopped_lanes.add(lane)
+        if first:
+            self.reactor.register_callback(self._resend_after_loss)
+
+    def _resend_after_loss(self, _eventtime: float) -> None:
+        """Send the mask again to a unit that holds it: it dropped it with the link.
+
+        Without the hold the refresh sends it anyway; without a mask there is nothing to send."""
+        lanes, self.stopped_lanes = sorted(self.stopped_lanes), set()
+        if not (self.present and self.hold and self.mask is not None):
+            return
+        logging.info(
+            "%s %s %s stopped on a lost link; the in-use mask is sent again",
+            self.head(),
+            "lane" if len(lanes) == 1 else "lanes",
+            ", ".join(self.lane_text(lane) for lane in lanes),
+        )
+        self._send_mask()
 
     def _refresh(self, eventtime: float) -> float:
         self._send_mask()

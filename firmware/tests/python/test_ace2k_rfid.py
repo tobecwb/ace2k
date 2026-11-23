@@ -24,6 +24,7 @@ from test_ace2k_extras import (
     FakeReactor,
     fire_ready,
     make,
+    make_units,
 )
 from test_ace2k_feed import IDLE_FRAME, event_params
 from test_ace2k_tags import anycubic_image, bambu_blocks, ntag_image, sections
@@ -1567,7 +1568,7 @@ def test_nothing_is_sent_before_the_first_in_use_mask() -> None:
     assert refresh_timer(printer)[1] == printer.reactor.NEVER
 
 
-def test_the_in_use_mask_goes_out_at_once_and_every_second_and_the_last_one_wins() -> None:
+def test_without_the_hold_the_mask_is_refreshed_every_second_and_the_last_one_wins() -> None:
     module, printer, mcu = make_rfid()
     rfid = rfid_of(module)
     rfid.set_in_use(0b0101)
@@ -1580,6 +1581,149 @@ def test_the_in_use_mask_goes_out_at_once_and_every_second_and_the_last_one_wins
     assert sent_named(mcu, "ace2k_rfid_in_use") == [[5], [5], [2], [2]]
     with pytest.raises(ValueError, match="4-bit"):
         rfid.set_in_use(16)
+
+
+HOLD = dict(DEFAULT_CONSTANTS, ACE2K_RFID_IN_USE_HOLD=1)
+
+
+def test_with_the_hold_the_mask_is_sent_on_change_only() -> None:
+    module, printer, mcu = make_rfid(constants=HOLD)
+    rfid = rfid_of(module)
+    rfid.set_in_use(0b0101)
+    assert sent_named(mcu, "ace2k_rfid_in_use") == [[5]]
+    assert refresh_timer(printer)[1] == printer.reactor.NEVER
+    # The fake reactor runs no timers; a timer at NEVER is what no resend means, so it suffices.
+    rfid.set_in_use(0b0010)
+    assert sent_named(mcu, "ace2k_rfid_in_use") == [[5], [2]]
+    assert refresh_timer(printer)[1] == printer.reactor.NEVER
+
+
+def test_with_the_hold_a_mask_set_before_connect_is_sent_at_connect() -> None:
+    module, printer, mcu = make(
+        dict(RESPONSES, ace2k_rfid_read={"lane": 0, "accepted": 1, "reason": 0}),
+        constants=HOLD,
+    )
+    rfid = rfid_of(module)
+    rfid.set_in_use(3)
+    assert sent_named(mcu, "ace2k_rfid_in_use") == []
+    mcu.config_callback()
+    assert sent_named(mcu, "ace2k_rfid_in_use") == [[3]]
+    assert refresh_timer(printer)[1] == printer.reactor.NEVER
+
+
+def test_with_the_hold_a_reconnect_sends_the_mask_once_more_and_arms_nothing() -> None:
+    module, printer, mcu = make_rfid(constants=dict(DEFAULT_CONSTANTS))  # no hold at first
+    rfid = rfid_of(module)
+    rfid.set_in_use(3)
+    assert refresh_timer(printer)[1] == printer.reactor.now + 1.0
+    mcu.constants["ACE2K_RFID_IN_USE_HOLD"] = 1  # reconnected to an image that holds
+    mcu.config_callback()
+    assert sent_named(mcu, "ace2k_rfid_in_use") == [[3], [3]]
+    assert refresh_timer(printer)[1] == printer.reactor.NEVER
+    mcu.config_callback()
+    assert sent_named(mcu, "ace2k_rfid_in_use") == [[3], [3], [3]]
+    assert refresh_timer(printer)[1] == printer.reactor.NEVER
+
+
+def test_with_the_hold_a_mask_of_zero_is_sent() -> None:
+    module, printer, mcu = make_rfid(constants=HOLD)
+    rfid_of(module).set_in_use(0)
+    assert sent_named(mcu, "ace2k_rfid_in_use") == [[0]]
+
+
+def fire(printer: FakePrinter, event: str, *params: object) -> None:
+    """Run every handler of a Klipper event, as Klipper's send_event does."""
+    for handler in printer.handler_lists.get(event, []):
+        handler(*params)
+
+
+def stopped_link(unit: str | None = None) -> dict[str, Any]:
+    return {
+        "kind": "stopped_link",
+        "mode": "feeding",
+        "motor_mm": 10.0,
+        "filament_mm": 9.5,
+        "seq": 4,
+        "unit": unit,
+    }
+
+
+def test_with_the_hold_a_stopped_link_sends_the_mask_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The unit alone took the link for lost and dropped the mask; Klipper stayed up."""
+    module, printer, mcu = make_rfid(constants=HOLD)
+    rfid_of(module).set_in_use(0b0101)
+    with caplog.at_level("INFO"):
+        fire(printer, "ace2k:feed_event", 1, stopped_link())
+    assert sent_named(mcu, "ace2k_rfid_in_use") == [[5], [5]]
+    lines = [
+        r.getMessage() for r in caplog.records if "in-use mask is sent again" in r.getMessage()
+    ]
+    assert lines == [
+        f"{module.head()} lane {module.lane_text(1)} stopped on a lost link;"
+        " the in-use mask is sent again"
+    ]
+    assert refresh_timer(printer)[1] == printer.reactor.NEVER
+
+
+def test_a_stopped_link_of_another_unit_or_another_kind_sends_nothing() -> None:
+    module, printer, mcu = make_rfid(constants=HOLD)
+    rfid_of(module).set_in_use(3)
+    fire(printer, "ace2k:feed_event", 1, stopped_link(unit="right"))
+    fire(printer, "ace2k:feed_event", 1, dict(stopped_link(), kind="stopped"))
+    assert sent_named(mcu, "ace2k_rfid_in_use") == [[3]]
+
+
+def test_one_loss_that_stops_two_lanes_sends_the_mask_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A single unit (its name is None): the two lanes stopped by one loss share one resend."""
+    module, printer, mcu = make_rfid(constants=HOLD)
+    rfid_of(module).set_in_use(0b0011)
+    printer.reactor.deferred = []
+    with caplog.at_level("INFO"):
+        fire(printer, "ace2k:feed_event", 0, stopped_link())
+        fire(printer, "ace2k:feed_event", 1, stopped_link())
+        assert len(printer.reactor.deferred) == 1
+        printer.reactor.deferred.pop()(printer.reactor.now)
+    assert sent_named(mcu, "ace2k_rfid_in_use") == [[3], [3]]
+    lines = [
+        r.getMessage() for r in caplog.records if "in-use mask is sent again" in r.getMessage()
+    ]
+    assert lines == [
+        f"{module.head()} lanes {module.lane_text(0)}, {module.lane_text(1)} stopped on a lost"
+        " link; the in-use mask is sent again"
+    ]
+    fire(printer, "ace2k:feed_event", 1, stopped_link())  # a later loss: a resend of its own
+    printer.reactor.deferred.pop()(printer.reactor.now)
+    assert sent_named(mcu, "ace2k_rfid_in_use") == [[3], [3], [3]]
+
+
+def test_with_two_units_a_stopped_link_resends_to_its_own_unit_only() -> None:
+    responses = dict(RESPONSES, ace2k_rfid_read={"lane": 0, "accepted": 1, "reason": 0})
+    units, printer, mcus = make_units(responses=responses, constants=HOLD)
+    for unit in units:
+        mcus[unit.name].config_callback()
+        rfid_of(unit)._on_connect()
+        rfid_of(unit).set_in_use(1)
+    printer.reactor.deferred = []
+    fire(printer, "ace2k:feed_event", 2, stopped_link(unit="a"))
+    fire(printer, "ace2k:feed_event", 3, stopped_link(unit="a"))
+    for callback in printer.reactor.deferred:
+        callback(printer.reactor.now)
+    assert sent_named(mcus["a"], "ace2k_rfid_in_use") == [[1], [1]]
+    assert sent_named(mcus["b"], "ace2k_rfid_in_use") == [[1]]
+
+
+def test_a_stopped_link_sends_nothing_without_the_hold_or_without_a_mask() -> None:
+    module, printer, mcu = make_rfid(constants=HOLD)
+    fire(printer, "ace2k:feed_event", 1, stopped_link())
+    assert sent_named(mcu, "ace2k_rfid_in_use") == []  # no mask yet
+    module, printer, mcu = make_rfid()  # no hold: the refresh sends it every second anyway
+    rfid_of(module).set_in_use(3)
+    fire(printer, "ace2k:feed_event", 1, stopped_link())
+    assert sent_named(mcu, "ace2k_rfid_in_use") == [[3]]
 
 
 def by_hand_state(mcu: FakeMcu, mask: int) -> None:

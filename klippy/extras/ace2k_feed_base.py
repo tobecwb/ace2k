@@ -78,6 +78,7 @@ class FeedBase:
     start_query: QueryCommand | None
     speed_query: QueryCommand | None
     stop_when_query: QueryCommand | None
+    last_query: QueryCommand | None  # the lane's last final event; None on an older image
     stop_cmd: Command | None
     clear_cmd: Command | None
     speed_min: float | None
