@@ -141,4 +141,8 @@ uint32_t ace2k_dryer_log_generation(const struct ace2k_dryer *self)
 void ace2k_dryer_log_stored(struct ace2k_dryer *self, uint32_t generation)
 {
     self->log_stored_gen = generation; /* a store of an older generation leaves the log dirty */
+    if (self->gain.pending && (int32_t)(generation - self->gain.pending_gen) >= 0) {
+        self->gain.pending = false; /* the candidate rate is on the page */
+        self->gain.source = ACE2K_DRYER_GAIN_STORED;
+    }
 }

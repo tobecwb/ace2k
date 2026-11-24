@@ -33,8 +33,9 @@ struct fake_thermal {
     double n[2]; /* the outlet NTCs, degC */
     double c;    /* the chamber, degC */
     double ambient;
-    double chamber_m; /* the chamber's loss to the room, 1/s: assumed, not fitted; tests may
-                         override */
+    double chamber_m;   /* the chamber's loss to the room, 1/s: assumed, not fitted; tests may
+                           override */
+    double heater_gain; /* scales both heaters' a_s: 1.0 is the fit; a stronger heater above it */
 };
 
 /* Every node at the ambient: a unit at rest in its room. */
@@ -43,6 +44,7 @@ static inline void fake_thermal_init(struct fake_thermal *m, int32_t ambient_mc)
     m->ambient = (double)ambient_mc / 1000.0;
     m->p[0] = m->p[1] = m->n[0] = m->n[1] = m->c = m->ambient;
     m->chamber_m = THERMAL_CHAMBER_M;
+    m->heater_gain = 1.0;
 }
 
 /* Each heater at its NTC's reading, the chamber at its own: the start of a replayed run. */
@@ -68,7 +70,7 @@ static inline void fake_thermal_substep(struct fake_thermal *m, double u, unsign
         double cool = ((fan_mask >> s) & 1U) != 0U ? 1.0 : FAKE_THERMAL_NOFAN_FACTOR;
         double d = m->p[s] - m->c;
         double dc = d < THERMAL_D_MAX ? d : THERMAL_D_MAX;
-        dp[s] = (a[s] * u * (1.0 + (x[s] * dc))) - (k[s] * cool * d);
+        dp[s] = (a[s] * m->heater_gain * u * (1.0 + (x[s] * dc))) - (k[s] * cool * d);
         dn[s] = (m->p[s] - m->n[s]) / tau[s];
         feed += 0.5 * cool * (m->n[s] - m->c);
     }

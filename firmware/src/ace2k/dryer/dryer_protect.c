@@ -125,7 +125,9 @@ static int32_t driving_duty_sum(const struct ace2k_dryer_protect *p, uint8_t new
 }
 
 /* Samples the hotter NTC and the applied duty once a second, in a ring of LAG + WINDOW + 1 slots.
- * The rise over the last WINDOW seconds is compared with the ceiling for the duty that drove it.
+ * The rise over the last WINDOW seconds is compared with the ceiling for the duty that drove it:
+ * the heater's rate (dryer_gain.c) times that duty, plus the floor. With no rate stored, the
+ * windows of the first GAIN_LEARN of HEATING only measure the rate, and are not judged.
  * The applied duty is 0 while heat fires nothing: no lease yet, a refused renewal, or a mains dip
  * or an NTC excursion that silences the lease. So the ceiling counts only the heat that went in. */
 static uint8_t check_response(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in,
@@ -149,11 +151,19 @@ static uint8_t check_response(struct ace2k_dryer *self, const struct ace2k_dryer
     uint8_t newest = (uint8_t)((p->win_idx + ACE2K_DRYER_RISE_SLOTS - 1U) % ACE2K_DRYER_RISE_SLOTS);
     uint8_t first = (uint8_t)((newest + ACE2K_DRYER_RISE_SLOTS - ACE2K_DRYER_RISE_WINDOW_S) %
                               ACE2K_DRYER_RISE_SLOTS);
-    int32_t limit = ((ACE2K_DRYER_RISE_MAX_MC_S_PER_PCT * driving_duty_sum(p, newest) *
-                      ACE2K_DRYER_RISE_MARGIN_PCT) /
-                     PROTECT_PCT) +
-                    ACE2K_DRYER_RISE_FLOOR_MC;
-    if (p->win_ntc_mc[newest] - p->win_ntc_mc[first] > limit) {
+    int32_t duty = driving_duty_sum(p, newest);
+    int32_t rise = p->win_ntc_mc[newest] - p->win_ntc_mc[first];
+    if (ace2k_dryer_gain_rate(self) == 0U) {
+        if (ace2k_time_since(now_ms, p->heating_since_ms) < ACE2K_DRYER_GAIN_LEARN_MS) {
+            ace2k_dryer_gain_learn(self, rise, duty);
+            return ACE2K_DRYER_FAULT_NONE;
+        }
+        ace2k_dryer_gain_finish(self);
+    }
+    int32_t rate = (int32_t)ace2k_dryer_gain_rate(self);
+    int32_t limit =
+        ((rate * duty * ACE2K_DRYER_RISE_MARGIN_PCT) / PROTECT_PCT) + ACE2K_DRYER_RISE_FLOOR_MC;
+    if (rise > limit) {
         return ACE2K_DRYER_FAULT_RESPONSE;
     }
     return ACE2K_DRYER_FAULT_NONE;

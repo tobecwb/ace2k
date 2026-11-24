@@ -17,6 +17,11 @@ them in more detail.
   never been tried, and the dryer switches mains power. The firmware accepts both frequencies, but
   that comes from the design, not from a measurement. Do not leave a drying cycle unattended. If
   your mains is 220–240 V / 50 Hz, expect to be the first to try it.
+- **230 V: the dryer's heater rate is learned, not measured here.** A heater on 230 V is stronger
+  than the one the `response` protection was set from. The unit now learns its own heater's rate
+  in the first cycles and keeps it. The ceiling of that rate (105 m°C/s per %) is a design value.
+  No 230 V unit has been on a bench here to check it. If a cycle on your unit still ends in
+  `fault` `response`, send the dryer log (`ACEK_DRYER_LOG`) with your report.
 - **The humidity mode heats with nobody there.** With `unattended_drying: True`, the unit starts a
   drying cycle on its own whenever its box stays humid, even with the printer off. The heater runs
   on mains power, and its protections have never been triggered on purpose on a real unit. Turn
@@ -109,6 +114,16 @@ them in more detail.
 
 ## Drying
 
+- **A first clean cycle with both ducts blocked can store a higher heater rate.** The unit learns
+  its heater's rate once, from the first cycle that ends clean. A heater with both ducts blocked
+  warms the outlet as fast as a stronger heater does, so the unit cannot tell the two apart. If the
+  first clean cycle ran with both ducts blocked, the stored rate may be higher than the usual one.
+  It stays below the maximum, because a rate that reaches 105 is never stored. The simulator puts
+  such a case near twice the usual rate. The `response` protection then trips later on a blocked
+  hot start. The `sides` protection still catches a blocked hot start, such as 65 °C from a cold
+  room. A blocked start at a low target is caught by nothing, today or after this change. If you
+  find a duct was blocked, run
+  [`ACEK_DRY_FORGET`](commands.md#acek_dry_forget) and start a cycle with the ducts open.
 - **The outlet runs hot.** Outlet air reaches about the target plus 7 °C. That is near where PLA
   softens. For PLA, choose a target well below its limit, and check the first cycles.
 - **The flap position is not read back.** The firmware pulses a flap open or closed, and cannot

@@ -39,7 +39,13 @@
 #define AUTO_MINUTES  7U /* u16 LE */
 #define AUTO_LEN      9U
 
+#define OFF_GAIN  (OFF_AUTO + AUTO_LEN) /* 205: the stored heater rate */
+#define GAIN_MARK 0xA8U                 /* the block is present; an older image writes 0 here */
+#define GAIN_RATE 1U
+#define GAIN_LEN  2U
+
 _Static_assert(OFF_AUTO + AUTO_LEN <= OFF_CRC, "the automatic modes fit before the CRC");
+_Static_assert(OFF_GAIN + GAIN_LEN <= OFF_CRC, "the stored heater rate fits before the CRC");
 _Static_assert(OFF_ENTRIES + (ACE2K_DRYER_LOG_ENTRIES * ENTRY_LEN) <= OFF_CRC,
                "the dryer's log fits before the CRC");
 
@@ -147,6 +153,26 @@ static void decode_auto(const uint8_t *in, struct ace2k_dryer_auto_store *s)
     s->profile_min = ace2k_get_u16_le(p + AUTO_MINUTES);
 }
 
+static void encode_gain(uint8_t rate, uint8_t *out)
+{
+    out[OFF_GAIN] = GAIN_MARK;
+    out[OFF_GAIN + GAIN_RATE] = rate;
+}
+
+/* The rate is read only with its mark, and only inside the band; anything else is none (0). */
+static uint8_t decode_gain(const uint8_t *in)
+{
+    const uint8_t *p = in + OFF_GAIN;
+    if (p[0] != GAIN_MARK) {
+        return 0U; /* an older image's page: no rate is stored */
+    }
+    const uint8_t rate = p[GAIN_RATE];
+    if (rate < ACE2K_DRYER_GAIN_FLOOR_MC_S_PER_PCT || rate > ACE2K_DRYER_GAIN_MAX_MC_S_PER_PCT) {
+        return 0U;
+    }
+    return rate;
+}
+
 void ace2k_config_encode(const struct ace2k_config_record *rec,
                          uint8_t out[ACE2K_CONFIG_RECORD_LEN])
 {
@@ -159,6 +185,7 @@ void ace2k_config_encode(const struct ace2k_config_record *rec,
     ace2k_put_u32_le(out + OFF_FLAGS, rec->flags);
     encode_log(&rec->dryer_log, out);
     encode_auto(&rec->dryer_auto, out);
+    encode_gain(rec->dryer_log.gain_mc_s_per_pct, out);
     ace2k_put_u16_le(out + OFF_CRC, ace2k_crc16_ccitt(out, OFF_CRC));
 }
 
@@ -215,6 +242,7 @@ enum ace2k_config_source ace2k_config_decode(const uint8_t in[ACE2K_CONFIG_RECOR
     if (layout2_valid(in)) {
         decode_log(in, &out->dryer_log);
         decode_auto(in, &out->dryer_auto);
+        out->dryer_log.gain_mc_s_per_pct = decode_gain(in);
     }
     return ACE2K_CONFIG_FROM_FLASH;
 }

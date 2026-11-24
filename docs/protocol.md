@@ -93,6 +93,8 @@ firmware's public API: any change here is a versioned, documented change.
 | `ace2k_dryer_auto_profile target_c=%c minutes=%hu` | the same response (`op` 2) — the temperature and the time of an automatic cycle, within the dryer's range (15–65 °C, 1–1 440 min). Stored on the config page. A temperature below the target of a running humidity-mode or bound cycle lowers that target at once; the end stays, and no event goes out. It never raises a cycle and never changes a manual one. `reason` 1 `range`: outside it; nothing changes | v0.13.0 |
 | `ace2k_dryer_auto_timing hold_s=%u cold_window_s=%u link_s=%u` | the same response (`op` 3) — the bench's overrides of the hold at or above the limit (30 min), the cold window (30 min) and the link time of a bound cycle (5 min), in seconds. 0 keeps the default; a value below 1 s is raised to 1 s. RAM only: a reset brings the defaults back. The host sends it once per connect, on the first report, with 0 for every bench option that is not set, so a removed option is undone by a Klipper restart; a failed send is tried again 5 s later. Only a change restarts what it times: a different window empties the cold-box window, a different hold restarts the hold, and a different link time restarts nothing. So the same timing at every connect leaves the box cold and the hold running. `reason` 1 `range`: a value whose milliseconds do not fit 32 bits; nothing changes | v0.13.0 |
 | `ace2k_dryer_auto_query rest_ticks=%u` | periodic `ace2k_dryer_auto_state mode=%c limit=%c max=%c failures=%c flags=%c profile_c=%c profile_min=%hu cold=%c own=%c bound=%c rh=%hu above_s=%u` — the modes' state ("The dryer's modes"). `mode`, `limit` (%), `max` and `failures`: as stored. `flags`: 0x1 `stopped`, the humidity mode stopped on its failures. `profile_c` and `profile_min`: the profile. `cold`: 1 when the box reads cold. `own`: 1 while the running cycle is the humidity mode's. `bound`: 1 while the running cycle is bound to the host. `rh`: the last valid chamber RH read with the dryer idle, in tenths of a percent; a cycle does not refresh it. `above_s`: how long the cold box has been at or above the limit, in seconds, 0 when it is not. While the chamber or RH reading is invalid, `cold` and `above_s` read 0, so the host starts nothing on a bad reading; inside, the cold box and the hold run on through a glitch shorter than 60 s. The host asks for 1 Hz; phase 90 ms, the dryer's | v0.13.0 |
+| `ace2k_dryer_gain_query` | `ace2k_dryer_gain_state gain=%hu source=%c` — the heater rate the `response` protection uses in the current or last cycle, in m°C/s per % of duty, and where it came from. `source`: 0 none yet, 1 learning (the first 60 s of `heating`), 2 learned this cycle (not stored), 3 stored on the config page. `gain` means nothing while `source` is 0 or 1. A plain query: the host asks when it needs the value, and once after a cycle ends ("The heater rate", below). An image from before it has no such command, and the host says so | v0.17.0-alpha.1 |
+| `ace2k_dryer_gain_forget` | `ace2k_dryer_response op=%c accepted=%c reason=%c` (`op` 5) — forgets the stored heater rate and writes the config page, with the gate idle. It also drops a rate still waiting to be stored. `reason` 0 is ok; 1 `busy` when the dryer is in `starting` or `heating`, and nothing changes. In `idle`, `cooldown` and `fault` it is accepted, also when nothing was stored. The next cycle learns the rate again | v0.17.0-alpha.1 |
 | `ace2k_rfid_reader_query reader=%c` | `ace2k_rfid_reader_state reader=%c version=%c` — a soft reset of that reader, then a read of its version register: `0x18` on this unit's parts; 0 when the reset did not complete within 150 ms, which a bus that reads all ones also gives; `0x00` for a bus that reads all zeros. `reader`: 0 = A (lanes 3–4), 1 = B (lanes 1–2). The probe runs in task context and may take 150 ms. Since v0.13.0 a reader that the tag watch uses (its field wanted on, or an exchange with a tag running) is not reset, because the reset would cut a read. The answer then carries the version read at that reader's last soft reset, which is the watch's own configuration before its field came on. A reader whose switch-off has not read back off is not in use, so it is probed: the soft reset switches its field off too. The health self-test follows the same rule ("Health bits", bits 4 and 5) | v0.2.0 |
 | `ace2k_rfid_query rest_ticks=%u` | periodic `ace2k_rfid_state state=%*s field=%c` — `state`: one byte per lane, the lane's tag state ("Tag states", below). `field`: bits 0x01 / 0x02 the field on at reader A / B; 0x04 / 0x08 a field fault at A / B (the field read back on after it was switched off; latched until the MCU restarts); 0x10 / 0x20 reader A / B dead (three failed configurations in a row, [Tag states](#tag-states)). The UIDs are not in the report, because four 10-byte UIDs do not fit one frame; `ace2k_rfid_lane_query` gives one. The host asks for 1 Hz; phase 60 ms | v0.4.0 |
 | `ace2k_rfid_read lane=%c move=%c seq=%c` | `ace2k_rfid_read_response lane=%c accepted=%c reason=%c` — a read on command. `move` 0: an inventory of the lane's reader decides once the field's baseline is done, without motion ("The read on command"). `move` 1: the read with motion, the load's search from where the filament is, and back ("The read with motion"). `reason`: 0 ok; 1 `busy` (a session open on the lane, or a read on command pending on it; for `move=1` also the lane in a feed mode, moving or in error, and, since v0.15.0, a tie-break of the unit running on any lane, which the read sends back: the host sends the read again every 0.25 s for up to 30 s); 2 `no_filament`; 3 `no_link`; 4 `other_lane_moving` (`move=1`: another lane of the unit busy; since v0.13.0 a lane in the follow with its motor at rest does not count); 5 `unsupported` (`move=1` in an image without the feed, or with no search configured). A lane above 3 or a `move` above 1 is a host bug: `shutdown`. `seq` (since v0.13.0): the host's key for a read with motion, 1–255 per lane, a new one for each read; 0 is no key, and a read without motion ignores it. Klipper sends a query again, with the same bytes, when its answer is lost. A read with motion whose `seq` is the lane's last accepted one is that copy, not a second read: while the search it started runs, or within 1 s after that search ended (`ACE2K_FEED_RETRY_WINDOW_MS`) with no other mode entered on the lane since, it is answered `accepted=1`, and nothing else happens: no search starts, the lane's tag is not forgotten. A `seq` above 255 is a host bug: `shutdown`. An image before v0.13.0 has the command without `seq`: the host then sends it without one, and a lost answer can make the unit search twice | v0.4.0; `seq` v0.13.0 |
@@ -1670,7 +1672,7 @@ The protections 1–7 are checked while `heating`; the cutout and the gate's lat
 | Fault | Name | Trips when |
 |---|---|---|
 | 1 | `not_heating` | 300 s into `heating`, an outlet NTC has neither risen 5 °C above its value at the start of `heating` nor come within 2 °C of the drive target |
-| 2 | `response` | the hotter outlet rose faster than the heater can explain: over the last 30 s, more than 35 m°C/s per % of the duty applied over them (and over the 15 s before them at a quarter weight, because the outlet NTC answers the gate 10–15 s late: the overshoot after a stop), plus 2 °C. This stands in for a stopped fan or a blocked duct, since no fan's rotation is read |
+| 2 | `response` | the hotter outlet rose faster than the heater can explain: over the last 30 s, more than the unit's heater rate (at least 35 m°C/s per %, "The heater rate", below) times the duty applied over them (and over the 15 s before them at a quarter weight, because the outlet NTC answers the gate 10–15 s late: the overshoot after a stop), plus 2 °C. This stands in for a stopped fan or a blocked duct, since no fan's rotation is read |
 | 3 | `sides` | the two outlet NTCs more than 15 °C apart for 60 s |
 | 4 | `chamber_over` | the chamber above its ceiling for 30 s, or above 80 °C. The ceiling is the cycle's highest target or the chamber's lowest reading since the start, whichever is higher, + 10 °C. The chamber's part only ever moves down within a cycle; the target's part rises when a retarget asks a higher target, and never falls (v0.6.0; v0.5.0 counted from the target alone, so a target 10 °C below the room latched it with nothing heating; the retarget since v0.13.0) |
 | 5 | `chamber_stale` | the chamber reading implausible, or none newer than 5 s |
@@ -1686,6 +1688,39 @@ The rise-rate ceiling of fault 2, and the thermal simulator the host tests run w
 fitted to four heater runs recorded on the unit. The simulator's chamber loss to the room is
 assumed, not fitted, so the chamber's accuracy and the outlets' overshoot are settled on the unit.
 Every threshold here is an initial value that the bench confirms or re-tunes.
+
+**The heater rate.** The `response` protection compares the rise of the outlet with what the heater
+can explain. What the heater can explain is a rate, in m°C/s per % of duty. A heater on 230 V is
+stronger than one on 127 V, so one fixed rate cannot fit both. Each unit therefore learns its own
+rate, and keeps it.
+
+- **The floor and the maximum.** The rate in use is never below 35, the value fitted at 127 V
+  (`ACE2K_DRYER_RISE_MAX_MC_S_PER_PCT`). It is never above 105
+  (`ACE2K_DRYER_GAIN_MAX_MC_S_PER_PCT`).
+  A unit at 127 V learns a rate below 35 and uses 35, so its protection is unchanged.
+- **Learning.** While no rate is stored, `response` only measures during the first 60 s of
+  `heating`. It keeps the largest ratio of rise to duty over the windows that end in that time. A
+  window counts only when the duty that drove it was at least 300 %·s, an average of 10 % over the
+  window. At 60 s the rate is that ratio times 1.5, kept between 35 and 105. From then on `response`
+  judges with it. When no window counted, the cycle uses 105 and stores nothing. Every other
+  protection runs from the first second.
+- **Storing.** The rate is stored once, from a clean cycle. A clean cycle first reached the drive
+  target, then ran 10 more minutes with no fault, and the two outlets were never more than 7.5 °C
+  apart (half of the `sides` bound) from that first reach on. The warm-up before the reach does not
+  count. A rate that was cut at the maximum is never stored. A fault before the write drops the
+  rate. A stop after the 10 minutes does not. The page is written with the gate idle, so a store
+  that falls due in a cycle waits for it. A stored rate is never overwritten.
+- **Forgetting.** A reflash forgets the rate, because it erases the config page. So does
+  `ace2k_dryer_gain_forget`. A fault never does. A stored value outside 35–105 reads as none
+  stored.
+- **The limit that is accepted.** A first clean cycle with both ducts blocked looks like a stronger
+  heater and may store a higher rate. It stays below the maximum, because a rate that reaches 105 is
+  never stored, and the simulator puts such a case near twice the usual rate. The `sides`
+  protection still catches a blocked hot start (65 °C from a cold room), later than `response`
+  would. A blocked start at a low target is caught by nothing, today or after. The forget clears
+  the rate once the duct is found.
+
+The host publishes the rate in the dryer's status as `gain` and `gain_source` ("Host interface").
 
 A refusal leaves everything as it was. The start checks, in this order, the state, the range, then
 the inputs:
@@ -2341,6 +2376,13 @@ a caller that holds only the object reads `printer.lookup_object("ace2k").feed.A
     (`{"temp": °C, "minutes": m}`) and `rh` (the unit's last idle RH, the one it judges, in whole
     %, rounded half up), as the unit last reported them. All but `humidity_allowed`
     are `None` before the first report and always on an older image.
+  - The status also carries `gain` (the heater rate in m°C/s per %) and `gain_source` (`none`,
+    `learning`, `learned`, `stored`), read with `ace2k_dryer_gain_query` at connect and after a
+    cycle ends. Once a cycle ends, `gain_source` describes that cycle: `learning` (the cycle
+    stopped inside the first 60 s) and `learned` (it ended before it could store, or a fault
+    dropped its candidate) both mean the last cycle stored nothing, and the next cycle learns
+    again. Both are `None` on an image without the command. `ACEK_DRY_FORGET` calls the
+    forget; on such an image it says so and sends nothing.
   - The events 8–13 of `ace2k:dryer` carry their names: `auto_started` (`arg` °C),
     `auto_dry` (`arg` the cold RH, %), `auto_failed` (`arg` the failures in a row),
     `auto_stopped` (`arg` the failures), `auto_off` and `stopped_link`. Each of these six is also

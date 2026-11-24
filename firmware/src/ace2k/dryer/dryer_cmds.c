@@ -435,3 +435,31 @@ void ace2k_dryer_cmd_log_query(uint32_t *args)
     sendf(ACE2K_DRYER_LOG_FMT, index, v[0], v[1], v[2], v[3], v[4], v[5]);
 }
 DECL_COMMAND(ace2k_dryer_cmd_log_query, "ace2k_dryer_log_query index=%c");
+
+// The host's query of the heater's rate: the rate in use and its source (dryer.h). The source is
+// 0 none, 1 learning, 2 learned this cycle, 3 stored. The read runs with the tick masked.
+void ace2k_dryer_cmd_gain_query(uint32_t *args)
+{
+    (void)args;
+    ensure_ready();
+    uint16_t gain = 0;
+    uint8_t source = 0;
+    irqstatus_t flag = irq_save();
+    ace2k_dryer_gain_get(&ace2k_dryer_instance, &gain, &source);
+    irq_restore(flag);
+    sendf("ace2k_dryer_gain_state gain=%hu source=%c", gain, source);
+}
+DECL_COMMAND(ace2k_dryer_cmd_gain_query, "ace2k_dryer_gain_query");
+
+// The host's forget of the heater's rate. The page is written by store_page, through the log
+// generation that the forget bumps. The call runs with the tick masked.
+void ace2k_dryer_cmd_gain_forget(uint32_t *args)
+{
+    (void)args;
+    ensure_ready();
+    irqstatus_t flag = irq_save();
+    enum ace2k_dryer_refusal r = ace2k_dryer_gain_forget(&ace2k_dryer_instance);
+    irq_restore(flag);
+    ace2k_dryer_binding_respond(ACE2K_DRYER_OP_GAIN_FORGET, r);
+}
+DECL_COMMAND(ace2k_dryer_cmd_gain_forget, "ace2k_dryer_gain_forget");

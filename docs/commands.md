@@ -996,6 +996,14 @@ Prints the unit's dryer log:
 - hours of heating, and the energy estimate at `heater_watts` (default 360 W);
 - a note if the thermal cutout tripped;
 - the last eight faults or interrupted cycles, with their temperatures.
+- the heater rate of the unit, on one line: `heater rate: N m°C/s per % (stored)`,
+  `heater rate: N m°C/s per % (learned this cycle, not stored yet)`, `heater rate: learning` or
+  `heater rate: none stored; the next cycle learns it`. The rate is what the `response` protection
+  judges the heater against. A unit learns it in the first 60 s of a cycle and stores it after
+  the first cycle that ends clean. At 127 V it reads 35, the floor. Once a cycle ends, the line
+  describes that cycle. `learning` means it stopped inside the first 60 s. `learned this cycle, not
+  stored yet` means it ended before it could store, or a fault dropped its rate. In both cases the
+  cycle stored nothing, and the next cycle learns again.
 
 If the log changes while it is read, the read is repeated, up to three times.
 
@@ -1004,6 +1012,22 @@ No parameters. Refused: `ace2k: firmware built without CONFIG_ACE2K_HEAT` or `CO
 
 ```
 ACEK_DRYER_LOG
+```
+
+### `ACEK_DRY_FORGET`
+
+Forgets the heater rate that the unit learned and stored. Use it after you found a blocked duct, or
+when you moved the unit to another mains supply. The next cycle learns the rate again. A fault
+never forgets it, and a reflash always does.
+
+No parameters. It answers `ace2k: dryer rate forgotten; the next cycle learns it again`. It also
+answers this when nothing was stored. It is refused while a cycle is starting or heating, with
+`ace2k: dryer forget refused: a cycle is drying — forget once it stops`. Stop the cycle first.
+On a firmware that does not learn the rate it says
+`ace2k: this firmware does not learn the dryer's rate`.
+
+```
+ACEK_DRY_FORGET
 ```
 
 ### `ACEK_FAN`

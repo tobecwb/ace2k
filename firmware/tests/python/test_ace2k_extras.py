@@ -794,6 +794,7 @@ RESPONSES = {
     "ace2k_lane_counters_reset": {"lane": 255, "accepted": 1},
     "ace2k_rfid_lane_query": {"lane": 0, "state": 0, "uid": b""},
     "ace2k_dryer_log_query": {"index": 0, "a": 0, "b": 0, "c": 0, "d": 0, "e": 0, "f": 0},
+    "ace2k_dryer_gain_query": {"gain": 0, "source": 0},
     # a lane with no final event of a host start yet (seq 0): a start reported idle is counted over
     "ace2k_feed_last_query": EchoLane(lane=0, kind=0, mode=0, motor_um=0, filament_um=0, seq=0),
 }
@@ -974,6 +975,7 @@ def test_every_gcode_name_is_letters_and_underscores_only() -> None:
         "ACEK_DRY",
         "ACEK_DRY_STOP",
         "ACEK_DRY_CLEAR",
+        "ACEK_DRY_FORGET",
         "ACEK_FAN",
         "ACEK_FLAP",
         "ACEK_DRYER_LOG",

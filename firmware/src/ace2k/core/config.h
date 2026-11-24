@@ -1,6 +1,7 @@
 /* What: the record that ace2k keeps on its config page: the link proof, the dryer's log
- * (counters and the last eight faults), and the automatic modes' settings. Also the read-only
- * view of the factory calibration pages of the unit: the four insert-sensor bands.
+ * (counters and the last eight faults), the stored heater rate, and the automatic modes' settings.
+ * Also the read-only view of the factory calibration pages of the unit: the four insert-sensor
+ * bands.
  * How: the binding owns one struct ace2k_config on the board's flash ops.
  * - ace2k_config_init() loads it. A blank or corrupt page yields the defaults, and says so in
  *   `source`. A layout-1 page is migrated: its head is kept, and the log is empty.

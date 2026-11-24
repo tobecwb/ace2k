@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.17.0-alpha.1 — 2026-11-24
+
+**An alpha, published as a pre-release.** It was not run on a bench here. It is for units whose
+dryer stops with `fault (response)` in the first minute of every cycle, which was seen on 230 V
+mains. The host interface stays at version 29.
+
+The `response` protection stops the heater when the outlet warms faster than the heat that went in
+can explain. Its limit was set from units on 127 V mains. A stronger heater warms faster and
+tripped it 35–40 s into each cycle.
+
+### Changed
+
+- **Each unit learns the rate of its own heater.** While no rate is stored, the unit measures its
+  heater in the first 60 s of each cycle and judges the rest of the cycle with that rate. The rate
+  is never below the old limit, so a unit on 127 V is protected as before, and never above three
+  times it.
+- **The rate is stored once.** The first cycle that reaches its temperature and then runs 10 more
+  minutes with no fault, with both outlets close to each other, stores the rate on the unit. Later
+  cycles use it from the start.
+- **Flashing this image erases the unit's config page.** The dryer log starts empty, and the unit
+  learns its rate again on the first cycle.
+
+### Added
+
+- **`ACEK_DRY_FORGET`.** It forgets the stored rate, and the next cycle learns it again. Use it
+  after you change the heater or clear a blocked duct. It is refused while a cycle is drying. A
+  fault never forgets the rate.
+- **`ACEK_DRYER_LOG` shows the rate.** One line says the rate and whether it is stored.
+
+### Known limits
+
+- **A blocked duct in the very first clean cycle can store a higher rate.** That rate stays below
+  the maximum. The `sides` protection still stops a blocked start at a high temperature. Clear the
+  duct and run `ACEK_DRY_FORGET`.
+
+### For host modules
+
+- **The dryer's status gains `gain` and `gain_source`.** Both are `None` on an older image.
+- **The firmware dictionary grows.** `ace2k_dryer_gain_query` answers with
+  `ace2k_dryer_gain_state gain=%hu source=%c`, and `ace2k_dryer_gain_forget` answers with
+  `ace2k_dryer_response` (`op` 5). An older host keeps working with this image, and this host keeps
+  working with an older image.
+
 ## v0.16.0 — 2026-11-23
 
 A frame lost on the link no longer pauses or ends a print. The host interface stays at version 29.
