@@ -71,7 +71,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Callable, Protocol, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Protocol, TypedDict
 
 try:
     from .ace2k_link import (
@@ -117,6 +117,7 @@ FAN_SECONDS_MAX = 600  # ACE2K_AIRFLOW_FAN_MANUAL_MAX_S of the unit
 FAN_SECONDS_DEFAULT = 60
 HEATER_WATTS = 360.0
 REPORT_S = 1.0
+GAIN_REREAD_S = 5.0  # the unit stores a learned rate shortly after the cycle ends
 READY_SEED_S = 0.1  # delay of the log read after klippy:ready; a query blocks, a handler must not
 LOG_ENTRIES = 8
 LOG_READ_ATTEMPTS = 3  # a log read that saw a new entry is repeated, at most this many times
@@ -241,10 +242,20 @@ SEQ_MOD = 256  # the sequence number of the unit is 8 bits wide
 LOG_QUERY = "ace2k_dryer_log_query index=%c"
 LOG_NAME = LOG_QUERY.split(maxsplit=1)[0]
 LOG_FMT = "ace2k_dryer_log index=%c a=%u b=%u c=%u d=%u e=%u f=%u"
+# The learned heater rate. An image from before it lacks all three; the host connects and says so.
+GAIN_QUERY = "ace2k_dryer_gain_query"
+GAIN_STATE = "ace2k_dryer_gain_state gain=%hu source=%c"
+FORGET_FMT = "ace2k_dryer_gain_forget"
+GAIN_SOURCE_NAMES = {0: "none", 1: "learning", 2: "learned", 3: "stored"}
+# a cycle that ends may have learned or stored a rate
+GAIN_EVENTS = ("done", "stopped", "fault", "stopped_link")
+FORGET_BUSY_TEXT = "a cycle is drying — forget once it stops"
+FORGET_OLD_FIRMWARE = "ace2k: this firmware does not learn the dryer's rate"
 GCODES = (
     "ACEK_DRY",
     "ACEK_DRY_STOP",
     "ACEK_DRY_CLEAR",
+    "ACEK_DRY_FORGET",
     "ACEK_FAN",
     "ACEK_FLAP",
     "ACEK_DRYER_LOG",
@@ -268,6 +279,8 @@ class Fields(TypedDict):
     owner: str | int | None
     fans_commanded: bool | None  # noqa: V107
     events_lost: int  # noqa: V107
+    gain: int | None  # m°C/s per % of duty; None on a firmware that does not learn it
+    gain_source: str | int | None  # noqa: V107  # a name from GAIN_SOURCE_NAMES; None as for gain
 
 
 class Counters(TypedDict):
@@ -404,6 +417,8 @@ class Ace2kDryer:
             owner=None,
             fans_commanded=None,
             events_lost=0,
+            gain=None,
+            gain_source=None,
         )
         self.log_counters: Counters | None = None
         self.log_unstored = False
@@ -412,6 +427,9 @@ class Ace2kDryer:
         # format -> its query, built at connect together with the fans and flaps
         self.airflow_queries: dict[str, QueryCommand] = {}
         self.log_query: QueryCommand | None = None  # the query of the dryer log, built at connect
+        self.gain_query: QueryCommand | None = None  # None on a firmware without the rate
+        self.gain_reread = False  # the one more read of a rate still `learned`
+        self.gain_timer: Any = None  # the refresh after a cycle ends, made on first use
         self.ack_cmd: Command | None = None
         self.query_cmd: Command | None = None
         # The next sequence number to handle. It is None until the first state report after a
@@ -527,6 +545,14 @@ class Ace2kDryer:
             for fmt in (START_FMT, STOP_FMT, CLEAR_FMT)
         }
         self.log_query = self.mcu.lookup_query_command(LOG_QUERY, LOG_FMT)
+        self.gain_query = None
+        # a reconnect, or a unit reflashed to an image without the rate, keeps nothing of before
+        self.fields.update({"gain": None, "gain_source": None})
+        present, _ = self._probe(FORGET_FMT)
+        if present:
+            self._check_all((GAIN_QUERY, GAIN_STATE), FORGET_FMT)
+            self.requests[FORGET_FMT] = self.mcu.lookup_query_command(FORGET_FMT, DRYER_RESP)
+            self.gain_query = self.mcu.lookup_query_command(GAIN_QUERY, GAIN_STATE)
         self.ack_cmd = self.mcu.lookup_command(EVENT_ACK_FMT)
         self.query_cmd = self.mcu.lookup_command(DRYER_QUERY)
         # Always sent. The unit holds its events until this query, including the cutout of a boot.
@@ -551,6 +577,7 @@ class Ace2kDryer:
             params = ask(self.printer, self.mcu, self.log_query, [0], "dryer log")
         except NoAnswerError as e:
             logging.warning("%s dryer log query failed: %s", self.unit.head(), e)
+            self._read_gain()
             return self.reactor.NEVER
         self.log_counters = self._counters(params)
         c = self.log_counters
@@ -568,7 +595,57 @@ class Ace2kDryer:
                 " is power-cycled (a restart does not clear it)",
                 self.unit.head("dryer"),
             )
+        self._read_gain()
         return self.reactor.NEVER
+
+    def _read_gain(self) -> bool:
+        """Read the heater rate of the unit into the status.
+
+        It blocks, so call it from a G-code handler or a timer, never from a response handler.
+        A firmware without the rate leaves the fields None. A unit that does not answer leaves
+        the last values and logs a warning. Return False only when the unit did not answer."""
+        if self.gain_query is None:
+            return True
+        try:
+            params = ask(self.printer, self.mcu, self.gain_query, [], "dryer rate")
+        except NoAnswerError as e:
+            logging.warning("%s dryer rate query failed: %s", self.unit.head(), e)
+            return False
+        self.fields.update(
+            {
+                "gain": params["gain"],
+                "gain_source": GAIN_SOURCE_NAMES.get(params["source"], params["source"]),
+            }
+        )
+        return True
+
+    def _refresh_gain(self, eventtime: float) -> float:
+        """The timer that reads the rate again once a cycle has ended.
+
+        The unit writes the page shortly after the cycle ends, so a rate still `learned` is read
+        once more, a few seconds later, and no more."""
+        self._read_gain()
+        if self.fields["gain_source"] == "learned" and not self.gain_reread:
+            self.gain_reread = True
+            return eventtime + GAIN_REREAD_S
+        self.gain_reread = False
+        return self.reactor.NEVER
+
+    def _gain_line(self) -> str | None:
+        """Return the rate line of the dryer log, or None when the firmware has no rate."""
+        f = self.fields
+        source, gain = f["gain_source"], f["gain"]
+        if source == "stored":
+            return f"heater rate: {gain} m°C/s per % (stored)"
+        if source == "learned":
+            return f"heater rate: {gain} m°C/s per % (learned this cycle, not stored yet)"
+        if source == "learning":
+            return "heater rate: learning"
+        if source == "none":
+            return "heater rate: none stored; the next cycle learns it"
+        if source is None:
+            return None
+        return f"heater rate: {gain} m°C/s per % (source {source})"
 
     # --- reports and events (the serial thread) -------------------------------------------
 
@@ -739,6 +816,12 @@ class Ace2kDryer:
         """On the reactor: say the line on the console if asked, and send the Klipper event."""
         if said:
             self.unit.say(line)
+        if event["kind"] in GAIN_EVENTS and self.gain_query is not None:
+            # a handler of the serial thread never asks; the read runs from a timer
+            if self.gain_timer is None:
+                self.gain_timer = self.reactor.register_timer(self._refresh_gain)
+            self.gain_reread = False
+            self.reactor.update_timer(self.gain_timer, self.reactor.monotonic() + READY_SEED_S)
         self.printer.send_event("ace2k:dryer", dict(event, unit=self.unit.name))
 
     # --- status -----------------------------------------------------------------------------
@@ -921,6 +1004,25 @@ class Ace2kDryer:
         self._dryer_request(gcmd, "clear", CLEAR_FMT)
         gcmd.respond_info("ace2k: dryer fault cleared")
 
+    cmd_ACEK_DRY_FORGET_help = (
+        "Forget the unit's learned heater rate; the next cycle learns it again"
+    )
+
+    def cmd_ACEK_DRY_FORGET(self, gcmd: GCodeCommand) -> None:
+        self._require_dryer(gcmd)
+        if FORGET_FMT not in self.requests:
+            raise gcmd.error(FORGET_OLD_FIRMWARE)
+        try:
+            self._request("forget", FORGET_FMT)
+        except NoAnswerError as e:
+            raise gcmd.error(str(e)) from None
+        except DryerRefused as e:
+            # the unit refuses the forget as busy only while a cycle is starting or heating
+            text = FORGET_BUSY_TEXT if e.code == 1 else REFUSAL_TEXT.get(e.code, f"reason {e.code}")
+            raise gcmd.error(f"ace2k: dryer forget refused: {text}") from None
+        gcmd.respond_info("ace2k: dryer rate forgotten; the next cycle learns it again")
+        self._read_gain()
+
     cmd_ACEK_FAN_help = "Both fans by hand: ON=0|1 [SECONDS=<1-600>]; refused while drying"
 
     def cmd_ACEK_FAN(self, gcmd: GCodeCommand) -> None:
@@ -1031,6 +1133,7 @@ class Ace2kDryer:
             counters, entries, stable = self._read_log(gcmd)
             if stable:
                 break
+        gain_read = self._read_gain()
         c = self._counters(counters)
         self.log_counters = c
         energy_wh = c["full_power_s"] * self.heater_watts / 3600.0
@@ -1041,6 +1144,11 @@ class Ace2kDryer:
             f" {c['heat_s'] / 3600.0:.1f} h of heating, {energy_wh:.0f} Wh at"
             f" {self.heater_watts:g} W"
         ]
+        gain_line = self._gain_line()
+        if not gain_read:
+            gain_line = "heater rate: unknown (the unit did not answer)"
+        if gain_line is not None:
+            lines.append(gain_line)
         if not stable:
             lines.append(
                 f"the log changed while it was read ({LOG_READ_ATTEMPTS} tries):"

@@ -46,6 +46,9 @@ DRYER_NAMES = {
     "ace2k_dryer_log",
 }
 RELEASE = set(KNOWN_ALL_BUT_HEALTH) | AIRFLOW_NAMES | DRYER_NAMES
+# the three names of the learned heater rate; RELEASE is an image that predates them
+GAIN_NAMES = {"ace2k_dryer_gain_query", "ace2k_dryer_gain_state", "ace2k_dryer_gain_forget"}
+WITH_GAIN = RELEASE | GAIN_NAMES
 # an image with the fans and flaps (CONFIG_ACE2K_HEAT) and without the dryer
 NO_DRYER = set(KNOWN_ALL_BUT_HEALTH) | AIRFLOW_NAMES
 EMPTY_LOG = {"index": 1, "a": 0, "b": 0, "c": 0, "d": 0, "e": 0, "f": 0}
@@ -1056,3 +1059,201 @@ def test_check_cycle_takes_the_ranges_and_names_the_bad_argument() -> None:
         ace2k_dryer.check_cycle(40.5, 60)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="dryer minutes 0 outside 1–1440"):
         ace2k_dryer.check_cycle(40, 0)
+
+
+# --- the learned heater rate ------------------------------------------------------------------
+
+
+def gain_responses(gain: int = 0, source: int = 0, **more: object) -> dict[str, Any]:
+    """The canned answers of an image with the rate commands."""
+    return dict(
+        DRYER_RESPONSES,
+        **{
+            "ace2k_dryer_gain_query": {"gain": gain, "source": source},
+            "ace2k_dryer_gain_forget": dict(OK, op=5),
+            **more,
+        },
+    )
+
+
+def test_gain_commands_are_probed_and_built() -> None:
+    module, printer, mcu, dryer = build(known=WITH_GAIN, responses=gain_responses())
+    assert ace2k_dryer.FORGET_FMT in dryer.requests
+    assert dryer.gain_query is not None
+    # a layout that differs is a config error, and so is a missing sibling
+    with pytest.raises(Exception, match="ace2k_dryer_gain_state.*different commits"):
+        build(
+            known=WITH_GAIN,
+            formats={"ace2k_dryer_gain_state": "ace2k_dryer_gain_state gain=%hu"},
+        )
+    with pytest.raises(Exception, match="ace2k_dryer_gain_query.*though ace2k_dryer_gain_forget"):
+        build(known=WITH_GAIN - {"ace2k_dryer_gain_query"})
+
+
+def test_forget_accepted() -> None:
+    module, printer, mcu, dryer = build(known=WITH_GAIN, responses=gain_responses(80, 3))
+    gcmd = gcode(printer, "ACEK_DRY_FORGET")
+    assert sent_to(mcu, "ace2k_dryer_gain_forget") == [[]]
+    assert gcmd.lines[-1] == "ace2k: dryer rate forgotten; the next cycle learns it again"
+    assert "ACEK_DRY_FORGET" in ace2k_dryer.GCODES
+    assert "Forget the unit's learned heater rate" in dryer.cmd_ACEK_DRY_FORGET_help
+    # the rate is read again after the forget
+    assert sent_to(mcu, "ace2k_dryer_gain_query") == [[]]
+
+
+def test_forget_refused_while_heating() -> None:
+    responses = gain_responses(
+        ace2k_dryer_gain_forget={"op": 5, "accepted": 0, "reason": 1},
+    )
+    module, printer, mcu, dryer = build(known=WITH_GAIN, responses=responses)
+    with pytest.raises(FakeGcmd.error) as caught:
+        gcode(printer, "ACEK_DRY_FORGET")
+    assert str(caught.value) == (
+        "ace2k: dryer forget refused: a cycle is drying — forget once it stops"
+    )
+    responses = gain_responses(ace2k_dryer_gain_forget={"op": 5, "accepted": 0, "reason": 3})
+    module, printer, mcu, dryer = build(known=WITH_GAIN, responses=responses)
+    with pytest.raises(FakeGcmd.error) as caught:
+        gcode(printer, "ACEK_DRY_FORGET")
+    assert str(caught.value) == "ace2k: dryer forget refused: " + ace2k_dryer.REFUSAL_TEXT[3]
+
+
+@pytest.mark.parametrize(
+    ("gain", "source", "line"),
+    [
+        (80, 3, "heater rate: 80 m°C/s per % (stored)"),
+        (
+            72,
+            2,
+            "heater rate: 72 m°C/s per % (learned this cycle, not stored yet)",
+        ),
+    ],
+)
+def test_log_prints_the_stored_rate(gain: int, source: int, line: str) -> None:
+    responses = gain_responses(gain, source, ace2k_dryer_log_query=[EMPTY_LOG])
+    module, printer, mcu, dryer = build(known=WITH_GAIN, responses=responses)
+    lines = gcode(printer, "ACEK_DRYER_LOG").lines[-1].split("\n")
+    assert lines[1] == line  # right after the counters line
+
+
+def test_log_prints_learning_and_none() -> None:
+    for source, line in (
+        (1, "heater rate: learning"),
+        (0, "heater rate: none stored; the next cycle learns it"),
+    ):
+        responses = gain_responses(0, source, ace2k_dryer_log_query=[EMPTY_LOG])
+        module, printer, mcu, dryer = build(known=WITH_GAIN, responses=responses)
+        assert gcode(printer, "ACEK_DRYER_LOG").lines[-1].split("\n")[1] == line
+
+
+def test_status_carries_gain_and_source() -> None:
+    responses = gain_responses(80, 3, ace2k_dryer_log_query=[EMPTY_LOG])
+    module, printer, mcu, dryer = build(known=WITH_GAIN, responses=responses)
+    assert dryer.status()["gain"] is None and dryer.status()["gain_source"] is None
+    printer.handlers["klippy:ready"]()
+    (seed,) = [t for t in printer.reactor.timers if t[0] == dryer._seed_log]
+    seed[0](seed[1])
+    assert (dryer.status()["gain"], dryer.status()["gain_source"]) == (80, "stored")
+    mcu.responses["ace2k_dryer_gain_query"] = {"gain": 0, "source": 1}
+    gcode(printer, "ACEK_DRYER_LOG")
+    assert (dryer.status()["gain"], dryer.status()["gain_source"]) == (0, "learning")
+    mcu.responses["ace2k_dryer_gain_query"] = {"gain": 0, "source": 0}
+    gcode(printer, "ACEK_DRY_FORGET")
+    assert (dryer.status()["gain"], dryer.status()["gain_source"]) == (0, "none")
+
+
+@pytest.mark.parametrize("kind", [0, 1, 2, 13])  # done, stopped, fault, stopped_link
+def test_gain_is_refreshed_after_a_done_event(kind: int) -> None:
+    responses = gain_responses(0, 1)
+    module, printer, mcu, dryer = build(known=WITH_GAIN, responses=responses)
+    _connected(mcu, 0)
+    mcu.responses["ace2k_dryer_gain_query"] = {"gain": 66, "source": 2}
+    # the handler itself never asks: it runs on the serial thread
+    mcu.subscriptions["ace2k_dryer_event"]({"kind": kind, "arg": 0, "seq": 0})
+    assert sent_to(mcu, "ace2k_dryer_gain_query") == []
+    (timer,) = [t for t in printer.reactor.armed() if t[0] == dryer._refresh_gain]
+    again = timer[0](timer[1])  # learned: the timer is armed once more for the stored rate
+    assert again == timer[1] + ace2k_dryer.GAIN_REREAD_S
+    assert (dryer.status()["gain"], dryer.status()["gain_source"]) == (66, "learned")
+    assert timer[0](again) == FakeReactor.NEVER  # still learned: it does not loop
+
+
+def test_an_event_that_ends_nothing_does_not_refresh_the_gain() -> None:
+    module, printer, mcu, dryer = build(known=WITH_GAIN, responses=gain_responses())
+    _connected(mcu, 0)
+    mcu.subscriptions["ace2k_dryer_event"]({"kind": 3, "arg": 1, "seq": 0})  # lowered
+    assert not [t for t in printer.reactor.armed() if t[0] == dryer._refresh_gain]
+
+
+def test_old_firmware_without_the_gain_commands_connects() -> None:
+    module, printer, mcu, dryer = build(known=RELEASE)
+    assert dryer.dryer_present and ace2k_dryer.FORGET_FMT not in dryer.requests
+    with pytest.raises(FakeGcmd.error) as caught:
+        gcode(printer, "ACEK_DRY_FORGET")
+    assert str(caught.value) == "ace2k: this firmware does not learn the dryer's rate"
+    gcmd = gcode(printer, "ACEK_DRYER_LOG")
+    assert "heater rate" not in gcmd.lines[-1]
+    assert (dryer.status()["gain"], dryer.status()["gain_source"]) == (None, None)
+    assert sent_to(mcu, "ace2k_dryer_gain_query") == []
+    _connected(mcu, 0)
+    mcu.subscriptions["ace2k_dryer_event"]({"kind": 0, "arg": 0, "seq": 0})
+    assert not [t for t in printer.reactor.armed() if t[0] == dryer._refresh_gain]
+
+
+def test_the_response_fault_keeps_its_console_text(caplog: pytest.LogCaptureFixture) -> None:
+    module, printer, mcu, dryer = build(known=WITH_GAIN, responses=gain_responses())
+    _connected(mcu, 0)
+    with caplog.at_level("INFO", logger="root"):
+        mcu.subscriptions["ace2k_dryer_event"]({"kind": 2, "arg": 2, "seq": 0})
+    assert "ace2k dryer: fault response — the heater stopped; the fans cool it down" in caplog.text
+
+
+def test_log_names_an_unknown_source_and_a_failed_read() -> None:
+    responses = gain_responses(70, 9, ace2k_dryer_log_query=[EMPTY_LOG])
+    module, printer, mcu, dryer = build(known=WITH_GAIN, responses=responses)
+    lines = gcode(printer, "ACEK_DRYER_LOG").lines[-1].split("\n")
+    assert lines[1] == "heater rate: 70 m°C/s per % (source 9)"
+    mcu.responses["ace2k_dryer_gain_query"] = printer_error()
+    lines = gcode(printer, "ACEK_DRYER_LOG").lines[-1].split("\n")
+    assert lines[1] == "heater rate: unknown (the unit did not answer)"
+    assert dryer.status()["gain"] == 70  # the status keeps the last values
+
+
+def test_the_seed_reads_the_log_before_the_gain() -> None:
+    responses = gain_responses(0, 0, ace2k_dryer_log_query=[EMPTY_LOG])
+    module, printer, mcu, dryer = build(known=WITH_GAIN, responses=responses)
+    printer.handlers["klippy:ready"]()
+    (seed,) = [t for t in printer.reactor.timers if t[0] == dryer._seed_log]
+    seed[0](seed[1])
+    names = [n for n, _ in mcu.queries]
+    assert names == ["ace2k_dryer_log_query", "ace2k_dryer_gain_query"]
+
+
+def test_a_rate_still_learned_is_read_once_more_and_no_more() -> None:
+    module, printer, mcu, dryer = build(known=WITH_GAIN, responses=gain_responses(0, 1))
+    _connected(mcu, 0)
+    mcu.responses["ace2k_dryer_gain_query"] = {"gain": 66, "source": 2}
+    mcu.subscriptions["ace2k_dryer_event"]({"kind": 0, "arg": 0, "seq": 0})
+    (timer,) = [t for t in printer.reactor.armed() if t[0] == dryer._refresh_gain]
+    again = timer[0](timer[1])  # learned: read once more, a few seconds later
+    assert again == timer[1] + ace2k_dryer.GAIN_REREAD_S
+    assert dryer.status()["gain_source"] == "learned"
+    mcu.responses["ace2k_dryer_gain_query"] = {"gain": 66, "source": 3}
+    assert timer[0](again) == FakeReactor.NEVER  # stored: no third read
+    assert dryer.status()["gain_source"] == "stored"
+    mcu.responses["ace2k_dryer_gain_query"] = {"gain": 66, "source": 2}
+    assert timer[0](again) == again + ace2k_dryer.GAIN_REREAD_S  # a new cycle starts afresh
+    assert timer[0](again) == FakeReactor.NEVER  # still learned after the one more: stops
+
+
+def test_a_reconnect_to_an_image_without_the_rate_clears_it() -> None:
+    responses = gain_responses(80, 3, ace2k_dryer_log_query=[EMPTY_LOG])
+    module, printer, mcu, dryer = build(known=WITH_GAIN, responses=responses)
+    printer.handlers["klippy:ready"]()
+    (seed,) = [t for t in printer.reactor.timers if t[0] == dryer._seed_log]
+    seed[0](seed[1])
+    assert (dryer.status()["gain"], dryer.status()["gain_source"]) == (80, "stored")
+    mcu.known = RELEASE  # the unit comes back on an image without the rate
+    dryer._build_dryer()
+    assert (dryer.status()["gain"], dryer.status()["gain_source"]) == (None, None)
+    assert "heater rate" not in gcode(printer, "ACEK_DRYER_LOG").lines[-1]

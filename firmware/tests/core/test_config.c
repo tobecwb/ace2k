@@ -541,6 +541,64 @@ TEST(an_unknown_layout_is_corrupt)
     ASSERT_EQ(ace2k_config_decode(raw, &out), ACE2K_CONFIG_FROM_DEFAULTS_CORRUPT);
 }
 
+/* The stored heater rate sits in its own marked block at 205: the mark 0xA8, then the rate. */
+TEST(the_gain_round_trips_as_a_marked_block)
+{
+    struct ace2k_config_record in = sample_record();
+    struct ace2k_config_record out;
+    uint8_t page[ACE2K_CONFIG_RECORD_LEN];
+    in.dryer_log.gain_mc_s_per_pct = 52U;
+    ace2k_config_encode(&in, page);
+    ASSERT_EQ(page[205], 0xA8U);
+    ASSERT_EQ(page[206], 52U);
+    ASSERT_EQ(ace2k_config_decode(page, &out), ACE2K_CONFIG_FROM_FLASH);
+    ASSERT_EQ(out.dryer_log.gain_mc_s_per_pct, 52U);
+}
+
+TEST(a_page_without_the_gain_mark_reads_none)
+{
+    struct ace2k_config_record in = sample_record();
+    struct ace2k_config_record out;
+    uint8_t page[ACE2K_CONFIG_RECORD_LEN];
+    in.dryer_log.gain_mc_s_per_pct = 52U;
+    ace2k_config_encode(&in, page);
+    page[205] = 0U; /* what an older image writes there */
+    ace2k_put_u16_le(page + ACE2K_CONFIG_RECORD_LEN - 2U,
+                     ace2k_crc16_ccitt(page, ACE2K_CONFIG_RECORD_LEN - 2U));
+    ASSERT_EQ(ace2k_config_decode(page, &out), ACE2K_CONFIG_FROM_FLASH);
+    ASSERT_EQ(out.dryer_log.gain_mc_s_per_pct, 0U);
+    ASSERT_EQ(out.dryer_log.cycles_started, in.dryer_log.cycles_started);
+}
+
+TEST(a_gain_outside_the_band_reads_none)
+{
+    const uint8_t rate[] = { 0U, 34U, 106U, 255U, 35U, 105U };
+    const uint8_t want[] = { 0U, 0U, 0U, 0U, 35U, 105U };
+    for (size_t i = 0; i < sizeof rate; i++) {
+        struct ace2k_config_record in = sample_record();
+        struct ace2k_config_record out;
+        uint8_t page[ACE2K_CONFIG_RECORD_LEN];
+        ace2k_config_encode(&in, page);
+        page[206] = rate[i];
+        ace2k_put_u16_le(page + ACE2K_CONFIG_RECORD_LEN - 2U,
+                         ace2k_crc16_ccitt(page, ACE2K_CONFIG_RECORD_LEN - 2U));
+        ASSERT_EQ(ace2k_config_decode(page, &out), ACE2K_CONFIG_FROM_FLASH);
+        ASSERT_EQ(out.dryer_log.gain_mc_s_per_pct, want[i]);
+    }
+}
+
+TEST(a_layout_1_page_migrates_with_no_gain)
+{
+    struct ace2k_config c;
+    fake_reset(&ace2k_flash);
+    write_layout1_page("0.4.0", ACE2K_CONFIG_FLAG_LINK_PROVEN);
+    ace2k_flash.page[205] = 0xA8U; /* a marked rate past the layout-1 record: not read */
+    ace2k_flash.page[206] = 52U;
+    ace2k_config_init(&c, &fake_ops, &ace2k_flash);
+    ASSERT_EQ(c.source, ACE2K_CONFIG_FROM_FLASH);
+    ASSERT_EQ(c.record.dryer_log.gain_mc_s_per_pct, 0U);
+}
+
 /* The two factory pages as RAM, read-only: a read outside them is a violation, any erase or
  * program on them is a violation (the ops must never be pointed at them for a write). */
 struct ace2k_fake_factory {

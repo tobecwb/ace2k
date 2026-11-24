@@ -34,6 +34,7 @@ enum ace2k_dryer_cmd_op {
     ACE2K_DRYER_OP_CLEAR = 2,
     ACE2K_DRYER_OP_START_BOUND = 3, /* ace2k_dryer_start_bound, in dryer_auto_cmds.c */
     ACE2K_DRYER_OP_STOP_BOUND = 4,  /* ace2k_dryer_stop_bound, in dryer_auto_cmds.c */
+    ACE2K_DRYER_OP_GAIN_FORGET = 5, /* ace2k_dryer_gain_forget, in this file */
 };
 /* Sends ace2k_dryer_response for op with the refusal r (0 ok). */
 void ace2k_dryer_binding_respond(enum ace2k_dryer_cmd_op op, enum ace2k_dryer_refusal r);

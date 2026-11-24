@@ -282,6 +282,7 @@ static void enter_fault(struct ace2k_dryer *self, uint8_t reason,
      * heat. */
     (void)ace2k_airflow_fans(self->airflow, ACE2K_AIRFLOW_OWNER_DRYER, true, 0U, now_ms);
     ace2k_dryer_log_fault(self, reason, in);
+    ace2k_dryer_gain_fault(self);
     ace2k_dryer_emit(self, ACE2K_DRYER_EV_FAULT, reason);
     cool_begin(self, in, now_ms);
     set_state(self, ACE2K_DRYER_FAULT, now_ms);
@@ -295,6 +296,7 @@ static void begin_heating(struct ace2k_dryer *self, const struct ace2k_dryer_inp
     self->ctl.renew_next_ms = now_ms;
     self->ctl.step_next_ms = now_ms;
     ace2k_dryer_protect_begin(self, in, now_ms);
+    ace2k_dryer_gain_begin(self);
     ace2k_dryer_vent_heating(&self->vent, now_ms);
     set_state(self, ACE2K_DRYER_HEATING, now_ms);
 }
@@ -407,6 +409,7 @@ static void tick_heating(struct ace2k_dryer *self, const struct ace2k_dryer_inpu
         enter_fault(self, fault, in, now_ms);
         return;
     }
+    ace2k_dryer_gain_track(self, in, now_ms);
     uint8_t duty = ace2k_dryer_ctl_step(self, in, now_ms);
     renew_lease(self, duty, in, now_ms);
     if (self->state != ACE2K_DRYER_HEATING) {
@@ -493,6 +496,7 @@ void ace2k_dryer_init(struct ace2k_dryer *self, struct ace2k_heat *heat,
      * tick, in any state. */
     flaps_begin(self, false, now_ms);
     boot_log(self, power_on_reset);
+    ace2k_dryer_gain_init(self);
 }
 
 /* True when the mains is present but off-band: a dip in progress. */

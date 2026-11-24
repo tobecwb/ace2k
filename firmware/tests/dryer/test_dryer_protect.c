@@ -15,10 +15,18 @@ _Static_assert(ACE2K_DRYER_RISE_MAX_MC_S_PER_PCT == THERMAL_RISE_MAX_MC_S_PER_PC
 // NOLINTNEXTLINE(readability-identifier-naming)
 static struct rig r; /* kept off the stack */
 
+/* A unit with the floor stored as its heater's rate: the response rule judges from the first full
+ * window, as it did before the rate was learned (test_dryer_gain.c covers the learning). */
+static void rig_init_floor(int32_t ambient_mc)
+{
+    rig_init(&r, ambient_mc);
+    r.log.gain_mc_s_per_pct = ACE2K_DRYER_GAIN_FLOOR_MC_S_PER_PCT;
+}
+
 /* A 55 °C cycle (drive 62 °C) in HEATING with the NTCs overridden. */
 static void heating_with_ntc(int32_t left_mc, int32_t right_mc)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     ASSERT_EQ(r.dryer.state, ACE2K_DRYER_HEATING);
     r.ovr_ntc = true;
@@ -43,7 +51,7 @@ static uint32_t fault_after(uint32_t max_ms)
 
 TEST(a_dead_heater_faults_not_heating_at_300_s)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.heater_dead = true;
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     uint32_t at = fault_after(310000U);
@@ -76,7 +84,7 @@ TEST(ntcs_rising_with_the_duty_at_zero_fault_the_response)
 
 TEST(a_blocked_duct_faults_before_any_ntc_reaches_85_c)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.plant_blocked = FAKE_THERMAL_FANS_BOTH;
     ASSERT_EQ(rig_start(&r, 65U, 60U), ACE2K_DRYER_OK);
     (void)fault_after(20U * RIG_MIN_MS);
@@ -104,7 +112,7 @@ TEST(fourteen_degrees_apart_is_not_a_fault)
 
 TEST(the_chamber_above_the_ceiling_for_30_s_faults)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     r.ovr_chamber = true;
     r.ovr_chamber_mc = 65500;
@@ -117,7 +125,7 @@ TEST(the_chamber_above_the_ceiling_for_30_s_faults)
 
 TEST(the_chamber_just_below_the_ceiling_is_not_a_fault)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     r.ovr_chamber = true;
     r.ovr_chamber_mc = 64500;
@@ -127,7 +135,7 @@ TEST(the_chamber_just_below_the_ceiling_is_not_a_fault)
 
 TEST(the_chamber_above_80_c_faults_on_the_next_tick)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     r.ovr_chamber = true;
     r.ovr_chamber_mc = 80500;
@@ -138,7 +146,7 @@ TEST(the_chamber_above_80_c_faults_on_the_next_tick)
 
 TEST(a_stale_chamber_faults_while_heating_and_not_while_idle)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.chamber_age_ms = ACE2K_DRYER_CHAMBER_STALE_MS + 1U;
     rig_run_ms(&r, 10000U);
     ASSERT_EQ(r.dryer.state, ACE2K_DRYER_IDLE);
@@ -243,7 +251,7 @@ TEST(a_lease_refused_for_a_store_in_progress_waits)
 
 TEST(absent_mains_fault_the_cycle)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     rig_run_ms(&r, RIG_MIN_MS);
     r.mains_present = false;
@@ -259,7 +267,7 @@ TEST(a_mains_dip_at_the_first_lease_is_no_fault_and_the_cycle_heats)
 {
     static const uint32_t dip_ticks[] = { 1U, 50U, 101U };
     for (size_t i = 0; i < ACE2K_ARRAY_SIZE(dip_ticks); i++) {
-        rig_init(&r, 25000);
+        rig_init_floor(25000);
         ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
         ASSERT_EQ(r.dryer.state, ACE2K_DRYER_HEATING);
         ASSERT_TRUE(!ace2k_heat_leased(&r.heat)); /* the first lease is the next tick's */
@@ -283,7 +291,7 @@ TEST(a_mains_dip_at_the_first_lease_is_no_fault_and_the_cycle_heats)
 /* A dip that begins in STARTING and outlasts the entry into HEATING: no fault either. */
 TEST(a_mains_dip_across_the_start_is_no_fault)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(ace2k_dryer_start(&r.dryer, 55U, 60U, r.now_ms), ACE2K_DRYER_OK);
     r.mains_plausible = false;
     ASSERT_TRUE(rig_run_until(&r, ACE2K_DRYER_HEATING, ACE2K_DRYER_START_TIMEOUT_MS));
@@ -345,7 +353,7 @@ TEST(a_mains_off_band_past_the_threshold_while_heating_faults_mains)
  * one counter for both layers — faults MAINS, well inside the start timeout. */
 TEST(a_mains_off_band_past_the_threshold_with_no_lease_faults_mains)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     r.mains_plausible = false;
     uint32_t since = r.now_ms;
@@ -374,7 +382,7 @@ TEST(the_first_reason_stays)
 
 TEST(a_strand_inserted_with_no_host_lowers_to_45_c_without_a_chamber_fault)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 65U, 120U), ACE2K_DRYER_OK);
     rig_run_ms(&r, 60U * RIG_MIN_MS);
     r.link_ok = false;
@@ -392,7 +400,7 @@ TEST(a_strand_inserted_with_no_host_lowers_to_45_c_without_a_chamber_fault)
 
 TEST(the_spool_rule_leaves_the_target_alone_with_the_host_low_targets_and_old_strands)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.insert_mask = 0x1U; /* lane 1's strand in before the start */
     rig_tick(&r);
     ASSERT_EQ(rig_start(&r, 65U, 60U), ACE2K_DRYER_OK);
@@ -418,7 +426,7 @@ TEST(the_spool_rule_leaves_the_target_alone_with_the_host_low_targets_and_old_st
  * target, never raise it; once at 45 °C a further glitch changes nothing. */
 TEST(a_strand_glitch_with_no_host_only_ever_lowers_the_target)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.insert_mask = 0x2U; /* lane 2's strand in before the start */
     rig_tick(&r);
     ASSERT_EQ(rig_start(&r, 65U, 60U), ACE2K_DRYER_OK);
@@ -490,7 +498,7 @@ TEST(a_cutout_after_an_ntc_fault_is_persisted_across_a_software_reset)
 /* The sticky cutout alone refuses a start as CUTOUT (the other refusals out of the way). */
 TEST(a_cutout_seen_refuses_a_start_as_cutout)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.dryer.cutout_seen = true;
     ASSERT_EQ(ace2k_dryer_start(&r.dryer, 55U, 60U, r.now_ms), ACE2K_DRYER_CUTOUT);
     ASSERT_EQ(r.dryer.state, ACE2K_DRYER_IDLE);
@@ -578,7 +586,7 @@ static bool an_ntc_above(int32_t limit_mc)
  * accepted once it is not. */
 TEST(a_fault_cools_down_opens_then_closes_the_flaps_hands_the_fans_to_rule_7_and_clears)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     rig_run_ms(&r, 15U * RIG_MIN_MS);
     r.ovr_chamber = true;
@@ -633,7 +641,7 @@ TEST(a_fault_cools_down_opens_then_closes_the_flaps_hands_the_fans_to_rule_7_and
 
 TEST(a_cutout_fault_is_never_cleared_by_command)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     rig_run_ms(&r, 5U * RIG_MIN_MS);
     struct flap_mark mark = flap_mark_now();
@@ -671,7 +679,7 @@ static void assert_cutout_latched_on_one_tick(void)
 /* STARTING, held there by fans that never read high: the cutout latches before the timeout. */
 TEST(a_cutout_in_starting_latches_cutout)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.fan_fail = true;
     ASSERT_EQ(ace2k_dryer_start(&r.dryer, 55U, 60U, r.now_ms), ACE2K_DRYER_OK);
     rig_run_ms(&r, 1000U);
@@ -684,7 +692,7 @@ TEST(a_cutout_in_starting_latches_cutout)
 /* COOLDOWN, the flaps still opening after a stop. */
 TEST(a_cutout_while_the_cool_down_opens_the_flaps_latches_cutout)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     rig_run_ms(&r, 5U * RIG_MIN_MS);
     ASSERT_EQ(ace2k_dryer_stop(&r.dryer, r.now_ms), ACE2K_DRYER_OK);
@@ -697,7 +705,7 @@ TEST(a_cutout_while_the_cool_down_opens_the_flaps_latches_cutout)
 /* COOLDOWN, the flaps open and the fans running the heat out. */
 TEST(a_cutout_while_the_cool_down_waits_latches_cutout)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     rig_run_ms(&r, 5U * RIG_MIN_MS);
     ASSERT_EQ(ace2k_dryer_stop(&r.dryer, r.now_ms), ACE2K_DRYER_OK);
@@ -714,7 +722,7 @@ TEST(a_cutout_while_the_cool_down_waits_latches_cutout)
  * of defence. */
 TEST(a_cutout_heat_never_sees_still_latches_the_dryer)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     rig_run_ms(&r, RIG_MIN_MS);
     ASSERT_EQ(r.dryer.state, ACE2K_DRYER_HEATING);
@@ -727,7 +735,7 @@ TEST(a_cutout_heat_never_sees_still_latches_the_dryer)
  * the next boot holds the dryer in FAULT unless it is a power-on reset. */
 TEST(a_cutout_after_a_shutdown_is_still_persisted)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     rig_run_ms(&r, 5U * RIG_MIN_MS);
     ace2k_dryer_shutdown(&r.dryer);
@@ -743,7 +751,7 @@ TEST(a_cutout_after_a_shutdown_is_still_persisted)
 
 TEST(the_protections_stay_quiet_through_a_normal_warm_up)
 {
-    rig_init(&r, 15000);
+    rig_init_floor(15000);
     ASSERT_EQ(rig_start(&r, 65U, 60U), ACE2K_DRYER_OK);
     rig_run_ms(&r, 20U * RIG_MIN_MS);
     ASSERT_EQ(r.dryer.state, ACE2K_DRYER_HEATING);
@@ -755,7 +763,7 @@ TEST(the_protections_stay_quiet_through_a_normal_warm_up)
  * the rise back from it.  The cycle goes on, with no fault. */
 TEST(one_invalid_ntc_tick_read_as_zero_is_not_a_response_fault)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     rig_run_ms(&r, 60000U); /* the response window full */
     ASSERT_EQ(r.dryer.state, ACE2K_DRYER_HEATING);
@@ -815,7 +823,7 @@ TEST(an_invalid_ntc_is_held_on_its_own_side_only)
  * response window's sample. */
 TEST(the_duty_in_percent_is_rounded_the_same_in_the_status_and_the_response_window)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     rig_run_ms(&r, 5000U);
     ASSERT_TRUE(ace2k_heat_firing(&r.heat));
@@ -839,7 +847,7 @@ TEST(the_duty_in_percent_is_rounded_the_same_in_the_status_and_the_response_wind
  * went in. */
 TEST(the_response_window_records_no_duty_while_heat_fires_nothing)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     rig_run_ms(&r, 5000U);
     ASSERT_TRUE(ace2k_heat_firing(&r.heat));
@@ -871,7 +879,7 @@ static void heat_fires_as_imposed(void)
 static uint8_t imposed_duty_run(uint8_t duty_pct, uint32_t on_s, uint32_t off_s,
                                 int32_t *overshoot_mc)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.dryer.highest_target_c = 65U; /* the chamber's ceiling out of the way */
     r.dryer.target_c = 65U;
     heat_fires_as_imposed();
@@ -935,7 +943,7 @@ TEST(the_overshoot_after_a_cut_to_zero_is_not_an_impossible_response)
  * NTC climbing +3.8 °C over the next 13 s (docs/hardware.md "Heater"), then flat. */
 TEST(the_measured_overshoot_after_50_percent_is_not_an_impossible_response)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.dryer.highest_target_c = 65U;
     r.dryer.target_c = 65U;
     heat_fires_as_imposed();
@@ -1046,7 +1054,7 @@ TEST(each_mains_dip_ridden_out_is_counted_and_noticed)
  * HEATING); one asked once heat holds the mains implausible is refused NO_MAINS; absent at once. */
 TEST(a_start_during_a_dip_is_accepted_and_refused_once_the_dip_lasts)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.mains_plausible = false;
     rig_tick(&r);
     ASSERT_EQ(ace2k_dryer_start(&r.dryer, 55U, 60U, r.now_ms), ACE2K_DRYER_OK);
@@ -1057,7 +1065,7 @@ TEST(a_start_during_a_dip_is_accepted_and_refused_once_the_dip_lasts)
     ASSERT_EQ(r.dryer.mains_dips, 1U); /* in progress at the start, ridden out: counted */
     ASSERT_EQ(r.dryer.notices & ACE2K_DRYER_NOTICE_MAINS_DIP, ACE2K_DRYER_NOTICE_MAINS_DIP);
 
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.mains_plausible = false;
     rig_run_ms(&r, ACE2K_HEAT_MAINS_IMPLAUSIBLE_TICKS * RIG_TICK_MS);
     ASSERT_EQ(ace2k_dryer_start(&r.dryer, 55U, 60U, r.now_ms), ACE2K_DRYER_NO_MAINS);
@@ -1071,7 +1079,7 @@ TEST(a_start_during_a_dip_is_accepted_and_refused_once_the_dip_lasts)
  * through one it holds. */
 TEST(a_mains_fault_clears_through_a_dip_but_not_a_lasting_one)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     r.mains_plausible = false; /* no lease yet: heat is not latched, the dryer faults */
     (void)fault_after(5000U);
@@ -1142,7 +1150,7 @@ TEST(a_dip_ending_in_a_fault_and_an_absent_mains_are_not_counted)
  * and the mains one tick off-band: the refusal names the heat, not the mains. */
 TEST(a_clear_with_the_gate_high_and_a_dip_names_the_heat_not_the_mains)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     rig_run_ms(&r, 2U * RIG_MIN_MS);
     r.gate_stuck = true;
@@ -1163,7 +1171,7 @@ TEST(a_clear_with_the_gate_high_and_a_dip_names_the_heat_not_the_mains)
  * the mains plausible again or not; it clears once drained to it. */
 TEST(a_mains_fault_clears_only_once_the_bucket_is_at_its_restart_level)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     r.mains_plausible = false;
     (void)fault_after(5000U);
@@ -1189,7 +1197,7 @@ TEST(a_mains_fault_clears_only_once_the_bucket_is_at_its_restart_level)
  * stop — was ridden out: counted, the notice raised. */
 TEST(a_dip_open_at_the_time_up_or_a_stop_is_counted)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 1U), ACE2K_DRYER_OK);
     while ((int32_t)(r.dryer.end_ms - r.now_ms) > 500) {
         rig_tick(&r);
@@ -1215,7 +1223,7 @@ TEST(a_dip_open_at_the_time_up_or_a_stop_is_counted)
  * ACE2K_DRYER_PHASE_REJECTS_NOTICE on; those before the start do not count. */
 TEST(edges_off_phase_raise_the_notice_from_the_threshold)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.heat.phase_rejects += 50U; /* before the cycle: not this cycle's */
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     r.heat.phase_rejects += ACE2K_DRYER_PHASE_REJECTS_NOTICE - 1U;
@@ -1232,7 +1240,7 @@ TEST(edges_off_phase_raise_the_notice_from_the_threshold)
  * 1.2 s in, on a clean line, is accepted and heats. */
 TEST(a_start_just_after_boot_on_a_clean_line_is_accepted)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.mains_unmeasured = true;
     r.mains_plausible = false; /* the binding reads no frequency as not plausible */
     rig_run_ms(&r, 1000U);
@@ -1299,7 +1307,7 @@ TEST(a_duty_of_zero_and_a_dip_ridden_out_never_hit_the_no_lease_bound)
  * heating.  Now the cycle runs, says so, and fires nothing. */
 TEST(a_target_below_the_room_runs_with_the_notice_and_fires_nothing)
 {
-    rig_init(&r, 30000);
+    rig_init_floor(30000);
     uint32_t fired = r.heat.fired;
     ASSERT_EQ(rig_start(&r, 15U, 60U), ACE2K_DRYER_OK);
     ASSERT_TRUE((r.dryer.notices & ACE2K_DRYER_NOTICE_AMBIENT_ABOVE) != 0U);
@@ -1311,7 +1319,7 @@ TEST(a_target_below_the_room_runs_with_the_notice_and_fires_nothing)
 
 TEST(the_ceiling_counts_from_the_start_chamber_when_it_is_above_the_target)
 {
-    rig_init(&r, 30000);
+    rig_init_floor(30000);
     ASSERT_EQ(rig_start(&r, 15U, 60U), ACE2K_DRYER_OK);
     int32_t start = r.dryer.start_chamber_mc;
     r.ovr_chamber = true;
@@ -1329,7 +1337,7 @@ TEST(the_ceiling_counts_from_the_start_chamber_when_it_is_above_the_target)
  * pushed to 47 °C for 30 s is over (36 + 10), not under the start's 54 °C. */
 TEST(a_warm_restart_ceiling_follows_the_chamber_down)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.ovr_chamber = true;
     r.ovr_chamber_mc = 44000;
     rig_run_ms(&r, 100U);
@@ -1350,7 +1358,7 @@ TEST(a_warm_restart_ceiling_follows_the_chamber_down)
  * not the start's — refused at the ceiling, accepted just below it. */
 TEST(a_warm_restart_clear_reads_the_running_minimum_ceiling)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.ovr_chamber = true;
     r.ovr_chamber_mc = 44000;
     rig_run_ms(&r, 100U);
@@ -1379,14 +1387,14 @@ TEST(a_warm_restart_clear_reads_the_running_minimum_ceiling)
 
 TEST(a_chamber_below_its_target_raises_no_ambient_notice)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 45U, 60U), ACE2K_DRYER_OK);
     ASSERT_EQ(r.dryer.notices & ACE2K_DRYER_NOTICE_AMBIENT_ABOVE, 0U);
 }
 
 TEST(a_start_after_an_outage_waits_for_a_measured_window)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     r.mains_present = false;
     rig_run_ms(&r, 300U);
     r.mains_present = true;
@@ -1402,7 +1410,7 @@ TEST(a_start_after_an_outage_waits_for_a_measured_window)
 
 TEST(a_mains_fault_clears_only_once_the_mains_is_measured_again)
 {
-    rig_init(&r, 25000);
+    rig_init_floor(25000);
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     r.mains_present = false;
     rig_run_ms(&r, 100U);
@@ -1432,7 +1440,7 @@ TEST(a_mains_fault_clears_only_once_the_mains_is_measured_again)
  * The ambient is low, so the NTCs have risen 5 °C from their start (the not-heating rule). */
 static void lid_rig(int32_t ref_mc, int32_t heater_mc)
 {
-    rig_init(&r, 15000);
+    rig_init_floor(15000);
     r.ovr_chamber = true;
     r.ovr_chamber_mc = ref_mc;
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
@@ -1509,7 +1517,7 @@ TEST(one_closed_sample_restarts_the_hold)
  * never judged against it: its reference is the chamber at the entry. */
 TEST(a_stale_chamber_at_entry_faults_chamber_stale_not_lid)
 {
-    rig_init(&r, 15000);
+    rig_init_floor(15000);
     r.chamber_valid = false;
     ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);
     ASSERT_EQ(r.dryer.state, ACE2K_DRYER_HEATING);
@@ -1603,7 +1611,7 @@ static uint32_t lid_replay(const char *name, uint8_t *fault)
         long right = col[2];
         long chamber = col[3];
         if (first) {
-            rig_init(&r, 15000);
+            rig_init_floor(15000);
             r.ovr_chamber = true;
             r.ovr_chamber_mc = (int32_t)chamber;
             ASSERT_EQ(rig_start(&r, 55U, 60U), ACE2K_DRYER_OK);

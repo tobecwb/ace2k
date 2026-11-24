@@ -15,6 +15,8 @@ cmd_ACEK_CLEAR_help
 cmd_ACEK_DRY
 cmd_ACEK_DRY_CLEAR
 cmd_ACEK_DRY_CLEAR_help
+cmd_ACEK_DRY_FORGET
+cmd_ACEK_DRY_FORGET_help
 cmd_ACEK_DRY_help
 cmd_ACEK_DRY_STOP
 cmd_ACEK_DRY_STOP_help

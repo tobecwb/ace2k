@@ -628,6 +628,13 @@ meanwhile reach the host once it is back. [`ACEK_STATUS`](commands.md#acek_statu
 `printer.ace2k.dryer` show the state. Every dryer event is a log line and the Klipper event
 `ace2k:dryer`.
 
+The dryer learns the rate of its own heater. The rate tells the `response` protection how fast
+the outlet may warm for the power it is given. A heater on 230 V is stronger than one on 127 V, so
+a fixed rate would stop the cycles of a stronger heater by mistake. In its first cycles the unit
+measures the rate during the first minute of heating. After the first cycle that ends clean, it
+stores the rate and keeps it. You do not set it. [`ACEK_DRYER_LOG`](commands.md#acek_dryer_log)
+shows it, and [`ACEK_DRY_FORGET`](commands.md#acek_dry_forget) clears it. A reflash clears it too.
+
 ### Drying on its own
 
 > [!CAUTION]

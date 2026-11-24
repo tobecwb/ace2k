@@ -95,6 +95,21 @@ void ace2k_dryer_log_cycle_close(struct ace2k_dryer *self, bool completed);
 void ace2k_dryer_log_fault(struct ace2k_dryer *self, uint8_t reason,
                            const struct ace2k_dryer_inputs *in);
 
+/* dryer_gain.c: the heater's rate, learned per unit (dryer.h, "The heater's rate"). */
+void ace2k_dryer_gain_init(struct ace2k_dryer *self);  /* from ace2k_dryer_init */
+void ace2k_dryer_gain_begin(struct ace2k_dryer *self); /* at the entry into HEATING */
+/* The rate the response rule judges with; 0 while it learns. */
+uint8_t ace2k_dryer_gain_rate(const struct ace2k_dryer *self);
+/* One window of the response rule while learning: its rise and the duty that drove it. */
+void ace2k_dryer_gain_learn(struct ace2k_dryer *self, int32_t rise_mc, int32_t duty_pct_s);
+/* The end of learning, at GAIN_LEARN into HEATING: the rate becomes the learned one. */
+void ace2k_dryer_gain_finish(struct ace2k_dryer *self);
+/* Every HEATING tick, after the protections passed: the clean-cycle rule and the store. */
+void ace2k_dryer_gain_track(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in,
+                            uint32_t now_ms);
+/* A fault drops a candidate not yet on the page; a stored rate stays. */
+void ace2k_dryer_gain_fault(struct ace2k_dryer *self);
+
 /* dryer_protect.c */
 /* Resets the state of the protections at the entry into HEATING. The insert mask is kept. */
 void ace2k_dryer_protect_begin(struct ace2k_dryer *self, const struct ace2k_dryer_inputs *in,

@@ -91,6 +91,20 @@
 #define ACE2K_DRYER_RISE_FLOOR_MC  2000   /* initial value; re-tune on the bench */
 #define ACE2K_DRYER_SIDES_APART_MC 15000  /* initial value */
 #define ACE2K_DRYER_SIDES_MS       60000U /* initial value; re-tune on the bench */
+/* The heater's rate, learned per unit (dryer_gain.c). Until a rate is stored, the response rule
+ * only measures over the first GAIN_LEARN of HEATING, then judges with the measured rate, bounded
+ * by the floor and the maximum of dryer_log.h. A clean cycle stores it on the page. */
+#define ACE2K_DRYER_GAIN_LEARN_MS 60000U /* the learning time; never extended */
+/* A window counts only when the duty that drove it is at least this (10 % over the window). */
+#define ACE2K_DRYER_GAIN_MIN_DUTY_PCT_S 300 /* initial value; re-tune on the bench */
+#define ACE2K_DRYER_GAIN_MARGIN_PCT     150 /* the margin on the largest ratio; initial value */
+/* A clean cycle: HEATING ran this long after its first reach of the drive target. */
+#define ACE2K_DRYER_GAIN_CLEAN_MS 600000U
+/* A clean cycle: from the first reach of the drive target on, the sides were never further apart
+ * than this. The warm-up before that reach does not count. */
+#define ACE2K_DRYER_GAIN_SIDES_MC (ACE2K_DRYER_SIDES_APART_MC / 2)
+_Static_assert(ACE2K_DRYER_GAIN_FLOOR_MC_S_PER_PCT == ACE2K_DRYER_RISE_MAX_MC_S_PER_PCT,
+               "a learned rate never sets the response ceiling below today's");
 /* The chamber ceiling. The chamber faults at 10 °C over its base for 30 s (dryer_internal.h), or
  * at once at 80 °C (docs/rules.md). Initial values. The AHT20 is rated to 85 °C. */
 #define ACE2K_DRYER_CHAMBER_OVER_MC    10000
@@ -285,6 +299,28 @@ struct ace2k_dryer_ctl {
     int32_t ch_min_mc, ch_max_mc; /* the chamber over the current outer window */
 };
 
+enum ace2k_dryer_gain_source {
+    ACE2K_DRYER_GAIN_NONE = 0,     /* no rate yet */
+    ACE2K_DRYER_GAIN_LEARNING = 1, /* the first GAIN_LEARN of HEATING, nothing stored */
+    ACE2K_DRYER_GAIN_LEARNED = 2,  /* learned this cycle, not stored */
+    ACE2K_DRYER_GAIN_STORED = 3,   /* the rate on the page */
+};
+
+/* The heater's rate (dryer_gain.c). begin resets it at every entry into HEATING, except the
+ * candidate still waiting for the page. */
+struct ace2k_dryer_gain {
+    uint8_t rate;   /* m°C/s per %, in use for the current or last cycle; 0 = none */
+    uint8_t source; /* enum ace2k_dryer_gain_source */
+    uint16_t best;  /* the largest ratio with the margin so far, saturating */
+    bool counted;   /* a window counted while learning */
+    bool capped;    /* the learned ratio reached the maximum: never stored */
+    bool reached;   /* HEATING reached the drive target */
+    uint32_t reached_ms;
+    bool sides_ok; /* the sides never apart by more than GAIN_SIDES_MC since the first reach */
+    bool pending;  /* written into the log, not yet on the page */
+    uint32_t pending_gen;
+};
+
 /* The state of the protections. It is reset at every entry into HEATING (dryer_protect.c). */
 struct ace2k_dryer_protect {
     int32_t start_mc[2]; /* left, right at the entry into HEATING */
@@ -352,6 +388,7 @@ struct ace2k_dryer {
     int32_t ntc_held_mc[2]; /* last valid value of each NTC, left then right; 0 before the first */
     struct ace2k_dryer_ctl ctl;
     struct ace2k_dryer_protect prot;
+    struct ace2k_dryer_gain gain;
     struct ace2k_dryer_event ring[ACE2K_DRYER_EVENT_RING];
     volatile uint8_t ring_head, ring_tail;
     volatile uint8_t ring_sent; /* the next event to send; tail ≤ sent ≤ head */
@@ -466,6 +503,15 @@ bool ace2k_dryer_event_resend_due(const struct ace2k_dryer *self, bool subscribe
 /* The seq of the oldest unacknowledged event, or the next seq to assign when no event is held.
  * After a connect, this is the host's base: the oldest field of the state report. */
 uint8_t ace2k_dryer_event_oldest(const struct ace2k_dryer *self);
+
+/* Forgets the stored heater rate: the log's rate and a candidate still waiting for the page are
+ * cleared, and the next cycle learns again. BUSY in STARTING and HEATING, where nothing changes;
+ * OK otherwise. The page is written as the log is, with the gate idle. Called from command
+ * context with the tick masked (irq_save), as start, stop and clear are; so is the query below. */
+enum ace2k_dryer_refusal ace2k_dryer_gain_forget(struct ace2k_dryer *self);
+/* The rate in use for the current or last cycle (m°C/s per %, 0 = none) and its source (enum
+ * ace2k_dryer_gain_source). */
+void ace2k_dryer_gain_get(const struct ace2k_dryer *self, uint16_t *gain, uint8_t *source);
 
 struct ace2k_dryer_status {
     uint8_t state, target_c, duty_pct, fault, notices, flaps;

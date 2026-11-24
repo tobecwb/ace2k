@@ -1,6 +1,7 @@
 /* What: the dryer's log, as the config page keeps it: counters, flags and the last eight
  * entries.
- * How: types only. dryer.h declares the functions that change it (dryer_log.c).
+ * How: types only. dryer.h declares the functions that change it (dryer_log.c). The stored heater
+ * rate is one of the log's fields, kept on the page in its own marked block (core/config.c).
  * Depends on: <stdint.h>. */
 #ifndef ACE2K_DRYER_LOG_H
 #define ACE2K_DRYER_LOG_H
@@ -18,7 +19,8 @@ struct ace2k_dryer_log_entry { /* 16 bytes on the page */
 #define ACE2K_DRYER_LOG_ENTRIES 8U
 struct ace2k_dryer_log {
     uint32_t cycles_started, cycles_completed, heat_s, full_power_s, faults;
-    uint32_t flags; /* ACE2K_DRYER_LOG_CYCLE_OPEN, ACE2K_DRYER_LOG_CUTOUT */
+    uint32_t flags;            /* ACE2K_DRYER_LOG_CYCLE_OPEN, ACE2K_DRYER_LOG_CUTOUT */
+    uint8_t gain_mc_s_per_pct; /* 0: none stored */
     /* the sub-second remainders of the two time counters; not persisted */
     uint32_t full_power_ms_frac;
     uint32_t heat_ms_frac;
@@ -28,5 +30,10 @@ struct ace2k_dryer_log {
 #define ACE2K_DRYER_LOG_CUTOUT     0x2U
 
 #define ACE2K_DRYER_LOG_TEMP_UNKNOWN_DC INT16_MIN /* a reading that was invalid or absent */
+
+/* The band a stored heater rate (m°C/s per %) must lie in to be read back; a rate outside it reads
+ * as none. The floor is the rise rule's own bound (dryer.h asserts they are equal). */
+#define ACE2K_DRYER_GAIN_FLOOR_MC_S_PER_PCT 35U
+#define ACE2K_DRYER_GAIN_MAX_MC_S_PER_PCT   105U
 
 #endif
