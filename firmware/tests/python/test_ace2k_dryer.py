@@ -14,6 +14,8 @@ from test_ace2k_extras import (
     FakeCommandError,
     FakeGcmd,
     FakeReactor,
+    armed_timer,
+    fire_ready,
     make,
     make_units,
 )
@@ -1257,3 +1259,224 @@ def test_a_reconnect_to_an_image_without_the_rate_clears_it() -> None:
     dryer._build_dryer()
     assert (dryer.status()["gain"], dryer.status()["gain_source"]) == (None, None)
     assert "heater rate" not in gcode(printer, "ACEK_DRYER_LOG").lines[-1]
+
+
+# --- the total: the minutes the running cycle was asked for ----------------------------------
+
+TOTAL_NAMES = {"ace2k_dryer_total_query", "ace2k_dryer_total"}
+WITH_TOTAL = WITH_GAIN | TOTAL_NAMES
+
+
+def total_responses(total: int = 0, **more: object) -> dict[str, Any]:
+    more.setdefault("ace2k_dryer_total_query", {"total_min": total})
+    return gain_responses(0, 0, **more)
+
+
+def dryer_line(printer: FakePrinter) -> str:
+    """The dryer's line of ACEK_STATUS."""
+    lines = gcode(printer, "ACEK_STATUS").lines[0].split("\n")
+    (line,) = [x for x in lines if "dryer:" in x]
+    return line
+
+
+def _report(mcu: FakeMcu, state: int, remaining: int = 0) -> None:
+    mcu.subscriptions["ace2k_dryer_state"](
+        state_frame(state=state, target=45 if state else 0, remaining=remaining)
+    )
+
+
+def _run_total_timer(printer: FakePrinter, dryer: Ace2kDryer) -> None:
+    """Run the armed read of the total, and keep its next wake time as the reactor does."""
+    cb, waketime = armed_timer(printer, dryer._refresh_total)
+    printer.reactor.update_timer(dryer.total_timer, cb(waketime))
+    assert not [t for t in printer.reactor.armed() if t[0] == dryer._refresh_total]
+
+
+def test_the_total_query_is_probed_and_built() -> None:
+    module, printer, mcu, dryer = build(known=WITH_TOTAL, responses=total_responses())
+    assert dryer.total_query is not None
+    with pytest.raises(Exception, match="ace2k_dryer_total.*different commits"):
+        build(
+            known=WITH_TOTAL,
+            responses=total_responses(),
+            formats={"ace2k_dryer_total": "ace2k_dryer_total total_min=%u"},
+        )
+
+
+def test_an_image_without_the_total_shows_the_remaining_time_alone() -> None:
+    module, printer, mcu, dryer = build(known=WITH_GAIN, responses=total_responses(90))
+    assert dryer.total_query is None
+    fire_ready(printer)
+    _connected(mcu, 0)
+    gcode(printer, "ACEK_DRY", TEMP=45, DURATION="90m")
+    _report(mcu, 1, 90)
+    _report(mcu, 2, 80)
+    assert sent_to(mcu, "ace2k_dryer_total_query") == []
+    assert not [t for t in printer.reactor.armed() if t[0] == dryer._refresh_total]
+    assert dryer.status()["duration"] is None
+    assert dryer_line(printer).endswith("1 h 20 min left")
+
+
+def test_the_connect_reads_the_total_of_a_running_cycle() -> None:
+    module, printer, mcu, dryer = build(
+        known=WITH_TOTAL, responses=total_responses(240, ace2k_dryer_log_query=[EMPTY_LOG])
+    )
+    _report(mcu, 2, 90)  # the first report since the connect: a cycle already running
+    assert not [t for t in printer.reactor.armed() if t[0] == dryer._refresh_total]
+    fire_ready(printer)
+    assert sent_to(mcu, "ace2k_dryer_total_query") == [[]]
+    assert dryer.status()["duration"] == 240
+    assert dryer_line(printer).endswith("dryer: heating 45 °C, 1 h 30 min left of 4 h")
+
+
+def test_the_connect_reads_the_total_even_when_the_log_read_fails() -> None:
+    responses = total_responses(240, ace2k_dryer_log_query=[printer_error()])
+    module, printer, mcu, dryer = build(known=WITH_TOTAL, responses=responses)
+    _report(mcu, 2, 90)
+    fire_ready(printer)
+    assert dryer.status()["duration"] == 240
+
+
+def test_a_connect_with_nothing_running_reads_no_total() -> None:
+    module, printer, mcu, dryer = build(
+        known=WITH_TOTAL, responses=total_responses(0, ace2k_dryer_log_query=[EMPTY_LOG])
+    )
+    _connected(mcu, 0)
+    fire_ready(printer)
+    assert sent_to(mcu, "ace2k_dryer_total_query") == []  # the unit reported no cycle: it holds 0
+    assert dryer.status()["duration"] is None
+
+
+def test_a_cycle_the_unit_starts_on_its_own_reads_the_total_from_a_timer() -> None:
+    """The humidity mode, the print mode or another host module: no ACEK_DRY on this host."""
+    module, printer, mcu, dryer = build(known=WITH_TOTAL, responses=total_responses(120))
+    _connected(mcu, 0)
+    _report(mcu, 1, 120)
+    # the report handler runs on the serial thread: it never asks
+    assert sent_to(mcu, "ace2k_dryer_total_query") == []
+    _run_total_timer(printer, dryer)
+    assert sent_to(mcu, "ace2k_dryer_total_query") == [[]]
+    assert dryer.status()["duration"] == 120
+    _report(mcu, 2, 119)  # heating: still the same cycle, no second read
+    assert dryer.status()["duration"] == 120
+    assert not [t for t in printer.reactor.armed() if t[0] == dryer._refresh_total]
+
+
+def test_ace_dry_takes_the_total_from_the_unit_not_from_its_argument() -> None:
+    module, printer, mcu, dryer = build(known=WITH_TOTAL, responses=total_responses(30))
+    _connected(mcu, 0)
+    gcode(printer, "ACEK_DRY", TEMP=45, DURATION=30)
+    assert sent_to(mcu, "ace2k_dryer_total_query") == [[]]
+    assert dryer.status()["duration"] == 30
+    mcu.responses["ace2k_dryer_total_query"] = {"total_min": 25}
+    gcode(printer, "ACEK_DRY", TEMP=45, DURATION=90)
+    assert dryer.status()["duration"] == 25
+
+
+def test_a_retarget_reads_the_new_total() -> None:
+    module, printer, mcu, dryer = build(known=WITH_TOTAL, responses=total_responses(30))
+    _connected(mcu, 0)
+    gcode(printer, "ACEK_DRY", TEMP=45, DURATION=30)
+    _report(mcu, 1, 30)
+    _report(mcu, 2, 20)
+    mcu.responses["ace2k_dryer_total_query"] = {"total_min": 240}
+    gcode(printer, "ACEK_DRY", TEMP=55, DURATION="4h")
+    _report(mcu, 2, 240)  # no transition: the report keeps the total just read
+    assert dryer.status()["duration"] == 240
+
+
+def test_the_host_start_reads_the_total() -> None:
+    module, printer, mcu, dryer = build(known=WITH_TOTAL, responses=total_responses(60))
+    _connected(mcu, 0)
+    dryer.start(45, 60)
+    assert dryer.status()["duration"] == 60
+
+
+def test_a_late_idle_report_does_not_erase_the_total_just_read() -> None:
+    module, printer, mcu, dryer = build(known=WITH_TOTAL, responses=total_responses(90))
+    _connected(mcu, 0)
+    gcode(printer, "ACEK_DRY", TEMP=45, DURATION=90)
+    assert dryer.status()["duration"] == 90
+    _report(mcu, 0)  # a report sent before the start, handled after its answer
+    assert dryer.status()["duration"] == 90
+    _report(mcu, 1, 90)
+    _run_total_timer(printer, dryer)  # the start has read it: the timer does not ask again
+    _report(mcu, 2, 89)
+    assert dryer.status()["duration"] == 90
+    assert sent_to(mcu, "ace2k_dryer_total_query") == [[]]
+
+
+@pytest.mark.parametrize("after", [3, 4, 0])  # cooldown, fault, idle
+def test_leaving_the_cycle_clears_the_total(after: int) -> None:
+    module, printer, mcu, dryer = build(known=WITH_TOTAL, responses=total_responses(90))
+    _connected(mcu, 0)
+    gcode(printer, "ACEK_DRY", TEMP=45, DURATION=90)
+    _report(mcu, 2, 50)
+    _report(mcu, after)
+    assert dryer.status()["duration"] is None
+    _report(mcu, 2, 50)  # a late heating report after the end does not bring it back
+    assert dryer.status()["duration"] is None
+
+
+def test_a_stop_clears_the_total_at_the_next_report() -> None:
+    module, printer, mcu, dryer = build(known=WITH_TOTAL, responses=total_responses(90))
+    _connected(mcu, 0)
+    gcode(printer, "ACEK_DRY", TEMP=45, DURATION=90)
+    _report(mcu, 2, 50)
+    gcode(printer, "ACEK_DRY_STOP")
+    _report(mcu, 3)
+    assert dryer.status()["duration"] is None
+    assert " of " not in dryer_line(printer)
+
+
+def test_an_unanswered_total_read_is_a_warning_and_shows_no_total(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    responses = total_responses(ace2k_dryer_total_query=printer_error())
+    module, printer, mcu, dryer = build(known=WITH_TOTAL, responses=responses)
+    _connected(mcu, 0)
+    with caplog.at_level("WARNING", logger="root"):
+        _report(mcu, 1, 30)
+        _run_total_timer(printer, dryer)
+    assert "dryer total query failed" in caplog.text
+    assert dryer.status()["duration"] is None
+    assert dryer_line(printer).endswith(", 30 min left")
+
+
+def test_a_reconnect_forgets_the_total() -> None:
+    module, printer, mcu, dryer = build(known=WITH_TOTAL, responses=total_responses(90))
+    _connected(mcu, 0)
+    gcode(printer, "ACEK_DRY", TEMP=45, DURATION=90)
+    _report(mcu, 2, 50)
+    mcu.config_callback()  # a reconnect
+    assert dryer.status()["duration"] is None
+
+
+@pytest.mark.parametrize(
+    ("remaining", "total", "tail"),
+    [
+        (90, 240, ", 1 h 30 min left of 4 h"),
+        (29, 30, ", 29 min left of 30 min"),
+    ],
+)
+def test_ace_status_prints_the_remaining_time_left_of_the_total(
+    remaining: int, total: int, tail: str
+) -> None:
+    module, printer, mcu, dryer = build(known=WITH_TOTAL, responses=total_responses(total))
+    _connected(mcu, 0)
+    _report(mcu, 1, remaining)
+    _run_total_timer(printer, dryer)
+    _report(mcu, 2, remaining)
+    assert module.get_status(0.0)["dryer"]["duration"] == total
+    assert dryer_line(printer).endswith(tail)
+
+
+def test_an_unanswered_read_after_a_retarget_shows_no_total_not_the_old_one() -> None:
+    module, printer, mcu, dryer = build(known=WITH_TOTAL, responses=total_responses(30))
+    _connected(mcu, 0)
+    gcode(printer, "ACEK_DRY", TEMP=45, DURATION=30)
+    _report(mcu, 1, 30)
+    _report(mcu, 2, 20)
+    mcu.responses["ace2k_dryer_total_query"] = printer_error()
+    gcode(printer, "ACEK_DRY", TEMP=55, DURATION="4h")
+    assert dryer.status()["duration"] is None

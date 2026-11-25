@@ -34,12 +34,14 @@ from typing import TYPE_CHECKING
 
 try:
     from .ace2k_dryer import (
+        ACTIVE,
         MODE_CODES,
         MODE_NAMES,  # noqa: F401 — re-exported
         DryerRefused,
     )
 except ImportError:  # the host tests import by bare name, with klippy/extras on the path
     from ace2k_dryer import (  # type: ignore[import-not-found, no-redef]
+        ACTIVE,
         MODE_CODES,
         MODE_NAMES,  # noqa: F401 — re-exported
         DryerRefused,
@@ -57,7 +59,6 @@ RETARGET_S = 1.0  # a retarget is believed when two polls this far apart both sh
 ON_STATES = ("printing", "paused")
 # The events that end its cycle and block further starts until the print ends.
 BLOCKING = ("stopped", "stopped_link", "fault")
-ACTIVE = ("starting", "heating")  # the dryer states of a running cycle
 
 
 class PrintWatch:

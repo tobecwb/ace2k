@@ -463,3 +463,19 @@ void ace2k_dryer_cmd_gain_forget(uint32_t *args)
     ace2k_dryer_binding_respond(ACE2K_DRYER_OP_GAIN_FORGET, r);
 }
 DECL_COMMAND(ace2k_dryer_cmd_gain_forget, "ace2k_dryer_gain_forget");
+
+// The minutes the running cycle was asked for, 0 when none runs. A query of its own rather than a
+// field of ace2k_dryer_state: a state frame with one more field would make every older host refuse
+// the connect (probe_format answers "differs"), while an image without this command simply leaves
+// an older host asking nothing. The factory firmware reports the same number as `duration` in its
+// status; ace2k had dropped it (docs/protocol.md, "The dryer").
+void ace2k_dryer_cmd_total_query(uint32_t *args)
+{
+    (void)args;
+    ensure_ready();
+    irqstatus_t flag = irq_save();
+    uint16_t total = ace2k_dryer_instance.total_min;
+    irq_restore(flag);
+    sendf("ace2k_dryer_total total_min=%hu", total);
+}
+DECL_COMMAND(ace2k_dryer_cmd_total_query, "ace2k_dryer_total_query");

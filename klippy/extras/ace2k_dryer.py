@@ -122,6 +122,10 @@ READY_SEED_S = 0.1  # delay of the log read after klippy:ready; a query blocks, 
 LOG_ENTRIES = 8
 LOG_READ_ATTEMPTS = 3  # a log read that saw a new entry is repeated, at most this many times
 LOG_TEMP_UNKNOWN_DC = -32768  # INT16_MIN of the unit: the reading was invalid or missing
+ACTIVE = ("starting", "heating")  # the dryer states of a running cycle
+# The minutes a cycle was asked for (docs/protocol.md, ace2k_dryer_total_query).
+TOTAL_QUERY = "ace2k_dryer_total_query"
+TOTAL_FMT = "ace2k_dryer_total total_min=%hu"
 
 # The dryer modes' names by the unit's code. ace2k_dryer_print and ace2k_dryer_mode re-export both.
 MODE_NAMES = {0: "manual", 1: "humidity", 2: "print"}
@@ -272,6 +276,7 @@ class Fields(TypedDict):
     drive: float | None  # noqa: V107
     duty: int | None
     remaining: int | None  # noqa: V107
+    duration: int | None  # noqa: V107  # the minutes the cycle was asked for; None when none runs
     fans: dict[str, bool] | None
     flaps: dict[str, str] | None
     fault: str | None  # noqa: V107
@@ -404,12 +409,19 @@ class Ace2kDryer:
         self.section = config.get_name()
         self.heater_watts = config.getfloat("heater_watts", HEATER_WATTS, above=0.0)
         self.airflow_present = self.dryer_present = False
+        # fields["duration"] comes from the unit, for every cycle (docs/protocol.md,
+        # ace2k_dryer_total_query).
+        self.total_query: QueryCommand | None = None  # None on an image without the command
+        self.total_timer: Any = None  # the read after a report entered a cycle, made on first use
+        # Whether the last report was of a running cycle; None until the first since a connect.
+        self.cycling: bool | None = None
         self.fields = Fields(
             state=None,
             target=None,
             drive=None,
             duty=None,
             remaining=None,
+            duration=None,
             fans=None,
             flaps=None,
             fault=None,
@@ -538,6 +550,15 @@ class Ace2kDryer:
             START_FMT,
         )
         self.dryer_present = True
+        # An image without the total leaves it None, and the status shows the remaining time
+        # alone. A reconnect keeps nothing of before.
+        self.total_query = None
+        self.cycling = None
+        self.fields["duration"] = None
+        present, _ = self._probe(TOTAL_QUERY)
+        if present:
+            self._check_all((TOTAL_FMT,), TOTAL_QUERY)
+            self.total_query = self.mcu.lookup_query_command(TOTAL_QUERY, TOTAL_FMT)
         # Built once. Every request reuses them, whether it comes from a G-code or from a host
         # module in a timer.
         self.requests = {
@@ -578,6 +599,7 @@ class Ace2kDryer:
         except NoAnswerError as e:
             logging.warning("%s dryer log query failed: %s", self.unit.head(), e)
             self._read_gain()
+            self._read_connect_total()
             return self.reactor.NEVER
         self.log_counters = self._counters(params)
         c = self.log_counters
@@ -596,6 +618,7 @@ class Ace2kDryer:
                 self.unit.head("dryer"),
             )
         self._read_gain()
+        self._read_connect_total()
         return self.reactor.NEVER
 
     def _read_gain(self) -> bool:
@@ -618,6 +641,47 @@ class Ace2kDryer:
             }
         )
         return True
+
+    def _read_total(self) -> None:
+        """Read the minutes of the running cycle from the unit into the status.
+
+        It blocks, so call it from a G-code handler or a timer, never from a response handler.
+        The unit clears the value when the cycle ends, so a read with nothing running gives 0 and
+        the status shows no total. A unit that does not answer leaves no total: after a retarget
+        the last value would be the old cycle's."""
+        if self.total_query is None:
+            return
+        try:
+            params = ask(self.printer, self.mcu, self.total_query, [], "dryer total")
+        except NoAnswerError as e:
+            logging.warning("%s dryer total query failed: %s", self.unit.head(), e)
+            self.fields["duration"] = None
+            return
+        self.fields["duration"] = params["total_min"] or None
+
+    def _read_connect_total(self) -> None:
+        """The connect's read of the total, for a cycle already running when the host attached.
+
+        A unit that has already reported no cycle holds 0, so it is not asked."""
+        if self.cycling is not False:
+            self._read_total()
+
+    def _arm_total(self, _eventtime: float) -> None:
+        """On the reactor: arm the read of the total, which a report handler may not do itself."""
+        if self.total_query is None:
+            return
+        if self.total_timer is None:
+            self.total_timer = self.reactor.register_timer(self._refresh_total)
+        self.reactor.update_timer(self.total_timer, self.reactor.monotonic() + READY_SEED_S)
+
+    def _refresh_total(self, _eventtime: float) -> float:
+        """The timer that reads the total once a report has entered a cycle.
+
+        A start of this host has already read it; a report that leaves the cycle clears it, so a
+        value still here is this cycle's."""
+        if self.fields["duration"] is None:
+            self._read_total()
+        return self.reactor.NEVER
 
     def _refresh_gain(self, eventtime: float) -> float:
         """The timer that reads the rate again once a cycle has ended.
@@ -652,6 +716,16 @@ class Ace2kDryer:
     def _handle_state(self, params: Params) -> None:
         state = STATE_NAMES.get(params["state"], params["state"])
         running = state != "idle"
+        # The total means something only while a cycle runs. Only a change of the report moves
+        # it: a report that leaves the cycle clears it, as the unit clears its own, and one that
+        # enters a cycle has it read. A report sent before a start and handled after its answer
+        # changes nothing, so it does not erase the total that the start has just read.
+        cycling = state in ACTIVE
+        if self.cycling and not cycling:
+            self.fields["duration"] = None
+        elif self.cycling is False and cycling:
+            self.reactor.register_async_callback(self._arm_total)
+        self.cycling = cycling
         notices = notices_of(params["notices"])
         unstored = "log_unstored" in notices
         if unstored and not self.log_unstored:
@@ -841,8 +915,10 @@ class Ace2kDryer:
                 line += f" {f['target']} °C"
             if f["drive"] is not None:
                 line += f" (drive {f['drive']:.1f} °C, duty {f['duty']} %)"
-            if f["remaining"] is not None and f["state"] in ("starting", "heating"):
+            if f["remaining"] is not None and f["state"] in ACTIVE:
                 line += f", {format_minutes(f['remaining'])} left"
+                if f["duration"]:
+                    line += f" of {format_minutes(f['duration'])}"
             if f["fault"] is not None:
                 line += f"; fault {f['fault']}"
         if f["notices"]:
@@ -929,6 +1005,9 @@ class Ace2kDryer:
         params = ask(self.printer, self.mcu, self.requests[fmt], data, fmt.split(maxsplit=1)[0])
         if not params["accepted"]:
             raise DryerRefused(what, params["reason"])
+        if fmt == START_FMT:
+            # a start or a retarget: the unit holds the cycle's total now
+            self._read_total()
 
     # --- the host interface ---------------------------------------------------
 
