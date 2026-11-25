@@ -359,6 +359,10 @@ struct ace2k_dryer {
     uint32_t phase_rejects_start; /* heat's phase_rejects at the start */
     uint8_t target_c;
     uint8_t highest_target_c; /* the cycle's highest target: the base of the chamber ceiling */
+    /* The minutes a cycle was asked for, 0 when none runs. ace2k_dryer_total_query reads it: the
+     * factory firmware reports the same field as `duration` in its status, and ace2k's state frame
+     * has no room for it without breaking an older host (docs/protocol.md, "The dryer"). */
+    uint16_t total_min;
     int32_t start_chamber_mc; /* lowest valid chamber reading since the start: the floor of the
                                * ceiling (dryer_internal.h) */
     bool shut;                /* a Klipper shutdown happened: nothing moves any more */
