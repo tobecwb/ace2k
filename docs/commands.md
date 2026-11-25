@@ -965,6 +965,12 @@ table prints `reason N`.
 ACEK_DRY TEMP=55 DURATION=4h
 ```
 
+While a cycle is in `starting` or `heating`, `printer.ace2k.dryer.duration` holds the minutes it
+was asked for, and `ACEK_STATUS` prints the time left against it: `1 h 30 min left of 4 h`. The
+value comes from the unit, so it is there for a cycle of the humidity or the print mode too. It is
+`None` when no cycle runs, and always on an image without `ace2k_dryer_total_query`, where
+`ACEK_STATUS` prints the time left alone.
+
 ### `ACEK_DRY_STOP`
 
 Stops the cycle. The unit cools the heater down with the fans before it releases them.

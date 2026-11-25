@@ -1664,6 +1664,62 @@ TEST(a_retarget_in_fault_is_refused_as_faulted_and_changes_nothing)
     ASSERT_EQ(r.dryer.end_ms, end);
 }
 
+/* The total: the minutes the running cycle was asked for, 0 when none runs. */
+TEST(the_total_is_zero_at_idle_and_a_refused_start_leaves_it)
+{
+    rig_init(&r, 25000);
+    ASSERT_EQ(r.dryer.total_min, 0U);
+    ASSERT_EQ(rig_start(&r, 66U, 30U), ACE2K_DRYER_RANGE);
+    ASSERT_EQ(r.dryer.total_min, 0U);
+}
+
+TEST(a_start_sets_the_total_and_a_retarget_replaces_it)
+{
+    rig_init(&r, 25000);
+    ASSERT_EQ(ace2k_dryer_start(&r.dryer, 45U, 30U, r.now_ms), ACE2K_DRYER_OK);
+    ASSERT_EQ(r.dryer.state, ACE2K_DRYER_STARTING);
+    ASSERT_EQ(r.dryer.total_min, 30U);
+    ASSERT_EQ(ace2k_dryer_retarget(&r.dryer, 55U, 90U, r.now_ms), ACE2K_DRYER_OK);
+    ASSERT_EQ(r.dryer.total_min, 90U);
+    ASSERT_TRUE(rig_run_until(&r, ACE2K_DRYER_HEATING, RIG_MIN_MS));
+    ASSERT_EQ(r.dryer.total_min, 90U);
+    ASSERT_EQ(ace2k_dryer_retarget(&r.dryer, 50U, 1440U, r.now_ms), ACE2K_DRYER_OK);
+    ASSERT_EQ(r.dryer.total_min, 1440U);
+    /* a refused retarget keeps the total */
+    ASSERT_EQ(ace2k_dryer_retarget(&r.dryer, 50U, 0U, r.now_ms), ACE2K_DRYER_RANGE);
+    ASSERT_EQ(r.dryer.total_min, 1440U);
+}
+
+TEST(a_stop_clears_the_total)
+{
+    rig_init(&r, 25000);
+    ASSERT_EQ(rig_start(&r, 45U, 30U), ACE2K_DRYER_OK);
+    ASSERT_EQ(r.dryer.total_min, 30U);
+    ASSERT_EQ(ace2k_dryer_stop(&r.dryer, r.now_ms), ACE2K_DRYER_OK);
+    ASSERT_EQ(r.dryer.state, ACE2K_DRYER_COOLDOWN);
+    ASSERT_EQ(r.dryer.total_min, 0U);
+}
+
+TEST(the_end_of_the_cycle_clears_the_total)
+{
+    rig_init(&r, 25000);
+    ASSERT_EQ(rig_start(&r, 45U, 2U), ACE2K_DRYER_OK);
+    ASSERT_EQ(r.dryer.total_min, 2U);
+    ASSERT_TRUE(rig_run_until(&r, ACE2K_DRYER_COOLDOWN, 3U * RIG_MIN_MS));
+    ASSERT_EQ(rig_events(&r, ACE2K_DRYER_EV_DONE), 1U);
+    ASSERT_EQ(r.dryer.total_min, 0U);
+}
+
+TEST(a_fault_clears_the_total)
+{
+    rig_init(&r, 25000);
+    ASSERT_EQ(rig_start(&r, 45U, 30U), ACE2K_DRYER_OK);
+    r.cutout = true;
+    rig_tick(&r);
+    ASSERT_EQ(r.dryer.state, ACE2K_DRYER_FAULT);
+    ASSERT_EQ(r.dryer.total_min, 0U);
+}
+
 int main(int argc, char **argv)
 {
     return TEST_MAIN(argc, argv);

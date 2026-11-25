@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+The dryer reports the length of the running cycle again, as the factory firmware does
+(PR #19, by cvitePro).
+
+- The dryer's status has a new field, `duration`: the minutes the running cycle was asked for. It
+  is `None` when no cycle runs.
+- `ACEK_STATUS` shows the time left against it, for example `1 h 30 min left of 4 h`.
+- The host reads the value from the unit with the new command `ace2k_dryer_total_query`. So cycles
+  of the humidity and print modes show it too.
+- An older image does not have this command. The status then shows the time left alone.
+
 ## v0.17.0-alpha.1 — 2026-11-24
 
 **An alpha, published as a pre-release.** It was not run on a bench here. It is for units whose
